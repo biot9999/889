@@ -1475,8 +1475,7 @@ class AgentBotHandlers:
             if user.id in ADMIN_USERS:
                 kb.append([InlineKeyboardButton("💰 价格管理", callback_data="price_management"),
                            InlineKeyboardButton("📊 系统报表", callback_data="system_reports")])
-                kb.append([InlineKeyboardButton("💸 利润提现", callback_data="profit_center"),
-                           InlineKeyboardButton("🔄 同步商品", callback_data="sync_products")])
+                kb.append([InlineKeyboardButton("💸 利润提现", callback_data="profit_center")])
             kb.append([InlineKeyboardButton("📞 联系客服", callback_data="support"),
                        InlineKeyboardButton("❓ 使用帮助", callback_data="help")])
             update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
@@ -1494,8 +1493,7 @@ class AgentBotHandlers:
         if user.id in ADMIN_USERS:
             kb.append([InlineKeyboardButton("💰 价格管理", callback_data="price_management"),
                        InlineKeyboardButton("📊 系统报表", callback_data="system_reports")])
-            kb.append([InlineKeyboardButton("💸 利润提现", callback_data="profit_center"),
-                       InlineKeyboardButton("🔄 同步商品", callback_data="sync_products")])
+            kb.append([InlineKeyboardButton("💸 利润提现", callback_data="profit_center")])
         kb.append([InlineKeyboardButton("📞 联系客服", callback_data="support"),
                    InlineKeyboardButton("❓ 使用帮助", callback_data="help")])
         text = f"🏠 主菜单\n\n当前时间: {self.core._to_beijing(datetime.utcnow()).strftime('%Y-%m-%d %H:%M:%S')}"
@@ -2114,56 +2112,6 @@ class AgentBotHandlers:
 
     def show_order_history(self, query):
         self.safe_edit_message(query, "📊 订单历史功能暂未实现", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
-    
-    def handle_sync_products(self, query):
-        """处理手动同步商品"""
-        uid = query.from_user.id
-        if uid not in ADMIN_USERS:
-            query.answer("❌ 无权限", show_alert=True)
-            return
-        
-        try:
-            # 执行同步
-            synced = self.core.auto_sync_new_products()
-            
-            # 获取统计信息
-            total_products = self.core.config.agent_product_prices.count_documents({
-                'agent_bot_id': self.core.config.AGENT_BOT_ID
-            })
-            active_products = self.core.config.agent_product_prices.count_documents({
-                'agent_bot_id': self.core.config.AGENT_BOT_ID,
-                'is_active': True
-            })
-            
-            text = f"""🔄 商品同步完成
-
-📊 同步结果：
-• 新增商品：{synced} 个
-• 总商品数：{total_products} 个
-• 激活商品：{active_products} 个
-• 未激活：{total_products - active_products} 个
-
-✅ 同步时间：{self.core._to_beijing(datetime.utcnow()).strftime('%Y-%m-%d %H:%M:%S')}
-
-💡 提示：
-• 新同步的商品默认激活
-• 可在价格管理中设置代理价格
-• 建议定期同步以获取最新商品"""
-            
-            kb = [
-                [InlineKeyboardButton("💰 价格管理", callback_data="price_management"),
-                 InlineKeyboardButton("🛍️ 商品中心", callback_data="products")],
-                [InlineKeyboardButton("🔄 再次同步", callback_data="sync_products"),
-                 InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]
-            ]
-            
-            self.safe_edit_message(query, text, kb, parse_mode=None)
-            
-        except Exception as e:
-            logger.error(f"❌ 同步商品失败: {e}")
-            import traceback
-            traceback.print_exc()
-            query.answer("❌ 同步失败，请稍后重试", show_alert=True)
 
     # ========== 回调分发 ==========
     def button_callback(self, update: Update, context: CallbackContext):
@@ -2256,10 +2204,6 @@ class AgentBotHandlers:
                 self.start_withdrawal(q); q.answer(); return
             elif d == "profit_withdraw_list":
                 self.show_withdrawal_list(q); q.answer(); return
-            
-            # ✅ 商品同步
-            elif d == "sync_products":
-                self.handle_sync_products(q); q.answer(); return
 
             # 充值金额快捷按钮
             elif d.startswith("recharge_amount_"):
