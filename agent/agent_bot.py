@@ -1987,7 +1987,7 @@ class AgentBotHandlers:
             order_id = res['order_id']
             
             # ✅ 发送购买成功通知
-            # 注意：文件已在 process_purchase() 中通过 send_item_file_to_user() 发送给用户
+            # 注意：文件已在 process_purchase() 中通过 send_batch_files_to_user() 发送给用户
             kb = [
                 [InlineKeyboardButton("🛍️ 继续购买", callback_data="products"),
                  InlineKeyboardButton("👤 个人中心", callback_data="profile")]
