@@ -1059,8 +1059,7 @@ class AgentBotCore:
             logger.error(f"❌ 查询充值记录失败: {e}")
             return []
 
-    # ---------- 文件打包发货 ----------
-    def send_batch_files_to_user(self, user_id: int, items: List[Dict], product_name: str) -> int:
+    def send_batch_files_to_user(self, user_id: int, items: List[Dict], product_name: str, order_id: str = "") -> int:
         logger.info(f"开始打包发送: {product_name} items={len(items)}")
         try:
             if not items:
@@ -1077,7 +1076,14 @@ class AgentBotCore:
                 return 0
             delivery_dir = f"{self.config.FILE_BASE_PATH}/协议号发货"
             os.makedirs(delivery_dir, exist_ok=True)
-            zip_path = f"{delivery_dir}/batch_{user_id}_{int(time.time())}.zip"
+            
+            # ✅ 改成：日期_用户ID_订单号后4位.zip
+            from datetime import datetime
+            date_str = datetime.now().strftime("%Y%m%d")
+            short_order_id = order_id[-4:] if order_id else "0000"
+            zip_filename = f"{date_str}_{user_id}_{short_order_id}.zip"
+            zip_path = f"{delivery_dir}/{zip_filename}"
+            
             files_added = 0
             try:
                 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1189,9 +1195,13 @@ class AgentBotCore:
                 {'$set': {'state': 1, 'sale_time': sale_time, 'yssj': sale_time, 'gmid': user_id}}
             )
 
+            # ✅ 订单号先生成
+            order_id = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}{user_id}"
+
             files_sent = 0
             try:
-                files_sent = self.send_batch_files_to_user(user_id, items, product.get('projectname', ''))
+                # ✅ 发货函数传递订单号当作第4参数
+                files_sent = self.send_batch_files_to_user(user_id, items, product.get('projectname', ''), order_id)
             except Exception as fe:
                 logger.warning(f"发货文件异常: {fe}")
 
@@ -1201,7 +1211,6 @@ class AgentBotCore:
             if total_profit > 0:
                 self.update_profit_account(total_profit)
 
-            order_id = f"order_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}{user_id}"
             order_coll = self.config.get_agent_gmjlu_collection()
             order_coll.insert_one({
                 'leixing': 'purchase',
@@ -1221,7 +1230,7 @@ class AgentBotCore:
 
             # 群通知
             try:
-                if self.config.AGENT_NOTIFY_CHAT_ID:  # ✅ 正确
+                if self.config.AGENT_NOTIFY_CHAT_ID:
                     p_name = self._h(product.get('projectname', ''))
                     nowuid = product.get('nowuid', '')
                     text = (
@@ -1257,7 +1266,7 @@ class AgentBotCore:
         except Exception as e:
             logger.error(f"处理购买失败: {e}")
             return False, f"购买处理异常: {e}"
-
+            
     # ---------- 统计 ----------
     def get_sales_statistics(self, days: int = 30) -> Dict:
         try:
@@ -1657,30 +1666,58 @@ class AgentBotHandlers:
 
     # ========== 商品相关 ==========
     def show_product_categories(self, query):
-        """显示商品分类（一级分类）- 仿照总部bot.py的show_product_list"""
-        cats = self.core.get_product_categories()
-        if not cats:
-            self.safe_edit_message(query, "❌ 暂无可用商品分类", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
-            return
-        
-        # ✅ 仿照总部的文本格式（完全一致）
-        text = (
-            "<b>🛒 商品分类 - 请选择所需：</b>\n\n"
-            "<b>❗️首次购买请先少量测试，避免纠纷</b>！\n\n"
-            "<b>❗️长期未使用账户可能会出现问题，联系客服处理</b>。"
-        )
-        
-        kb = []
-        for c in cats:
-            name = c['_id']
-            stock = c['stock']
-            # ✅ 显示格式与总部完全一致：分类名 [库存个]
-            button_text = f"{name} [{stock}个]"
-            kb.append([InlineKeyboardButton(button_text, callback_data=f"category_{name}")])
-        
-        kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main")])
-        self.safe_edit_message(query, text, kb, parse_mode='HTML')
-
+        """显示商品分类（一级分类）- 从fenlei表读取"""
+        try:
+            self.core.auto_sync_new_products()
+            
+            # ✅ 从 fenlei 表读分类
+            fenlei_coll = self.core.config.db['fenlei']
+            all_categories = list(fenlei_coll.find({}))
+            
+            if not all_categories:
+                self.safe_edit_message(query, "❌ 暂无可用商品分类", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
+                return
+            
+            text = (
+                "🛒 <b>商品分类 - 请选择所需商品：</b>\n\n"
+                "「快送商品区」-「热选择所需商品」\n\n"
+                "<b>❗️首次购买请先少量测试，避免纠纷</b>！\n\n"
+                "<b>❗️长期未使用账户可能会出现问题，联系客服处理</b>。"
+            )
+            
+            kb = []
+            
+            # ✅ 统计每个分类的库存
+            for category in all_categories:
+                cat_name = category.get('projectname', '未知分类')
+                
+                # 统计该分类下的所有商品库存
+                # 需要从 ejfl 里找到 leixing 匹配这个分类的商品
+                stock = self.core.config.hb.count_documents({
+                    'nowuid': {
+                        '$in': [
+                            p.get('nowuid') 
+                            for p in self.core.config.ejfl.find({'leixing': cat_name})
+                        ]
+                    },
+                    'state': 0
+                })
+                
+                if stock > 0:  # 只显示有库存的分类
+                    button_text = f"{cat_name}  [{stock}个]"
+                    kb.append([InlineKeyboardButton(button_text, callback_data=f"category_{cat_name}")])
+            
+            if not kb:
+                self.safe_edit_message(query, "❌ 暂无库存商品", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
+                return
+            
+            kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main")])
+            self.safe_edit_message(query, text, kb, parse_mode='HTML')
+            
+        except Exception as e:
+            logger.error(f"❌ 获取商品分类失败: {e}")
+            self.safe_edit_message(query, "❌ 加载失败，请重试", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
+            
     def show_category_products(self, query, category: str, page: int = 1):
         """显示分类下的商品（二级分类）"""
         try:
@@ -1750,7 +1787,7 @@ class AgentBotHandlers:
                 stock = p['stock']
                 
                 # ✅ 按钮格式
-                button_text = f"{name} {price}U [库存: {stock}个]"
+                button_text = f"{name} {price}U   [{stock}个]"
                 kb.append([InlineKeyboardButton(button_text, callback_data=f"product_{nowuid}")])
             
             # 如果没有有库存的商品
@@ -1771,7 +1808,7 @@ class AgentBotHandlers:
             self.safe_edit_message(query, "❌ 加载失败，请重试", [[InlineKeyboardButton("🔙 返回", callback_data="back_products")]], parse_mode=None)
 
     def show_product_detail(self, query, nowuid: str):
-        """显示商品详情"""
+        """显示商品详情 - 完全仿照总部格式"""
         try:
             prod = self.core.config.ejfl.find_one({'nowuid': nowuid})
             if not prod:
@@ -1785,34 +1822,39 @@ class AgentBotHandlers:
                 self.safe_edit_message(query, "❌ 商品价格未设置", [[InlineKeyboardButton("🔙 返回", callback_data="back_products")]], parse_mode=None)
                 return
             
-            text = f"""📦 商品详情
-
-🏷️ 名称: {self.H(prod['projectname'])}
-📂 类型: {self.H(prod.get('leixing', '未分类'))}
-💰 代理价: {price} USDT
-📦 库存: {stock}
-🆔 编号: {self.H(prod['nowuid'])}
-
-📝 描述:
-{self.H(prod.get('text', '暂无'))}
-"""
+            # ✅ 完全按照总部的简洁格式
+            product_name = self.H(prod.get('projectname', 'N/A'))
+            product_status = "✅您正在购买："
+            
+            text = (
+                f"<b>{product_status} {product_name}\n\n</b>"
+                f"<b>💰 价格: {price:.2f} USDT\n\n</b>"
+                f"<b>📦 库存: {stock}个\n\n</b>"
+                f"<b>❗未使用过的本店商品的，请先少量购买测试，以免造成不必要的争执！谢谢合作！\n</b>"
+                
+            )
+            
             kb = []
             if stock > 0:
-                kb.append([InlineKeyboardButton("🛒 立即购买", callback_data=f"buy_{nowuid}")])
+                kb.append([InlineKeyboardButton("✅ 购买", callback_data=f"buy_{nowuid}"),
+                          InlineKeyboardButton("❗使用说明", callback_data="help")])
             else:
-                text += "\n⚠️ 商品缺货"
+                text += "\n\n⚠️ 商品缺货"
+                kb.append([InlineKeyboardButton("使用说明", callback_data="help")])
             
-            kb.append([InlineKeyboardButton("🔙 返回商品列表", callback_data=f"category_{prod.get('leixing', '协议号')}")])
-            kb.append([InlineKeyboardButton("🏠 返回主菜单", callback_data="back_main")])
+            kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main"),
+                      InlineKeyboardButton("返回", callback_data=f"category_{prod.get('leixing', '协议号')}")])
             
             self.safe_edit_message(query, text, kb, parse_mode=ParseMode.HTML)
         
         except Exception as e:
             logger.error(f"❌ 获取商品详情失败: {e}")
             self.safe_edit_message(query, "❌ 加载失败，请重试", [[InlineKeyboardButton("🔙 返回", callback_data="back_products")]], parse_mode=None)
+            
+            
     def handle_buy_product(self, query, nowuid: str):
+        """处理购买流程 - 完全仿照总部格式"""
         uid = query.from_user.id
-        self.user_states[uid] = {'state': 'waiting_quantity', 'product_nowuid': nowuid}
         prod = self.core.config.ejfl.find_one({'nowuid': nowuid})
         price = self.core.get_product_price(nowuid)
         stock = self.core.get_product_stock(nowuid)
@@ -1820,28 +1862,192 @@ class AgentBotHandlers:
         bal = user.get('USDT', 0) if user else 0
         max_afford = int(bal // price) if price else 0
         max_qty = min(stock, max_afford)
-        text = (f"🛒 购买 {self.H(prod['projectname'])}\n"
-                f"单价:{price}U  库存:{stock}\n余额:{bal:.2f}U\n最多可买:{max_qty}\n\n请输入购买数量（发送数字）")
-        self.safe_edit_message(query, text, [[InlineKeyboardButton("❌ 取消", callback_data=f"product_{nowuid}")]], parse_mode=None)
+        
+        # ✅ 完全按照总部的格式
+        text = (
+            f"请输入数量:\n"
+            f"格式: 10\n\n"
+            f"✅ 您正在购买 - {self.H(prod['projectname'])}\n"
+            f"💰 单价: {price} U\n"
+            f"🪙 您的余额: {bal:.2f} U\n"
+            f"📊 最多可买: {max_qty} 个"
+        )
+        kb = [
+            [InlineKeyboardButton("❌ 取消交易", callback_data=f"product_{nowuid}")]
+        ]
+        
+        # ✅ 保存当前消息的ID（这是要被删除的消息）
+        input_msg_id = query.message.message_id
+        
+        # ✅ 修改消息显示"请输入数量"
+        self.safe_edit_message(query, text, kb, parse_mode=None)
+        
+        # ✅ 保存消息 ID 到状态
+        self.user_states[uid] = {
+            'state': 'waiting_quantity',
+            'product_nowuid': nowuid,
+            'input_msg_id': input_msg_id  # ← 保存这条要被删除的消息ID
+        }
+        
+        
+    def handle_quantity_input(self, update: Update, context: CallbackContext):
+        """处理购买数量输入 - 显示确认页面"""
+        uid = update.effective_user.id
+        if uid not in self.user_states or self.user_states[uid].get('state') != 'waiting_quantity':
+            return
+        
+        try:
+            qty = int(update.message.text.strip())
+        except:
+            update.message.reply_text("❌ 请输入有效整数")
+            return
+        
+        st = self.user_states[uid]
+        nowuid = st['product_nowuid']
+        prod = self.core.config.ejfl.find_one({'nowuid': nowuid})
+        price = self.core.get_product_price(nowuid)
+        stock = self.core.get_product_stock(nowuid)
+        user = self.core.get_user_info(uid)
+        bal = user.get('USDT', 0) if user else 0
+        
+        if qty <= 0:
+            update.message.reply_text("❌ 数量需 > 0")
+            return
+        if qty > stock:
+            update.message.reply_text(f"❌ 库存不足（当前 {stock}）")
+            return
+        
+        total_cost = price * qty
+        if total_cost > bal:
+            update.message.reply_text(f"❌ 余额不足，需: {total_cost:.2f}U 当前: {bal:.2f}U")
+            return
+        
+        chat_id = uid
+        
+        # ✅ 先删除"请输入数量"的消息
+        if 'input_msg_id' in st:
+            try:
+                context.bot.delete_message(chat_id=chat_id, message_id=st['input_msg_id'])
+            except Exception as e:
+                logger.error(f"删除输入数量消息失败: {e}")
+        
+        # ✅ 删除用户输入的数字消息
+        try:
+            update.message.delete()
+        except Exception as e:
+            logger.error(f"删除用户消息失败: {e}")
+        
+        # ✅ 显示确认页面（总部格式）
+        text = (
+            f"<b>✅ 您正在购买 - {self.H(prod['projectname'])}</b>\n\n"
+            f"<b>🛍 数量: {qty}</b>\n\n"
+            f"<b>💰 价格: {price}</b>\n\n"
+            f"<b>🪙 您的余额: {bal:.2f}</b>"
+        )
+        
+        kb = [
+            [InlineKeyboardButton("❌ 取消交易", callback_data=f"product_{nowuid}"),
+             InlineKeyboardButton("✅ 确认购买", callback_data=f"confirm_buy_{nowuid}_{qty}")],
+            [InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]
+        ]
+        
+        # ✅ 用 send_message 发送确认页面
+        msg = context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.HTML
+        )
+        
+        # ✅ 保存状态
+        self.user_states[uid] = {
+            'state': 'confirming_purchase',
+            'product_nowuid': nowuid,
+            'quantity': qty,
+            'confirm_msg_id': msg.message_id  # 只需保存确认页面的ID
+        }
 
-    def handle_confirm_buy(self, query, nowuid: str):
-        self.handle_buy_product(query, nowuid)
-
+    def handle_confirm_buy(self, query, nowuid: str, qty: int, context: CallbackContext):
+        """确认购买 - 处理交易"""
+        uid = query.from_user.id
+        st = self.user_states.pop(uid, None)
+        chat_id = query.message.chat_id
+        
+        # ✅ 删除确认页面的消息
+        try:
+            query.message.delete()
+        except Exception as e:
+            logger.error(f"删除确认页面失败: {e}")
+        
+        # 处理购买
+        ok, res = self.core.process_purchase(uid, nowuid, qty)
+        
+        if ok:
+            from datetime import datetime
+            
+            # ✅ 获取订单信息
+            order_id = res['order_id']  # order_2025111320245570044964
+            # ✅ 取订单号的后4位
+            short_order_id = order_id[-4:]  # 4964
+            
+            # ✅ 生成文件名：日期_用户ID_订单号后4位.zip
+            date_str = datetime.now().strftime("%Y%m%d")
+            zip_filename = f"{date_str}_{uid}_{short_order_id}.zip"
+            # 结果: 20251113_7004496404_4964.zip
+            
+            # ... 你的 ZIP 生成代码 ...
+            
+            # ✅ 发送文件给用户
+            with open(zip_filename, 'rb') as f:
+                context.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename=zip_filename
+                )
+            
+            # ✅ 发送购买成功通知
+            kb = [
+                [InlineKeyboardButton("🛍️ 继续购买", callback_data="products"),
+                 InlineKeyboardButton("👤 个人中心", callback_data="profile")]
+            ]
+            context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"✅ 购买成功\n"
+                    f"订单: {self.H(order_id)}\n"
+                    f"商品: {self.H(res['product_name'])}\n"
+                    f"数量: {res['quantity']}\n"
+                    f"金额: {res['total_cost']:.2f}U\n"
+                    f"余额: {res['user_balance']:.2f}U"
+                ),
+                reply_markup=InlineKeyboardMarkup(kb),
+                parse_mode=None
+            )
+            query.answer("✅ 购买成功！")
+        else:
+            query.answer(f"❌ 购买失败: {res}", show_alert=True)
+            
     def show_user_profile(self, query):
+        """显示用户个人中心"""
         uid = query.from_user.id
         info = self.core.get_user_info(uid)
         if not info:
             self.safe_edit_message(query, "❌ 用户信息不存在", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
             return
+        
         avg = round(info.get('zgje', 0) / max(info.get('zgsl', 1), 1), 2)
         level = '🥇 金牌' if info.get('zgje', 0) > 100 else '🥈 银牌' if info.get('zgje', 0) > 50 else '🥉 铜牌'
-        text = (f"👤 个人中心\n\n"
-                f"ID: {uid}\n"
-                f"内部ID: {self.H(info.get('count_id','-'))}\n"
-                f"余额: {info.get('USDT',0):.2f}U\n"
-                f"累计消费: {info.get('zgje',0):.2f}U  次数:{info.get('zgsl',0)}\n"
-                f"平均订单: {avg:.2f}U\n"
-                f"等级: {level}\n")
+        
+        text = (
+            f"👤 个人中心\n\n"
+            f"ID: {uid}\n"
+            f"内部ID: {self.H(info.get('count_id', '-'))}\n"
+            f"余额: {info.get('USDT', 0):.2f}U\n"
+            f"累计消费: {info.get('zgje', 0):.2f}U  次数:{info.get('zgsl', 0)}\n"
+            f"平均订单: {avg:.2f}U\n"
+            f"等级: {level}\n"
+        )
+        
         kb = [
             [InlineKeyboardButton("💰 充值余额", callback_data="recharge"),
              InlineKeyboardButton("📊 订单历史", callback_data="orders")],
@@ -1849,6 +2055,7 @@ class AgentBotHandlers:
              InlineKeyboardButton("📞 联系客服", callback_data="support")],
             [InlineKeyboardButton("🏠 返回主菜单", callback_data="back_main")]
         ]
+        
         self.safe_edit_message(query, text, kb, parse_mode=None)
 
     # ========== 充值 UI ==========
@@ -2262,8 +2469,21 @@ class AgentBotHandlers:
             elif d.startswith("buy_"):
                 self.handle_buy_product(q, d.replace("buy_","")); q.answer(); return
             elif d.startswith("confirm_buy_"):
-                self.handle_confirm_buy(q, d.replace("confirm_buy_","")); q.answer(); return
-
+                # ✅ 处理确认购买
+                try:
+                    parts = d.replace("confirm_buy_", "").split("_")
+                    nowuid = parts[0]
+                    qty = int(parts[1])
+                    self.handle_confirm_buy(q, nowuid, qty, context)  # ← 加上 context
+                    q.answer()
+                except Exception as e:
+                    logger.error(f"确认购买异常: {e}")
+                    q.answer("参数错误", show_alert=True)
+                return
+                
+                self.handle_confirm_buy(q, nowuid, qty)
+                q.answer()
+                return
             # 利润中心
             elif d == "profit_center":
                 self.show_profit_center(q); q.answer(); return
@@ -2390,59 +2610,42 @@ class AgentBotHandlers:
 
     # ========== 文本消息状态处理 ==========
     def handle_text_message(self, update: Update, context: CallbackContext):
+        """处理文本消息"""
         uid = update.effective_user.id
         if uid not in self.user_states:
             return
+        
         st = self.user_states[uid]
         try:
             if st.get('state') == 'waiting_quantity':
-                try:
-                    qty = int(update.message.text.strip())
-                except:
-                    update.message.reply_text("❌ 请输入有效整数")
-                    return
-                nowuid = st['product_nowuid']
-                price = self.core.get_product_price(nowuid)
-                stock = self.core.get_product_stock(nowuid)
-                user = self.core.get_user_info(uid)
-                bal = user.get('USDT',0) if user else 0
-                if qty <=0:
-                    update.message.reply_text("❌ 数量需>0"); return
-                if qty > stock:
-                    update.message.reply_text(f"❌ 库存不足（当前 {stock}）"); return
-                if price * qty > bal:
-                    update.message.reply_text(f"❌ 余额不足，需:{price*qty}U 当前:{bal:.2f}U"); return
-                self.user_states.pop(uid, None)
-                proc = update.message.reply_text("🔄 正在处理，请稍候...")
-                ok, res = self.core.process_purchase(uid, nowuid, qty)
-                try: proc.delete()
-                except: pass
-                if ok:
-                    update.message.reply_text(
-                        f"✅ 购买成功\n订单:{self.H(res['order_id'])}\n商品:{self.H(res['product_name'])}\n数量:{res['quantity']}\n金额:{res['total_cost']}U\n余额:{res['user_balance']:.2f}U",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛍️ 继续购买", callback_data="products"),
-                                                            InlineKeyboardButton("👤 个人中心", callback_data="profile")]]),
-                        parse_mode=ParseMode.HTML
-                    )
-                else:
-                    update.message.reply_text(f"❌ 购买失败：{res}")
+                # ✅ 处理购买数量输入
+                self.handle_quantity_input(update, context)
+                return
+            
             elif st.get('state') == 'waiting_price':
                 try:
                     new_price = float(update.message.text.strip())
                 except:
                     update.message.reply_text("❌ 请输入有效的价格数字")
                     return
-                nowuid = st['product_nowuid']; op = st['original_price']
+                nowuid = st['product_nowuid']
+                op = st['original_price']
                 if new_price < op:
                     update.message.reply_text(f"❌ 代理价格不能低于总部价格 {op} USDT")
                     return
                 self.user_states.pop(uid, None)
                 ok, msg = self.core.update_agent_price(nowuid, new_price)
                 update.message.reply_text(("✅ " if ok else "❌ ") + msg)
+                return
+            
             elif st.get('state') == 'waiting_withdraw_amount':
                 self.handle_withdraw_amount_input(update)
+                return
+            
             elif st.get('state') == 'waiting_withdraw_address':
                 self.handle_withdraw_address_input(update)
+                return
+            
             elif st.get('state') == 'waiting_recharge_amount':
                 txt = update.message.text.strip()
                 try:
@@ -2451,6 +2654,8 @@ class AgentBotHandlers:
                     update.message.reply_text("❌ 金额格式错误，请输入数字（例如 12 或 12.5）")
                     return
                 self.handle_recharge_amount_input(update, amt)
+                return
+        
         except Exception as e:
             logger.error(f"文本处理异常: {e}")
             update.message.reply_text("❌ 处理异常，请重试")
