@@ -1983,37 +1983,37 @@ class AgentBotHandlers:
         ok, res = self.core.process_purchase(uid, nowuid, qty)
         
         if ok:
-            # ✅ 获取订单信息
-            order_id = res['order_id']
-            
-            # ✅ 发送购买成功通知
-            # 注意：文件已在 process_purchase() 中通过 send_batch_files_to_user() 发送给用户
-            kb = [
+            # ✅ 从环境变量加载通知模板内容
+            custom_message_template = os.getenv("PURCHASE_SUCCESS_TEMPLATE", (
+                "✅您的账户已打包完成，请查收！\n\n"
+                "🔐二级密码:请在json文件中【two2fa】查看！\n\n"
+                "⚠️注意：请马上检查账户，1小时内出现问题，联系客服处理！\n"
+                "‼️超过售后时间，损失自付，无需多言！\n\n"
+                "🔹 9号客服  @o9eth   @o7eth\n"
+                "🔹 频道  @idclub9999\n"
+                "🔹补货通知  @p5540"
+            ))
+
+            # ✅ 发送购买成功通知（不包括订单、商品等细节内容）
+            keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🛍️ 继续购买", callback_data="products"),
                  InlineKeyboardButton("👤 个人中心", callback_data="profile")]
-            ]
+            ])
             try:
                 context.bot.send_message(
                     chat_id=chat_id,
-                    text=(
-                        f"✅ 购买成功\n"
-                        f"订单: {self.H(order_id)}\n"
-                        f"商品: {self.H(res['product_name'])}\n"
-                        f"数量: {res['quantity']}\n"
-                        f"金额: {res['total_cost']:.2f}U\n"
-                        f"余额: {res['user_balance']:.2f}U"
-                    ),
-                    reply_markup=InlineKeyboardMarkup(kb),
-                    parse_mode=None
-                )
-                logger.info(f"✅ 购买成功通知已发送给用户 {uid}")
+                    text=os.getenv("PURCHASE_SUCCESS_TEMPLATE"),
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.HTML
+                    )
+                logger.info(f"✅ 自定义购买成功通知已发送给用户 {uid}")
             except Exception as msg_error:
                 logger.error(f"❌ 发送购买成功通知失败: {msg_error}")
             
             query.answer("✅ 购买成功！")
         else:
             query.answer(f"❌ 购买失败: {res}", show_alert=True)
-            
+       
     def show_user_profile(self, query):
         """显示用户个人中心"""
         uid = query.from_user.id
