@@ -9064,81 +9064,81 @@ def textkeyboard(update: Update, context: CallbackContext):
 
 
             elif text == '🛒商品列表' or text == '🛒Product List':
-                        del_message(update.message)
-                        fenlei_data = list(fenlei.find({}, sort=[('row', 1)]))
-                        ejfl_data = list(ejfl.find({}))
-                        hb_data = list(hb.find({'state': 0}))
+                del_message(update.message)
+                fenlei_data = list(fenlei.find({}, sort=[('row', 1)]))
+                ejfl_data = list(ejfl.find({}))
+                hb_data = list(hb.find({'state': 0}))
 
-                        # ✅ 一级分类始终显示，显示库存数量（包括0）
-                        keyboard = []
-                        displayed_categories = []
-                        
-                        for i in fenlei_data:
-                                    uid = i['uid']
-                                    projectname = i['projectname']
-                                    row = i['row']
-                                    hsl = sum(
-                                                1 for j in ejfl_data if j['uid'] == uid
-                                                for hb_item in hb_data if hb_item['nowuid'] == j['nowuid']
-                                    )
-                                    
-                                    # ✅ 一级分类始终显示（不论库存多少）
-                                    projectname_display = projectname if lang == 'zh' else get_fy(projectname)
-                                    displayed_categories.append({
-                                        'name': projectname_display,
-                                        'stock': hsl,
-                                        'uid': uid,
-                                        'row': row
-                                    })
-                        
-                        # 按原有行号排序（保持管理员设置的顺序）
-                        displayed_categories.sort(key=lambda x: x['row'])
-                        
-                        # 每行一个按钮
-                        for cat in displayed_categories:
-                            # ✅ 显示库存数量，0库存直接显示0
-                            if cat['stock'] > 0:
-                                if lang == 'zh':
-                                    button_text = f'{cat["name"]} [{cat["stock"]}个]'
-                                else:
-                                    button_text = f'{cat["name"]} [{cat["stock"]} items]'
-                            else:
-                                if lang == 'zh':
-                                    button_text = f'{cat["name"]} [0个]'
-                                else:
-                                    button_text = f'{cat["name"]} [0 items]'
-                            
-                            keyboard.append([
-                                InlineKeyboardButton(
-                                    button_text, 
-                                    callback_data=f'catejflsp {cat["uid"]}:{cat["stock"]}'
-                                )
-                            ])
-
+                # ✅ 一级分类始终显示，显示库存数量（包括0）
+                keyboard = []
+                displayed_categories = []
+                
+                for i in fenlei_data:
+                    uid = i['uid']
+                    projectname = i['projectname']
+                    row = i['row']
+                    hsl = sum(
+                        1 for j in ejfl_data if j['uid'] == uid
+                        for hb_item in hb_data if hb_item['nowuid'] == j['nowuid']
+                    )
+                    
+                    # ✅ 一级分类始终显示（不论库存多少）
+                    projectname_display = projectname if lang == 'zh' else get_fy(projectname)
+                    displayed_categories.append({
+                        'name': projectname_display,
+                        'stock': hsl,
+                        'uid': uid,
+                        'row': row
+                    })
+                
+                # 按原有行号排序（保持管理员设置的顺序）
+                displayed_categories.sort(key=lambda x: x['row'])
+                
+                # 每行一个按钮
+                for cat in displayed_categories:
+                    # ✅ 显示库存数量，0库存直接显示0
+                    if cat['stock'] > 0:
                         if lang == 'zh':
-                            fstext = (
-                                "<b>🛒 商品分类 - 请选择所需：</b>\n\n"
-                                "<b>❗快速查找商品库存发送区号！如（+94）</b>\n\n"
-                                "<b>❗️首次购买请先少量测试，避免纠纷</b>！\n\n"
-                                "<b>❗️长期未使用账户可能会出现问题，联系客服处理</b>。"
-                            )
-                            keyboard.append([InlineKeyboardButton("⚠️注意事项⚠️（点我查看）", callback_data="notice")])
-                            keyboard.append([InlineKeyboardButton("❌关闭", callback_data=f"close {user_id}")])
+                            button_text = f'{cat["name"]} [{cat["stock"]}个]'
                         else:
-                            fstext = (
-                                "<b>🛒 Product Categories - Please choose:</b>\n"
-                                "❗️If you are new, please start with a small test purchase to avoid issues.\n"
-                                "❗️Inactive accounts may encounter problems, please contact support."
-                            )
-                            keyboard.append([InlineKeyboardButton("⚠️ Important Notice ⚠️", callback_data="notice")])
-                            keyboard.append([InlineKeyboardButton("❌ Close", callback_data=f"close {user_id}")])
-
-                        context.bot.send_message(
-                            chat_id=user_id,
-                            text=fstext,
-                            parse_mode='HTML',
-                            reply_markup=InlineKeyboardMarkup(keyboard)
+                            button_text = f'{cat["name"]} [{cat["stock"]} items]'
+                    else:
+                        if lang == 'zh':
+                            button_text = f'{cat["name"]} [0个]'
+                        else:
+                            button_text = f'{cat["name"]} [0 items]'
+                    
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            button_text, 
+                            callback_data=f'catejflsp {cat["uid"]}:{cat["stock"]}'
                         )
+                    ])
+
+                if lang == 'zh':
+                    fstext = (
+                        "<b>🛒 商品分类 - 请选择所需：</b>\n\n"
+                        "<b>❗快速查找商品库存发送区号！如（+94）</b>\n\n"
+                        "<b>❗️首次购买请先少量测试，避免纠纷</b>！\n\n"
+                        "<b>❗️长期未使用账户可能会出现问题，联系客服处理</b>。"
+                    )
+                    keyboard.append([InlineKeyboardButton("⚠️注意事项⚠️（点我查看）", callback_data="notice")])
+                    keyboard.append([InlineKeyboardButton("❌关闭", callback_data=f"close {user_id}")])
+                else:
+                    fstext = (
+                        "<b>🛒 Product Categories - Please choose:</b>\n"
+                        "❗️If you are new, please start with a small test purchase to avoid issues.\n"
+                        "❗️Inactive accounts may encounter problems, please contact support."
+                    )
+                    keyboard.append([InlineKeyboardButton("⚠️ Important Notice ⚠️", callback_data="notice")])
+                    keyboard.append([InlineKeyboardButton("❌ Close", callback_data=f"close {user_id}")])
+
+                context.bot.send_message(
+                    chat_id=user_id,
+                    text=fstext,
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
 
             # ✅ 关键词查询功能 - 用户发送关键词自动查询商品
             else:
@@ -10675,7 +10675,7 @@ def handle_user_withdrawal_txid(update: Update, context: CallbackContext):
     if user_id not in WAITING_USER_TXID:
         return
 
-    withdrawal_id = WAITING_TXHASH[user_id]
+    withdrawal_id = WAITING_USER_TXID[user_id]
 
     # 使用改进的哈希校验
     if not validate_txhash(text):
@@ -13432,19 +13432,23 @@ def main():
     # 这样底部按钮（商品列表、个人中心等）才能正常响应
     dispatcher.add_handler(MessageHandler(Filters.chat_type.private & Filters.reply, huifu), )
     
-    # 🆕 用户提现TXID提交处理器（优先级最高，在textkeyboard之前）
-    # 只处理在等待状态的用户消息
-    dispatcher.add_handler(MessageHandler(
-        Filters.text & ~Filters.command & Filters.private,
-        handle_user_withdrawal_txid
-    ))
-    
+    # ✅ 主要的消息处理器 - 处理底部按钮和所有用户交互（最高优先级）
     dispatcher.add_handler(MessageHandler(
         (Filters.text | Filters.photo | Filters.animation | Filters.video | Filters.document) & ~(Filters.command),
         textkeyboard, run_async=True))
-    # handle_admin_txhash_message 放在后面，用于处理管理员输入交易哈希
-    # ✅ 添加 Filters.private 使 filter 更精确，只处理私聊消息
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command & Filters.private, handle_admin_txhash_message))
+    
+    # 🆕 用户提现TXID提交处理器（在textkeyboard之后，但由于textkeyboard的run_async，可能并行执行）
+    # 这个处理器在textkeyboard没有处理消息时才会触发
+    # 注意：这个处理器的early return（line 10676）确保只在用户处于等待TXID状态时才处理
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & ~Filters.command & Filters.private,
+        handle_user_withdrawal_txid,
+        run_async=True
+    ))
+    
+    # handle_admin_txhash_message 放在最后，用于处理管理员输入交易哈希
+    # ✅ 添加 Filters.private 使 filter 更精确，只处理私聊消息  
+    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command & Filters.private, handle_admin_txhash_message, run_async=True))
     updater.job_queue.run_repeating(suoyouchengxu, 1, 1, name='suoyouchengxu')
     updater.job_queue.run_repeating(jiexi, 3, 1, name='chongzhi')
     updater.start_polling(timeout=BOT_TIMEOUT)
