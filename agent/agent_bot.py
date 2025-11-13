@@ -292,7 +292,7 @@ class AgentBotCore:
                     'agent_price.is_active': True
                 }},
                 {'$group': {
-                    '_id': '$leixing',
+                    '_id': {'$ifNull': ['$leixing', '未分类']},  # ✅ 修复None分类问题
                     'count': {'$sum': 1}
                 }},
                 {'$sort': {'count': -1}}
@@ -301,6 +301,54 @@ class AgentBotCore:
         except Exception as e:
             logger.error(f"❌ 获取商品分类失败: {e}")
             return []
+
+    def get_all_products_with_details(self, page: int = 1, limit: int = 20) -> Dict:
+        """获取所有激活商品的详细信息（与总部保持一致）"""
+        try:
+            skip = (page - 1) * limit
+            pipeline = [
+                {'$lookup': {
+                    'from': 'agent_product_prices',
+                    'localField': 'nowuid',
+                    'foreignField': 'original_nowuid',
+                    'as': 'agent_price'
+                }},
+                {'$match': {
+                    'agent_price.agent_bot_id': self.config.AGENT_BOT_ID,
+                    'agent_price.is_active': True
+                }},
+                {'$skip': skip},
+                {'$limit': limit},
+                {'$sort': {'leixing': 1}}  # 按分类排序
+            ]
+            products = list(self.config.ejfl.aggregate(pipeline))
+            
+            # 获取总数
+            total_pipeline = [
+                {'$lookup': {
+                    'from': 'agent_product_prices',
+                    'localField': 'nowuid',
+                    'foreignField': 'original_nowuid',
+                    'as': 'agent_price'
+                }},
+                {'$match': {
+                    'agent_price.agent_bot_id': self.config.AGENT_BOT_ID,
+                    'agent_price.is_active': True
+                }},
+                {'$count': 'total'}
+            ]
+            total_result = list(self.config.ejfl.aggregate(total_pipeline))
+            total = total_result[0]['total'] if total_result else 0
+            
+            return {
+                'products': products,
+                'total': total,
+                'current_page': page,
+                'total_pages': (total + limit - 1) // limit if total > 0 else 0
+            }
+        except Exception as e:
+            logger.error(f"❌ 获取商品列表失败: {e}")
+            return {'products': [], 'total': 0, 'current_page': 1, 'total_pages': 0}
 
     def get_products_by_category(self, category: str, page: int = 1, limit: int = 10) -> Dict:
         try:
@@ -1540,18 +1588,77 @@ class AgentBotHandlers:
 
     # ========== 商品相关 ==========
     def show_product_categories(self, query):
+        """显示商品列表（优化版：直接显示商品，与总部保持一致）"""
+        self.show_all_products_list(query, page=1)
+    
+    def show_all_products_list(self, query, page: int = 1):
+        """显示所有商品列表（与总部保持一致）"""
+        res = self.core.get_all_products_with_details(page, limit=10)
+        prods = res['products']
+        if not prods:
+            self.safe_edit_message(query, "❌ 暂无可用商品", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
+            return
+        
+        text = f"🛍️ 商品列表（第{page}/{res['total_pages']}页，共{res['total']}个商品）\n\n"
+        kb = []
+        
+        current_category = None
+        for p in prods:
+            # 获取分类
+            category = p.get('leixing') or '未分类'
+            
+            # 如果分类变化，添加分类标题
+            if category != current_category:
+                current_category = category
+                text += f"\n📂 【{self.H(category)}】\n"
+            
+            # 获取商品信息
+            name = p.get('projectname', '未知商品')
+            nowuid = p.get('nowuid')
+            price = self.core.get_product_price(nowuid)
+            stock = self.core.get_product_stock(nowuid)
+            
+            # 显示商品信息
+            if price is not None:
+                stock_display = f"{stock}个" if stock > 0 else "缺货"
+                text += f"  • {self.H(name)}\n"
+                text += f"    💰 {price}U  |  📦 {stock_display}\n"
+                
+                # 添加购买按钮（只有有库存时）
+                if stock > 0:
+                    kb.append([InlineKeyboardButton(f"🛒 {name} - {price}U", callback_data=f"product_{nowuid}")])
+        
+        # 分页按钮
+        pag = []
+        if page > 1:
+            pag.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"products_page_{page-1}"))
+        if res['current_page'] < res['total_pages']:
+            pag.append(InlineKeyboardButton("➡️ 下一页", callback_data=f"products_page_{page+1}"))
+        if pag:
+            kb.append(pag)
+        
+        # 底部按钮
+        kb.append([
+            InlineKeyboardButton("🔍 分类浏览", callback_data="category_browse"),
+            InlineKeyboardButton("🏠 主菜单", callback_data="back_main")
+        ])
+        
+        self.safe_edit_message(query, text, kb, parse_mode=None)
+
+    def show_category_browse(self, query):
+        """显示分类浏览界面（原有的分类方式）"""
         cats = self.core.get_product_categories()
         if not cats:
-            self.safe_edit_message(query, "❌ 暂无可用商品分类", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
+            self.safe_edit_message(query, "❌ 暂无可用商品分类", [[InlineKeyboardButton("🔙 返回", callback_data="products")]], parse_mode=None)
             return
-        text = "🛍️ 商品分类\n\n"
+        text = "📂 分类浏览\n\n"
         kb = []
         for c in cats:
             name = c['_id']
             count = c['count']
-            text += f"• {self.H(name)} ({count})\n"
+            text += f"• {self.H(name)} ({count}个)\n"
             kb.append([InlineKeyboardButton(f"{name} ({count})", callback_data=f"category_{name}")])
-        kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main")])
+        kb.append([InlineKeyboardButton("🔙 返回商品列表", callback_data="products")])
         self.safe_edit_message(query, text, kb, parse_mode=None)
 
     def show_category_products(self, query, category: str, page: int = 1):
@@ -2052,6 +2159,11 @@ class AgentBotHandlers:
                 return
 
             # 商品相关
+            elif d.startswith("products_page_"):
+                page = int(d.replace("products_page_",""))
+                self.show_all_products_list(q, page); q.answer(); return
+            elif d == "category_browse":
+                self.show_category_browse(q); q.answer(); return
             elif d.startswith("category_page_"):
                 _, cat, p = d.split("_", 2)
                 self.show_category_products(q, cat, int(p)); q.answer(); return
