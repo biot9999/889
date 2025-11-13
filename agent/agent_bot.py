@@ -278,77 +278,56 @@ class AgentBotCore:
             return 0
 
     def get_product_categories(self) -> List[Dict]:
+        """获取商品分类列表（一级分类）- 仿照总部bot.py实现"""
         try:
             self.auto_sync_new_products()
-            pipeline = [
-                {'$lookup': {
-                    'from': 'agent_product_prices',
-                    'localField': 'nowuid',
-                    'foreignField': 'original_nowuid',
-                    'as': 'agent_price'
-                }},
-                {'$match': {
-                    'agent_price.agent_bot_id': self.config.AGENT_BOT_ID,
-                    'agent_price.is_active': True
-                }},
-                {'$group': {
-                    '_id': {'$ifNull': ['$leixing', '未分类']},  # ✅ 修复None分类问题
-                    'count': {'$sum': 1}
-                }},
-                {'$sort': {'count': -1}}
+            
+            # 获取所有商品和库存信息
+            all_products = list(self.config.ejfl.find({}))
+            categories = {}
+            
+            for p in all_products:
+                nowuid = p.get('nowuid')
+                if not nowuid:
+                    continue
+                    
+                # 检查是否是激活的代理商品
+                agent_price = self.config.agent_product_prices.find_one({
+                    'agent_bot_id': self.config.AGENT_BOT_ID,
+                    'original_nowuid': nowuid,
+                    'is_active': True
+                })
+                
+                if not agent_price:
+                    continue
+                
+                # 获取库存
+                stock = self.config.hb.count_documents({'nowuid': nowuid, 'state': 0})
+                
+                # 分类名称（处理None情况）
+                category = p.get('leixing') or '未分类'
+                
+                # 累加分类的库存
+                if category not in categories:
+                    categories[category] = {'name': category, 'stock': 0, 'count': 0}
+                categories[category]['stock'] += stock
+                categories[category]['count'] += 1
+            
+            # 转换为列表并按库存排序
+            result = [
+                {
+                    '_id': cat_info['name'],
+                    'stock': cat_info['stock'],
+                    'count': cat_info['count']
+                }
+                for cat_info in categories.values()
             ]
-            return list(self.config.ejfl.aggregate(pipeline))
+            result.sort(key=lambda x: -x['stock'])  # 库存多的在前面
+            
+            return result
         except Exception as e:
             logger.error(f"❌ 获取商品分类失败: {e}")
             return []
-
-    def get_all_products_with_details(self, page: int = 1, limit: int = 20) -> Dict:
-        """获取所有激活商品的详细信息（与总部保持一致）"""
-        try:
-            skip = (page - 1) * limit
-            pipeline = [
-                {'$lookup': {
-                    'from': 'agent_product_prices',
-                    'localField': 'nowuid',
-                    'foreignField': 'original_nowuid',
-                    'as': 'agent_price'
-                }},
-                {'$match': {
-                    'agent_price.agent_bot_id': self.config.AGENT_BOT_ID,
-                    'agent_price.is_active': True
-                }},
-                {'$skip': skip},
-                {'$limit': limit},
-                {'$sort': {'leixing': 1}}  # 按分类排序
-            ]
-            products = list(self.config.ejfl.aggregate(pipeline))
-            
-            # 获取总数
-            total_pipeline = [
-                {'$lookup': {
-                    'from': 'agent_product_prices',
-                    'localField': 'nowuid',
-                    'foreignField': 'original_nowuid',
-                    'as': 'agent_price'
-                }},
-                {'$match': {
-                    'agent_price.agent_bot_id': self.config.AGENT_BOT_ID,
-                    'agent_price.is_active': True
-                }},
-                {'$count': 'total'}
-            ]
-            total_result = list(self.config.ejfl.aggregate(total_pipeline))
-            total = total_result[0]['total'] if total_result else 0
-            
-            return {
-                'products': products,
-                'total': total,
-                'current_page': page,
-                'total_pages': (total + limit - 1) // limit if total > 0 else 0
-            }
-        except Exception as e:
-            logger.error(f"❌ 获取商品列表失败: {e}")
-            return {'products': [], 'total': 0, 'current_page': 1, 'total_pages': 0}
 
     def get_products_by_category(self, category: str, page: int = 1, limit: int = 10) -> Dict:
         try:
@@ -1588,104 +1567,95 @@ class AgentBotHandlers:
 
     # ========== 商品相关 ==========
     def show_product_categories(self, query):
-        """显示商品列表（优化版：直接显示商品，与总部保持一致）"""
-        self.show_all_products_list(query, page=1)
-    
-    def show_all_products_list(self, query, page: int = 1):
-        """显示所有商品列表（与总部保持一致）"""
-        res = self.core.get_all_products_with_details(page, limit=10)
-        prods = res['products']
-        if not prods:
-            self.safe_edit_message(query, "❌ 暂无可用商品", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
-            return
-        
-        text = f"🛍️ 商品列表（第{page}/{res['total_pages']}页，共{res['total']}个商品）\n\n"
-        kb = []
-        
-        current_category = None
-        for p in prods:
-            # 获取分类
-            category = p.get('leixing') or '未分类'
-            
-            # 如果分类变化，添加分类标题
-            if category != current_category:
-                current_category = category
-                text += f"\n📂 【{self.H(category)}】\n"
-            
-            # 获取商品信息
-            name = p.get('projectname', '未知商品')
-            nowuid = p.get('nowuid')
-            price = self.core.get_product_price(nowuid)
-            stock = self.core.get_product_stock(nowuid)
-            
-            # 显示商品信息
-            if price is not None:
-                stock_display = f"{stock}个" if stock > 0 else "缺货"
-                text += f"  • {self.H(name)}\n"
-                text += f"    💰 {price}U  |  📦 {stock_display}\n"
-                
-                # 添加购买按钮（只有有库存时）
-                if stock > 0:
-                    kb.append([InlineKeyboardButton(f"🛒 {name} - {price}U", callback_data=f"product_{nowuid}")])
-        
-        # 分页按钮
-        pag = []
-        if page > 1:
-            pag.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"products_page_{page-1}"))
-        if res['current_page'] < res['total_pages']:
-            pag.append(InlineKeyboardButton("➡️ 下一页", callback_data=f"products_page_{page+1}"))
-        if pag:
-            kb.append(pag)
-        
-        # 底部按钮
-        kb.append([
-            InlineKeyboardButton("🔍 分类浏览", callback_data="category_browse"),
-            InlineKeyboardButton("🏠 主菜单", callback_data="back_main")
-        ])
-        
-        self.safe_edit_message(query, text, kb, parse_mode=None)
-
-    def show_category_browse(self, query):
-        """显示分类浏览界面（原有的分类方式）"""
+        """显示商品分类（一级分类）- 仿照总部bot.py的show_product_list"""
         cats = self.core.get_product_categories()
         if not cats:
-            self.safe_edit_message(query, "❌ 暂无可用商品分类", [[InlineKeyboardButton("🔙 返回", callback_data="products")]], parse_mode=None)
+            self.safe_edit_message(query, "❌ 暂无可用商品分类", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
             return
-        text = "📂 分类浏览\n\n"
+        
+        # 仿照总部的文本格式
+        text = (
+            "<b>🛒 商品分类 - 请选择所需：</b>\n\n"
+            "<b>❗️首次购买请先少量测试，避免纠纷</b>！\n\n"
+            "<b>❗️长期未使用账户可能会出现问题，联系客服处理</b>。"
+        )
+        
         kb = []
         for c in cats:
             name = c['_id']
-            count = c['count']
-            text += f"• {self.H(name)} ({count}个)\n"
-            kb.append([InlineKeyboardButton(f"{name} ({count})", callback_data=f"category_{name}")])
-        kb.append([InlineKeyboardButton("🔙 返回商品列表", callback_data="products")])
-        self.safe_edit_message(query, text, kb, parse_mode=None)
+            stock = c['stock']
+            # 显示格式：分类名 [库存个数]
+            button_text = f"{name} [{stock}个]" if stock > 0 else f"{name} [0个]"
+            kb.append([InlineKeyboardButton(button_text, callback_data=f"category_{name}")])
+        
+        kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main")])
+        self.safe_edit_message(query, text, kb, parse_mode='HTML')
 
     def show_category_products(self, query, category: str, page: int = 1):
-        res = self.core.get_products_by_category(category, page)
-        prods = res['products']
-        if not prods:
-            self.safe_edit_message(query, f"{self.H(category)} 分类暂无可用商品", [[InlineKeyboardButton("🔙 返回分类", callback_data="back_products")]], parse_mode=None)
-            return
-        text = f"📦 {self.H(category)} 商品（第{page}/{res['total_pages']}页）\n\n"
-        kb = []
-        for p in prods:
-            name = p.get('projectname')
+        """显示分类下的商品（二级分类）- 仿照总部bot.py的catejflsp"""
+        # 获取分类下的所有商品
+        all_products = list(self.core.config.ejfl.find({'leixing': category}))
+        
+        # 筛选有库存的商品并计算库存
+        products_with_stock = []
+        for p in all_products:
             nowuid = p.get('nowuid')
+            if not nowuid:
+                continue
+            
+            # 检查是否是激活的代理商品
+            agent_price = self.core.config.agent_product_prices.find_one({
+                'agent_bot_id': self.core.config.AGENT_BOT_ID,
+                'original_nowuid': nowuid,
+                'is_active': True
+            })
+            
+            if not agent_price:
+                continue
+            
+            # 获取价格和库存
             price = self.core.get_product_price(nowuid)
             stock = self.core.get_product_stock(nowuid)
-            if price is not None and stock > 0:
-                text += f"{self.H(name)}\n  价格: {price}U  库存:{stock}\n\n"
-                kb.append([InlineKeyboardButton(f"🛒 {name} - {price}U", callback_data=f"product_{nowuid}")])
-        pag = []
-        if page > 1:
-            pag.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"category_page_{category}_{page-1}"))
-        if res['current_page'] < res['total_pages']:
-            pag.append(InlineKeyboardButton("➡️ 下一页", callback_data=f"category_page_{category}_{page+1}"))
-        if pag:
-            kb.append(pag)
-        kb.append([InlineKeyboardButton("🔙 返回分类", callback_data="back_products")])
-        self.safe_edit_message(query, text, kb, parse_mode=None)
+            
+            # 只显示有库存且有价格的商品
+            if stock > 0 and price is not None and price > 0:
+                p['stock'] = stock
+                p['price'] = price
+                products_with_stock.append(p)
+        
+        # 按库存降序排列（库存多的在前面）
+        products_with_stock.sort(key=lambda x: -x['stock'])
+        
+        # 仿照总部的文本格式
+        text = (
+            "<b>🛒这是商品列表  选择你需要的分类：</b>\n\n"
+            "❗️没使用过的本店商品的，请先少量购买测试，以免造成不必要的争执！谢谢合作！。\n\n"
+            "❗有密码的账户售后时间1小时内，二级未知的账户售后30分钟内！\n\n"
+            "❗购买后请第一时间检查账户，提供证明处理售后 超时损失自付！"
+        )
+        
+        kb = []
+        for p in products_with_stock:
+            name = p.get('projectname')
+            nowuid = p.get('nowuid')
+            price = p['price']
+            stock = p['stock']
+            
+            # 按钮格式：商品名 价格U [库存: X个]
+            button_text = f"{name} {price}U [库存: {stock}个]"
+            kb.append([InlineKeyboardButton(button_text, callback_data=f"product_{nowuid}")])
+        
+        # 如果没有有库存的商品
+        if not kb:
+            kb.append([InlineKeyboardButton("暂无商品耐心等待", callback_data="no_action")])
+        
+        # 返回按钮
+        kb.append([
+            InlineKeyboardButton("🔙 返回", callback_data="back_products"),
+            InlineKeyboardButton("❌ 关闭", callback_data=f"close {query.from_user.id}")
+        ])
+        
+        self.safe_edit_message(query, text, kb, parse_mode='HTML')
 
     def show_product_detail(self, query, nowuid: str):
         prod = self.core.config.ejfl.find_one({'nowuid': nowuid})
@@ -2159,11 +2129,6 @@ class AgentBotHandlers:
                 return
 
             # 商品相关
-            elif d.startswith("products_page_"):
-                page = int(d.replace("products_page_",""))
-                self.show_all_products_list(q, page); q.answer(); return
-            elif d == "category_browse":
-                self.show_category_browse(q); q.answer(); return
             elif d.startswith("category_page_"):
                 _, cat, p = d.split("_", 2)
                 self.show_category_products(q, cat, int(p)); q.answer(); return
@@ -2267,6 +2232,16 @@ class AgentBotHandlers:
                     logger.warning(f"取消订单异常: {e}")
                     q.answer("取消失败", show_alert=True)
                 return
+
+            # 通用操作
+            elif d == "no_action":
+                q.answer(); return
+            elif d.startswith("close "):
+                try:
+                    q.message.delete()
+                except:
+                    pass
+                q.answer(); return
 
             else:
                 self.safe_edit_message(q, "❓ 未知操作", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
