@@ -47,10 +47,9 @@ from mongo import (
     get_agent_bot_user_collection, get_agent_bot_user, update_agent_bot_user_balance,
     get_agent_product_price, get_real_time_stock, generate_agent_bot_id
 )
-# 等待交易哈希输入的管理员临时状态
-WAITING_TXHASH = {}  # key: admin_user_id, value: withdrawal_id (字符串)
-# 等待用户提交提现TXID的临时状态
-WAITING_USER_TXID = {}  # key: user_id, value: withdrawal_id (字符串)
+# ✅ 先定义变量（在文件顶部）
+NOTIFY_CHANNEL_ID = os.getenv("NOTIFY_CHANNEL_ID")
+AGENT_NOTIFY_CHAT_ID = os.getenv("AGENT_NOTIFY_CHAT_ID")
 class MultiBotDistributionSystem:
     """多机器人分销系统管理类"""
     
@@ -10379,7 +10378,7 @@ def handle_all_callbacks(update: Update, context: CallbackContext):
 🎉 感谢您的使用！"""
 
                 context.bot.send_message(
-                    chat_id=NOTIFY_CHANNEL_ID,
+                    chat_id=AGENT_NOTIFY_CHAT_ID,
                     text=notification_text,
                     parse_mode='HTML'
                 )
