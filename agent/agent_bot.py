@@ -78,6 +78,10 @@ logger = logging.getLogger("agent_bot")
 ADMIN_USERS = [7004496404]
 
 # 通知群 / 频道
+# ✅ 代理自己的通知群（订单、充值、提现通知发这里）
+AGENT_NOTIFY_CHAT_ID = os.getenv("AGENT_NOTIFY_CHAT_ID")
+
+# ✅ 总部通知群（代理用来监听总部补货等通知）
 HEADQUARTERS_NOTIFY_CHAT_ID = os.getenv("HQ_NOTIFY_CHAT_ID") or os.getenv("HEADQUARTERS_NOTIFY_CHAT_ID")
 
 class AgentBotConfig:
@@ -121,7 +125,15 @@ class AgentBotConfig:
         self.TRON_API_KEY_HEADER = os.getenv("TRON_API_KEY_HEADER", "TRON-PRO-API-KEY")
         self._tron_key_index = 0
 
-        self.UNIFIED_NOTIFY_CHAT_ID = HEADQUARTERS_NOTIFY_CHAT_ID
+        # ✅ 代理自己的通知群
+        self.AGENT_NOTIFY_CHAT_ID = os.getenv("AGENT_NOTIFY_CHAT_ID")
+        if not self.AGENT_NOTIFY_CHAT_ID:
+            logger.warning("⚠️ 未设置 AGENT_NOTIFY_CHAT_ID，订单通知可能无法发送")
+        
+        # ✅ 总部通知群
+        self.HEADQUARTERS_NOTIFY_CHAT_ID = HEADQUARTERS_NOTIFY_CHAT_ID
+        if not self.HEADQUARTERS_NOTIFY_CHAT_ID:
+            logger.warning("⚠️ 未设置 HEADQUARTERS_NOTIFY_CHAT_ID")
 
         # 取消订单后是否删除原消息 (默认删除)
         self.RECHARGE_DELETE_ON_CANCEL = os.getenv("RECHARGE_DELETE_ON_CANCEL", "1") in ("1", "true", "True")
@@ -642,10 +654,10 @@ class AgentBotCore:
             }
             self.config.withdrawal_requests.insert_one(doc)
 
-            if HEADQUARTERS_NOTIFY_CHAT_ID:
+            if self.config.AGENT_NOTIFY_CHAT_ID:  # ✅ 正确
                 try:
                     Bot(self.config.BOT_TOKEN).send_message(
-                        chat_id=HEADQUARTERS_NOTIFY_CHAT_ID,
+                        chat_id=AGENT_NOTIFY_CHAT_ID,
                         text=(f"📢 <b>代理提现申请</b>\n\n"
                               f"🏢 代理ID：<code>{self._h(self.config.AGENT_BOT_ID)}</code>\n"
                               f"👤 用户：{self._link_user(user_id)}\n"
@@ -999,7 +1011,7 @@ class AgentBotCore:
                 logger.warning(f"用户充值成功通知发送失败: {ue}")
 
             # 群通知
-            if HEADQUARTERS_NOTIFY_CHAT_ID:
+            if self.config.AGENT_NOTIFY_CHAT_ID:  # ✅ 正确
                 try:
                     tx_short = (tx_id[:12] + '...') if tx_id and len(tx_id) > 12 else (tx_id or '-')
                     text = (
@@ -1011,7 +1023,7 @@ class AgentBotCore:
                         f"🔗 TX：<code>{self._h(tx_short)}</code>"
                     )
                     Bot(self.config.BOT_TOKEN).send_message(
-                        chat_id=HEADQUARTERS_NOTIFY_CHAT_ID,
+                        chat_id=AGENT_NOTIFY_CHAT_ID,
                         text=text,
                         parse_mode=ParseMode.HTML,
                         reply_markup=self._kb_tx_addr_user(tx_id, self.config.AGENT_USDT_ADDRESS, order['user_id'])
@@ -1209,7 +1221,7 @@ class AgentBotCore:
 
             # 群通知
             try:
-                if HEADQUARTERS_NOTIFY_CHAT_ID:
+                if self.config.AGENT_NOTIFY_CHAT_ID:  # ✅ 正确
                     p_name = self._h(product.get('projectname', ''))
                     nowuid = product.get('nowuid', '')
                     text = (
@@ -1225,7 +1237,7 @@ class AgentBotCore:
                         f"⏰ 时间：{self._h(sale_time)}"
                     )
                     Bot(self.config.BOT_TOKEN).send_message(
-                        chat_id=HEADQUARTERS_NOTIFY_CHAT_ID,
+                        chat_id=AGENT_NOTIFY_CHAT_ID,
                         text=text,
                         parse_mode=ParseMode.HTML,
                         reply_markup=self._kb_product_actions(nowuid, user_id)
