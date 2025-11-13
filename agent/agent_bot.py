@@ -243,20 +243,32 @@ class AgentBotCore:
             return None
 
     def auto_sync_new_products(self):
+        """自动同步总部新增商品到代理"""
         try:
             all_products = list(self.config.ejfl.find({}))
             synced = 0
+            updated = 0
+            
             for p in all_products:
                 nowuid = p.get('nowuid')
                 if not nowuid:
                     continue
+                
+                # ✅ 检查商品是否已存在于代理价格表
                 exists = self.config.agent_product_prices.find_one({
                     'agent_bot_id': self.config.AGENT_BOT_ID,
                     'original_nowuid': nowuid
                 })
+                
+                # ✅ 获取总部价格
+                original_price = float(p.get('money', 0))
+                
                 if not exists:
-                    # ✅ 只存储总部价格（参考值）和初始利润标记
-                    original_price = float(p.get('money', 0.6))
+                    # ✅ 新商品：创建代理价格记录
+                    # 只有总部价格大于0的商品才同步
+                    if original_price <= 0:
+                        continue
+                    
                     agent_markup = 0.0  # 初始无加价，后续管理员手动设置
                     self.config.agent_product_prices.insert_one({
                         'agent_bot_id': self.config.AGENT_BOT_ID,
@@ -265,21 +277,49 @@ class AgentBotCore:
                         'original_price_snapshot': original_price,  # 参考用，不作实际计算
                         'product_name': p.get('projectname', ''),
                         'category': p.get('leixing') or '协议号',
-                        'is_active': True,
+                        'is_active': True,  # ✅ 新同步的商品默认激活
                         'auto_created': True,
                         'sync_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                         'created_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                         'updated_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     })
                     synced += 1
+                    logger.info(f"✅ 新增同步商品: {p.get('projectname')} (nowuid: {nowuid})")
+                else:
+                    # ✅ 已存在的商品：更新商品名称和分类（但不改变价格设置）
+                    updates = {}
+                    if exists.get('product_name') != p.get('projectname'):
+                        updates['product_name'] = p.get('projectname', '')
+                    if exists.get('category') != (p.get('leixing') or '协议号'):
+                        updates['category'] = p.get('leixing') or '协议号'
+                    
+                    # ✅ 更新总部价格快照（仅用于参考）
+                    if abs(exists.get('original_price_snapshot', 0) - original_price) > 0.01:
+                        updates['original_price_snapshot'] = original_price
+                    
+                    if updates:
+                        updates['sync_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        updates['updated_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        self.config.agent_product_prices.update_one(
+                            {'agent_bot_id': self.config.AGENT_BOT_ID, 'original_nowuid': nowuid},
+                            {'$set': updates}
+                        )
+                        updated += 1
+            
+            if synced > 0 or updated > 0:
+                logger.info(f"✅ 商品同步完成: 新增 {synced} 个, 更新 {updated} 个")
+            
             return synced
         except Exception as e:
             logger.error(f"❌ 自动同步失败: {e}")
+            import traceback
+            traceback.print_exc()
             return 0
 
     def get_product_categories(self) -> List[Dict]:
         """获取商品分类列表（一级分类）- 仿照总部bot.py实现"""
         try:
+            # ✅ 每次获取分类时自动同步新商品
             self.auto_sync_new_products()
             
             # 获取所有商品和库存信息
@@ -290,8 +330,13 @@ class AgentBotCore:
                 nowuid = p.get('nowuid')
                 if not nowuid:
                     continue
+                
+                # ✅ 检查商品是否有价格（总部价格）
+                original_price = float(p.get('money', 0))
+                if original_price <= 0:
+                    continue
                     
-                # 检查是否是激活的代理商品
+                # ✅ 检查是否是激活的代理商品
                 agent_price = self.config.agent_product_prices.find_one({
                     'agent_bot_id': self.config.AGENT_BOT_ID,
                     'original_nowuid': nowuid,
@@ -1406,6 +1451,12 @@ class AgentBotHandlers:
 
     def start_command(self, update: Update, context: CallbackContext):
         user = update.effective_user
+        # ✅ 启动时触发一次商品同步
+        if user.id in ADMIN_USERS:
+            synced = self.core.auto_sync_new_products()
+            if synced > 0:
+                logger.info(f"✅ 启动时同步了 {synced} 个新商品")
+        
         if self.core.register_user(user.id, user.username or "", user.first_name or ""):
             text = f"""🎉 欢迎使用 {self.H(self.core.config.AGENT_NAME)}！
 
@@ -1424,7 +1475,8 @@ class AgentBotHandlers:
             if user.id in ADMIN_USERS:
                 kb.append([InlineKeyboardButton("💰 价格管理", callback_data="price_management"),
                            InlineKeyboardButton("📊 系统报表", callback_data="system_reports")])
-                kb.append([InlineKeyboardButton("💸 利润提现", callback_data="profit_center")])
+                kb.append([InlineKeyboardButton("💸 利润提现", callback_data="profit_center"),
+                           InlineKeyboardButton("🔄 同步商品", callback_data="sync_products")])
             kb.append([InlineKeyboardButton("📞 联系客服", callback_data="support"),
                        InlineKeyboardButton("❓ 使用帮助", callback_data="help")])
             update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
@@ -1442,7 +1494,8 @@ class AgentBotHandlers:
         if user.id in ADMIN_USERS:
             kb.append([InlineKeyboardButton("💰 价格管理", callback_data="price_management"),
                        InlineKeyboardButton("📊 系统报表", callback_data="system_reports")])
-            kb.append([InlineKeyboardButton("💸 利润提现", callback_data="profit_center")])
+            kb.append([InlineKeyboardButton("💸 利润提现", callback_data="profit_center"),
+                       InlineKeyboardButton("🔄 同步商品", callback_data="sync_products")])
         kb.append([InlineKeyboardButton("📞 联系客服", callback_data="support"),
                    InlineKeyboardButton("❓ 使用帮助", callback_data="help")])
         text = f"🏠 主菜单\n\n当前时间: {self.core._to_beijing(datetime.utcnow()).strftime('%Y-%m-%d %H:%M:%S')}"
@@ -1573,7 +1626,7 @@ class AgentBotHandlers:
             self.safe_edit_message(query, "❌ 暂无可用商品分类", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
             return
         
-        # 仿照总部的文本格式
+        # ✅ 仿照总部的文本格式（完全一致）
         text = (
             "<b>🛒 商品分类 - 请选择所需：</b>\n\n"
             "<b>❗️首次购买请先少量测试，避免纠纷</b>！\n\n"
@@ -1584,8 +1637,8 @@ class AgentBotHandlers:
         for c in cats:
             name = c['_id']
             stock = c['stock']
-            # 显示格式：分类名 [库存个数]
-            button_text = f"{name} [{stock}个]" if stock > 0 else f"{name} [0个]"
+            # ✅ 显示格式与总部完全一致：分类名 [库存个]
+            button_text = f"{name} [{stock}个]"
             kb.append([InlineKeyboardButton(button_text, callback_data=f"category_{name}")])
         
         kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main")])
@@ -1596,28 +1649,33 @@ class AgentBotHandlers:
         # 获取分类下的所有商品
         all_products = list(self.core.config.ejfl.find({'leixing': category}))
         
-        # 筛选有库存的商品并计算库存
+        # ✅ 筛选有效商品：有库存 + 有价格 + 激活的代理商品
         products_with_stock = []
         for p in all_products:
             nowuid = p.get('nowuid')
             if not nowuid:
                 continue
             
-            # 检查是否是激活的代理商品
-            agent_price = self.core.config.agent_product_prices.find_one({
+            # ✅ 先检查总部价格
+            original_price = float(p.get('money', 0))
+            if original_price <= 0:
+                continue
+            
+            # ✅ 检查是否是激活的代理商品
+            agent_price_doc = self.core.config.agent_product_prices.find_one({
                 'agent_bot_id': self.core.config.AGENT_BOT_ID,
                 'original_nowuid': nowuid,
                 'is_active': True
             })
             
-            if not agent_price:
+            if not agent_price_doc:
                 continue
             
-            # 获取价格和库存
+            # ✅ 获取实时价格和库存
             price = self.core.get_product_price(nowuid)
             stock = self.core.get_product_stock(nowuid)
             
-            # 只显示有库存且有价格的商品
+            # ✅ 只显示有库存且有价格的商品
             if stock > 0 and price is not None and price > 0:
                 p['stock'] = stock
                 p['price'] = price
@@ -1626,7 +1684,7 @@ class AgentBotHandlers:
         # 按库存降序排列（库存多的在前面）
         products_with_stock.sort(key=lambda x: -x['stock'])
         
-        # 仿照总部的文本格式
+        # ✅ 仿照总部的文本格式（完全一致）
         text = (
             "<b>🛒这是商品列表  选择你需要的分类：</b>\n\n"
             "❗️没使用过的本店商品的，请先少量购买测试，以免造成不必要的争执！谢谢合作！。\n\n"
@@ -1641,7 +1699,7 @@ class AgentBotHandlers:
             price = p['price']
             stock = p['stock']
             
-            # 按钮格式：商品名 价格U [库存: X个]
+            # ✅ 按钮格式与总部完全一致：商品名 价格U [库存: X个]
             button_text = f"{name} {price}U [库存: {stock}个]"
             kb.append([InlineKeyboardButton(button_text, callback_data=f"product_{nowuid}")])
         
@@ -1649,7 +1707,7 @@ class AgentBotHandlers:
         if not kb:
             kb.append([InlineKeyboardButton("暂无商品耐心等待", callback_data="no_action")])
         
-        # 返回按钮
+        # ✅ 返回按钮格式与总部保持一致
         kb.append([
             InlineKeyboardButton("🔙 返回", callback_data="back_products"),
             InlineKeyboardButton("❌ 关闭", callback_data=f"close {query.from_user.id}")
@@ -2056,6 +2114,56 @@ class AgentBotHandlers:
 
     def show_order_history(self, query):
         self.safe_edit_message(query, "📊 订单历史功能暂未实现", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
+    
+    def handle_sync_products(self, query):
+        """处理手动同步商品"""
+        uid = query.from_user.id
+        if uid not in ADMIN_USERS:
+            query.answer("❌ 无权限", show_alert=True)
+            return
+        
+        try:
+            # 执行同步
+            synced = self.core.auto_sync_new_products()
+            
+            # 获取统计信息
+            total_products = self.core.config.agent_product_prices.count_documents({
+                'agent_bot_id': self.core.config.AGENT_BOT_ID
+            })
+            active_products = self.core.config.agent_product_prices.count_documents({
+                'agent_bot_id': self.core.config.AGENT_BOT_ID,
+                'is_active': True
+            })
+            
+            text = f"""🔄 商品同步完成
+
+📊 同步结果：
+• 新增商品：{synced} 个
+• 总商品数：{total_products} 个
+• 激活商品：{active_products} 个
+• 未激活：{total_products - active_products} 个
+
+✅ 同步时间：{self.core._to_beijing(datetime.utcnow()).strftime('%Y-%m-%d %H:%M:%S')}
+
+💡 提示：
+• 新同步的商品默认激活
+• 可在价格管理中设置代理价格
+• 建议定期同步以获取最新商品"""
+            
+            kb = [
+                [InlineKeyboardButton("💰 价格管理", callback_data="price_management"),
+                 InlineKeyboardButton("🛍️ 商品中心", callback_data="products")],
+                [InlineKeyboardButton("🔄 再次同步", callback_data="sync_products"),
+                 InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]
+            ]
+            
+            self.safe_edit_message(query, text, kb, parse_mode=None)
+            
+        except Exception as e:
+            logger.error(f"❌ 同步商品失败: {e}")
+            import traceback
+            traceback.print_exc()
+            query.answer("❌ 同步失败，请稍后重试", show_alert=True)
 
     # ========== 回调分发 ==========
     def button_callback(self, update: Update, context: CallbackContext):
@@ -2148,6 +2256,10 @@ class AgentBotHandlers:
                 self.start_withdrawal(q); q.answer(); return
             elif d == "profit_withdraw_list":
                 self.show_withdrawal_list(q); q.answer(); return
+            
+            # ✅ 商品同步
+            elif d == "sync_products":
+                self.handle_sync_products(q); q.answer(); return
 
             # 充值金额快捷按钮
             elif d.startswith("recharge_amount_"):
