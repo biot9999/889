@@ -157,6 +157,9 @@ class AgentBotConfig:
         # 确保包含空字符串和会被映射为None的情况
         if "" not in self.AGENT_PROTOCOL_CATEGORY_ALIASES:
             self.AGENT_PROTOCOL_CATEGORY_ALIASES.append("")
+        
+        # ✅ 零库存分类显示配置
+        self.AGENT_SHOW_EMPTY_CATEGORIES = os.getenv("AGENT_SHOW_EMPTY_CATEGORIES", "1") in ("1", "true", "True")
 
         try:
             self.client = MongoClient(self.MONGODB_URI)
@@ -166,6 +169,7 @@ class AgentBotConfig:
 
             self.ejfl = self.db['ejfl']
             self.hb = self.db['hb']
+            self.fenlei = self.db['fenlei']  # ✅ 总部分类表
             self.agent_product_prices = self.db['agent_product_prices']
             self.agent_profit_account = self.db['agent_profit_account']
             self.withdrawal_requests = self.db['withdrawal_requests']
@@ -428,61 +432,85 @@ class AgentBotCore:
             return 0
 
     def get_product_categories(self) -> List[Dict]:
-        """获取商品分类列表（一级分类）- 仿照总部bot.py实现"""
+        """获取商品分类列表（一级分类）- 直接克隆总部分类，实时同步"""
         try:
             # ✅ 每次获取分类时自动同步新商品
             self.auto_sync_new_products()
             
-            # 获取所有商品和库存信息
-            all_products = list(self.config.ejfl.find({}))
-            categories = {}
+            # ✅ 直接从总部 ejfl 表读取所有商品的 leixing 字段作为分类
+            # 这样就和总部保持完全一致
+            pipeline = [
+                {'$group': {
+                    '_id': '$leixing',  # 按 leixing 分组（总部的分类字段）
+                    'count': {'$sum': 1}
+                }}
+            ]
             
-            for p in all_products:
-                nowuid = p.get('nowuid')
-                if not nowuid:
+            hq_categories = list(self.config.ejfl.aggregate(pipeline))
+            
+            # ✅ 为每个总部分类计算代理的库存
+            categories_map = {}
+            
+            for cat_data in hq_categories:
+                category_name = cat_data['_id']
+                
+                # 处理 None 或空字符串的分类名（总部可能有这种情况）
+                if category_name is None:
+                    category_name = '协议号'  # 总部对 None 的默认显示
+                
+                # ✅ 查询该分类下在代理这边激活的商品
+                # 使用总部的 leixing 字段匹配
+                hq_products = list(self.config.ejfl.find({'leixing': cat_data['_id']}, {'nowuid': 1}))
+                hq_nowuid_list = [p.get('nowuid') for p in hq_products if p.get('nowuid')]
+                
+                if not hq_nowuid_list:
                     continue
                 
-                # ✅ 检查商品是否有价格（总部价格）
-                original_price = float(p.get('money', 0))
-                if original_price <= 0:
-                    continue
-                    
-                # ✅ 检查是否是激活的代理商品
-                agent_price = self.config.agent_product_prices.find_one({
+                # 查询这些商品中有多少在代理这边是激活的
+                agent_products = list(self.config.agent_product_prices.find({
                     'agent_bot_id': self.config.AGENT_BOT_ID,
-                    'original_nowuid': nowuid,
+                    'original_nowuid': {'$in': hq_nowuid_list},
                     'is_active': True
-                })
+                }, {'original_nowuid': 1}))
                 
-                if not agent_price:
-                    continue
+                agent_nowuid_list = [p.get('original_nowuid') for p in agent_products if p.get('original_nowuid')]
                 
-                # 获取库存
-                stock = self.config.hb.count_documents({'nowuid': nowuid, 'state': 0})
+                # 统计库存（只统计代理激活商品的库存）
+                if agent_nowuid_list:
+                    stock = self.config.hb.count_documents({
+                        'nowuid': {'$in': agent_nowuid_list},
+                        'state': 0
+                    })
+                else:
+                    stock = 0
                 
-                # 分类名称（处理None情况）
-                category = p.get('leixing') or '协议号'
-                
-                # 累加分类的库存
-                if category not in categories:
-                    categories[category] = {'name': category, 'stock': 0, 'count': 0}
-                categories[category]['stock'] += stock
-                categories[category]['count'] += 1
+                # 即使库存为0，也添加分类（如果开启了零库存显示）
+                if stock > 0 or self.config.AGENT_SHOW_EMPTY_CATEGORIES:
+                    categories_map[category_name] = {
+                        'name': category_name,
+                        'stock': stock,
+                        'count': len(agent_nowuid_list)
+                    }
             
-            # 转换为列表并按库存排序
+            # 转换为列表
             result = [
                 {
                     '_id': cat_info['name'],
                     'stock': cat_info['stock'],
                     'count': cat_info['count']
                 }
-                for cat_info in categories.values()
+                for cat_info in categories_map.values()
             ]
-            result.sort(key=lambda x: -x['stock'])  # 库存多的在前面
             
+            # 按库存降序排序
+            result.sort(key=lambda x: -x['stock'])
+            
+            logger.info(f"✅ 获取商品分类成功（克隆总部）: 共 {len(result)} 个分类")
             return result
         except Exception as e:
             logger.error(f"❌ 获取商品分类失败: {e}")
+            import traceback
+            traceback.print_exc()
             return []
 
     def get_products_by_category(self, category: str, page: int = 1, limit: int = 10) -> Dict:
@@ -1776,86 +1804,14 @@ class AgentBotHandlers:
 
     # ========== 商品相关 ==========
     def show_product_categories(self, query):
-        """显示商品分类（动态分类：基于已同步商品+库存）"""
+        """显示商品分类（增强版：支持显示零库存分类）"""
         try:
-            # ✅ 从 agent_product_prices 聚合所有激活商品的分类
-            pipeline = [
-                {'$match': {
-                    'agent_bot_id': self.core.config.AGENT_BOT_ID,
-                    'is_active': True
-                }},
-                {'$group': {
-                    '_id': '$category',
-                    'product_count': {'$sum': 1}
-                }}
-            ]
+            # ✅ 调用核心方法获取分类列表（包含零库存分类）
+            categories = self.core.get_product_categories()
             
-            categories_data = list(self.core.config.agent_product_prices.aggregate(pipeline))
-            
-            if not categories_data:
+            if not categories:
                 self.safe_edit_message(query, "❌ 暂无可用商品分类", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
                 return
-            
-            # ✅ 统计每个分类的库存（合并别名）
-            categories_map = {}  # {unified_cat_name: {stock, count, nowuids}}
-            
-            for cat_data in categories_data:
-                cat_name = cat_data['_id']
-                
-                # ✅ 将别名归并到统一分类
-                # 检查是否为协议号别名
-                all_aliases = [None] + self.core.config.AGENT_PROTOCOL_CATEGORY_ALIASES
-                if cat_name in all_aliases or cat_name == self.core.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
-                    display_cat_name = self.core.config.AGENT_PROTOCOL_CATEGORY_UNIFIED
-                else:
-                    display_cat_name = cat_name
-                
-                # ✅ 获取该分类下所有激活商品的nowuid列表
-                agent_products = list(self.core.config.agent_product_prices.find({
-                    'agent_bot_id': self.core.config.AGENT_BOT_ID,
-                    'category': cat_name,
-                    'is_active': True
-                }, {'original_nowuid': 1}))
-                
-                if not agent_products:
-                    continue
-                
-                # ✅ 提取nowuid列表
-                nowuid_list = [ap.get('original_nowuid') for ap in agent_products if ap.get('original_nowuid')]
-                
-                if not nowuid_list:
-                    continue
-                
-                # ✅ 统计这些商品的实际库存
-                stock = self.core.config.hb.count_documents({
-                    'nowuid': {'$in': nowuid_list},
-                    'state': 0
-                })
-                
-                # 累加到统一分类
-                if display_cat_name not in categories_map:
-                    categories_map[display_cat_name] = {'stock': 0, 'count': 0, 'nowuids': set()}
-                
-                categories_map[display_cat_name]['stock'] += stock
-                categories_map[display_cat_name]['count'] += len(nowuid_list)
-                categories_map[display_cat_name]['nowuids'].update(nowuid_list)
-            
-            # 转换为列表
-            categories_with_stock = []
-            for cat_name, cat_info in categories_map.items():
-                if cat_info['stock'] > 0:  # 只显示有库存的分类
-                    categories_with_stock.append({
-                        'name': cat_name,
-                        'stock': cat_info['stock'],
-                        'count': cat_info['count']
-                    })
-            
-            if not categories_with_stock:
-                self.safe_edit_message(query, "❌ 暂无库存商品", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
-                return
-            
-            # 按库存降序排序
-            categories_with_stock.sort(key=lambda x: -x['stock'])
             
             text = (
                 "🛒 <b>商品分类 - 请选择所需商品：</b>\n\n"
@@ -1865,9 +1821,9 @@ class AgentBotHandlers:
             )
             
             kb = []
-            for cat in categories_with_stock:
-                button_text = f"{cat['name']}  [{cat['stock']}个]"
-                kb.append([InlineKeyboardButton(button_text, callback_data=f"category_{cat['name']}")])
+            for cat in categories:
+                button_text = f"{cat['_id']}  [{cat['stock']}个]"
+                kb.append([InlineKeyboardButton(button_text, callback_data=f"category_{cat['_id']}")])
             
             kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main")])
             
@@ -1880,35 +1836,47 @@ class AgentBotHandlers:
             self.safe_edit_message(query, "❌ 加载失败，请重试", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
             
     def show_category_products(self, query, category: str, page: int = 1):
-        """显示分类下的商品（二级分类）"""
+        """显示分类下的商品（二级分类）- 直接克隆总部逻辑"""
         try:
             # ✅ 先自动同步新商品，确保最新商品能显示
             self.core.auto_sync_new_products()
             
             skip = (page - 1) * 10
             
-            # ✅ 判断是否为统一协议号分类，如果是，查询所有别名
-            all_aliases = [None] + self.core.config.AGENT_PROTOCOL_CATEGORY_ALIASES
-            if category == self.core.config.AGENT_PROTOCOL_CATEGORY_UNIFIED or category in all_aliases:
-                # 查询所有协议号别名（包括统一分类名本身）
-                category_match = {
-                    'agent_bot_id': self.core.config.AGENT_BOT_ID,
-                    'is_active': True,
-                    'category': {
-                        '$in': [self.core.config.AGENT_PROTOCOL_CATEGORY_UNIFIED] + self.core.config.AGENT_PROTOCOL_CATEGORY_ALIASES + [None]
-                    }
-                }
+            # ✅ 直接按总部的 leixing 字段查询
+            # 处理"协议号"显示名称映射到 None 的情况（总部的逻辑）
+            if category == '协议号':
+                hq_category = None
             else:
-                # 其他分类，按原逻辑查询
-                category_match = {
-                    'agent_bot_id': self.core.config.AGENT_BOT_ID,
-                    'is_active': True,
-                    'category': category
-                }
+                hq_category = category
             
-            # ✅ 从 agent_product_prices 表按 category 字段查询（这样新商品也能显示）
+            # ✅ 从总部 ejfl 表查询该分类的商品
+            hq_products = list(self.config.ejfl.find({'leixing': hq_category}, {'nowuid': 1}))
+            hq_nowuid_list = [p.get('nowuid') for p in hq_products if p.get('nowuid')]
+            
+            if not hq_nowuid_list:
+                # 该分类在总部没有商品
+                text = (
+                    "<b>🛒 这是商品列表  选择你需要的分类：</b>\n\n"
+                    "❗️没使用过的本店商品的，请先少量购买测试，以免造成不必要的争执！谢谢合作！。\n\n"
+                    "❗有密码的账户售后时间1小时内，二级未知的账户售后30分钟内！\n\n"
+                    "❗购买后请第一时间检查账户，提供证明处理售后 超时损失自付！"
+                )
+                kb = [
+                    [InlineKeyboardButton("暂无商品耐心等待", callback_data="no_action")],
+                    [InlineKeyboardButton("🔙 返回", callback_data="back_products"),
+                     InlineKeyboardButton("❌ 关闭", callback_data=f"close {query.from_user.id}")]
+                ]
+                self.safe_edit_message(query, text, kb, parse_mode='HTML')
+                return
+            
+            # ✅ 查询这些商品在代理这边的价格和激活状态
             pipeline = [
-                {'$match': category_match},
+                {'$match': {
+                    'agent_bot_id': self.core.config.AGENT_BOT_ID,
+                    'original_nowuid': {'$in': hq_nowuid_list},
+                    'is_active': True
+                }},
                 {'$lookup': {
                     'from': 'ejfl',
                     'localField': 'original_nowuid',
