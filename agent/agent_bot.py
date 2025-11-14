@@ -298,7 +298,7 @@ class AgentBotCore:
                         'updated_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     })
                     synced += 1
-                    logger.info(f"✅ 新增同步商品: {p.get('projectname')} (nowuid: {nowuid})")
+                    logger.info(f"✅ 新增同步商品: {p.get('projectname')} (nowuid: {nowuid}, 总部价: {original_price}U, 代理价: {agent_price}U)")
                 else:
                     # ✅ 已存在的商品：更新商品名称和分类（但不改变价格设置）
                     updates = {}
