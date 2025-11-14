@@ -324,9 +324,13 @@ class AgentBotCore:
                 # ✅ 安全获取总部价格（处理异常情况）
                 original_price = self._safe_price(p.get('money'))
                 
-                # ✅ 统一分类逻辑：使用 _unify_category 助手
+                # ✅ 保留原始分类：只对协议号别名做统一，其它分类保持原样
                 leixing = p.get('leixing')
-                category = self._unify_category(leixing)
+                # 只统一协议号别名，其它分类直接使用原值
+                if leixing is None or leixing in self.config.AGENT_PROTOCOL_CATEGORY_ALIASES:
+                    category = self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED
+                else:
+                    category = leixing  # 保持原始分类名
                 
                 if not exists:
                     # ✅ 新商品：创建代理价格记录
