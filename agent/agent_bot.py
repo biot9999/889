@@ -137,6 +137,12 @@ class AgentBotConfig:
 
         # 取消订单后是否删除原消息 (默认删除)
         self.RECHARGE_DELETE_ON_CANCEL = os.getenv("RECHARGE_DELETE_ON_CANCEL", "1") in ("1", "true", "True")
+        
+        # ✅ 商品同步配置
+        self.AGENT_ENABLE_PRODUCT_WATCH = os.getenv("AGENT_ENABLE_PRODUCT_WATCH", "1") in ("1", "true", "True")
+        self.PRODUCT_SYNC_POLL_SECONDS = int(os.getenv("PRODUCT_SYNC_POLL_SECONDS", "120"))
+        if self.PRODUCT_SYNC_POLL_SECONDS < 30:
+            self.PRODUCT_SYNC_POLL_SECONDS = 30  # 最小30秒
 
         try:
             self.client = MongoClient(self.MONGODB_URI)
@@ -180,6 +186,22 @@ class AgentBotCore:
         if dt is None:
             dt = datetime.utcnow()
         return dt + timedelta(hours=8)
+    
+    def _safe_price(self, money_field: Any) -> float:
+        """安全解析价格字段，处理空值、字符串等异常情况"""
+        try:
+            if money_field is None:
+                return 0.0
+            if isinstance(money_field, (int, float)):
+                return float(money_field)
+            if isinstance(money_field, str):
+                money_field = money_field.strip()
+                if not money_field:
+                    return 0.0
+                return float(money_field)
+            return 0.0
+        except (ValueError, TypeError):
+            return 0.0
 
     # ---------- UI 辅助 ----------
     def _h(self, s: Any) -> str:
@@ -255,11 +277,12 @@ class AgentBotCore:
             return None
 
     def auto_sync_new_products(self):
-        """自动同步总部新增商品到代理"""
+        """自动同步总部新增商品到代理（增强版：支持价格为0的商品预建记录）"""
         try:
             all_products = list(self.config.ejfl.find({}))
             synced = 0
             updated = 0
+            activated = 0
             
             for p in all_products:
                 nowuid = p.get('nowuid')
@@ -272,42 +295,45 @@ class AgentBotCore:
                     'original_nowuid': nowuid
                 })
                 
-                # ✅ 获取总部价格
-                original_price = float(p.get('money', 0))
+                # ✅ 安全获取总部价格（处理异常情况）
+                original_price = self._safe_price(p.get('money'))
                 
                 if not exists:
                     # ✅ 新商品：创建代理价格记录
-                    # 只有总部价格大于0的商品才同步
-                    if original_price <= 0:
-                        continue
-                    
                     agent_markup = 0.0  # 初始无加价，后续管理员手动设置
-                    agent_price = round(original_price + agent_markup, 2)  # ✅ 计算代理价格
+                    agent_price = round(original_price + agent_markup, 2)
+                    
+                    # ✅ 即使总部价为0也创建记录，但标记为未激活
+                    is_active = original_price > 0
+                    needs_price_set = original_price <= 0
+                    
                     self.config.agent_product_prices.insert_one({
                         'agent_bot_id': self.config.AGENT_BOT_ID,
                         'original_nowuid': nowuid,
-                        'agent_markup': agent_markup,  # ✅ 存储加价（利润标记）
-                        'agent_price': agent_price,  # ✅ 同时存储代理价格
-                        'original_price_snapshot': original_price,  # 参考用，不作实际计算
+                        'agent_markup': agent_markup,
+                        'agent_price': agent_price,
+                        'original_price_snapshot': original_price,
                         'product_name': p.get('projectname', ''),
                         'category': p.get('leixing') or '协议号',
-                        'is_active': True,  # ✅ 新同步的商品默认激活
+                        'is_active': is_active,
+                        'needs_price_set': needs_price_set,
                         'auto_created': True,
                         'sync_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                         'created_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                         'updated_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     })
                     synced += 1
-                    logger.info(f"✅ 新增同步商品: {p.get('projectname')} (nowuid: {nowuid}, 总部价: {original_price}U, 代理价: {agent_price}U)")
+                    status_msg = "待补价" if needs_price_set else "已激活"
+                    logger.info(f"✅ 新增同步商品: {p.get('projectname')} (nowuid: {nowuid}, 总部价: {original_price}U, 代理价: {agent_price}U, 状态: {status_msg})")
                 else:
-                    # ✅ 已存在的商品：更新商品名称和分类（但不改变价格设置）
+                    # ✅ 已存在的商品：更新商品名称、分类和价格
                     updates = {}
                     if exists.get('product_name') != p.get('projectname'):
                         updates['product_name'] = p.get('projectname', '')
                     if exists.get('category') != (p.get('leixing') or '协议号'):
                         updates['category'] = p.get('leixing') or '协议号'
                     
-                    # ✅ 更新总部价格快照（仅用于参考）
+                    # ✅ 更新总部价格快照
                     if abs(exists.get('original_price_snapshot', 0) - original_price) > 0.01:
                         updates['original_price_snapshot'] = original_price
                     
@@ -316,6 +342,13 @@ class AgentBotCore:
                     new_agent_price = round(original_price + agent_markup, 2)
                     if abs(exists.get('agent_price', 0) - new_agent_price) > 0.01:
                         updates['agent_price'] = new_agent_price
+                    
+                    # ✅ 如果之前是待补价状态，现在总部价>0，自动激活
+                    if exists.get('needs_price_set') and original_price > 0:
+                        updates['is_active'] = True
+                        updates['needs_price_set'] = False
+                        activated += 1
+                        logger.info(f"✅ 自动激活商品: {p.get('projectname')} (总部价已补: {original_price}U)")
                     
                     if updates:
                         updates['sync_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -326,8 +359,8 @@ class AgentBotCore:
                         )
                         updated += 1
             
-            if synced > 0 or updated > 0:
-                logger.info(f"✅ 商品同步完成: 新增 {synced} 个, 更新 {updated} 个")
+            if synced > 0 or updated > 0 or activated > 0:
+                logger.info(f"✅ 商品同步完成: 新增 {synced} 个, 更新 {updated} 个, 激活 {activated} 个")
             
             return synced
         except Exception as e:
@@ -1674,33 +1707,32 @@ class AgentBotHandlers:
 
     # ========== 商品相关 ==========
     def show_product_categories(self, query):
-        """显示商品分类（一级分类）- 从fenlei表读取"""
+        """显示商品分类（动态分类：基于已同步商品+库存）"""
         try:
-            # ✅ 先自动同步新商品
-            self.core.auto_sync_new_products()
+            # ✅ 从 agent_product_prices 聚合所有激活商品的分类
+            pipeline = [
+                {'$match': {
+                    'agent_bot_id': self.core.config.AGENT_BOT_ID,
+                    'is_active': True
+                }},
+                {'$group': {
+                    '_id': '$category',
+                    'product_count': {'$sum': 1}
+                }}
+            ]
             
-            # ✅ 从 fenlei 表读分类
-            fenlei_coll = self.core.config.db['fenlei']
-            all_categories = list(fenlei_coll.find({}))
+            categories_data = list(self.core.config.agent_product_prices.aggregate(pipeline))
             
-            if not all_categories:
+            if not categories_data:
                 self.safe_edit_message(query, "❌ 暂无可用商品分类", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
                 return
             
-            text = (
-                "🛒 <b>商品分类 - 请选择所需商品：</b>\n\n"
-                "「快送商品区」-「热选择所需商品」\n\n"
-                "<b>❗️首次购买请先少量测试，避免纠纷</b>！\n\n"
-                "<b>❗️长期未使用账户可能会出现问题，联系客服处理</b>。"
-            )
-            
-            kb = []
-            
-            # ✅ 统计每个分类的库存（修复：只统计已同步且激活的代理商品）
-            for category in all_categories:
-                cat_name = category.get('projectname', '未知分类')
+            # ✅ 统计每个分类的库存
+            categories_with_stock = []
+            for cat_data in categories_data:
+                cat_name = cat_data['_id']
                 
-                # ✅ 获取该分类下所有激活的代理商品的nowuid列表
+                # ✅ 获取该分类下所有激活商品的nowuid列表
                 agent_products = list(self.core.config.agent_product_prices.find({
                     'agent_bot_id': self.core.config.AGENT_BOT_ID,
                     'category': cat_name,
@@ -1723,18 +1755,41 @@ class AgentBotHandlers:
                 })
                 
                 if stock > 0:  # 只显示有库存的分类
-                    button_text = f"{cat_name}  [{stock}个]"
-                    kb.append([InlineKeyboardButton(button_text, callback_data=f"category_{cat_name}")])
+                    categories_with_stock.append({
+                        'name': cat_name,
+                        'stock': stock,
+                        'count': len(nowuid_list)
+                    })
             
-            if not kb:
+            if not categories_with_stock:
                 self.safe_edit_message(query, "❌ 暂无库存商品", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
                 return
             
+            # 按库存降序排序
+            categories_with_stock.sort(key=lambda x: -x['stock'])
+            
+            text = (
+                "🛒 <b>商品分类 - 请选择所需商品：</b>\n\n"
+                "「快送商品区」-「热选择所需商品」\n\n"
+                "<b>❗️首次购买请先少量测试，避免纠纷</b>！\n\n"
+                "<b>❗️长期未使用账户可能会出现问题，联系客服处理</b>。"
+            )
+            
+            kb = []
+            for cat in categories_with_stock:
+                button_text = f"{cat['name']}  [{cat['stock']}个]"
+                kb.append([InlineKeyboardButton(button_text, callback_data=f"category_{cat['name']}")])
+            
+            # ✅ 添加刷新按钮
+            kb.append([InlineKeyboardButton("🔄 刷新", callback_data="products")])
             kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main")])
+            
             self.safe_edit_message(query, text, kb, parse_mode='HTML')
             
         except Exception as e:
             logger.error(f"❌ 获取商品分类失败: {e}")
+            import traceback
+            traceback.print_exc()
             self.safe_edit_message(query, "❌ 加载失败，请重试", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
             
     def show_category_products(self, query, category: str, page: int = 1):
@@ -2206,6 +2261,7 @@ class AgentBotHandlers:
             pag.append(InlineKeyboardButton("➡️ 下一页", callback_data=f"price_page_{page+1}"))
         if pag:
             kb.append(pag)
+        kb.append([InlineKeyboardButton("🔄 同步新品", callback_data="force_sync_products")])
         kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main")])
         self.safe_edit_message(query, text, kb, parse_mode=None)
 
@@ -2424,6 +2480,12 @@ class AgentBotHandlers:
             # 价格管理 / 报表
             elif d == "price_management":
                 self.show_price_management(q); q.answer(); return
+            elif d == "force_sync_products":
+                # ✅ 强制同步新品
+                synced = self.core.auto_sync_new_products()
+                q.answer(f"✅ 同步完成！新增/更新 {synced} 个商品", show_alert=True)
+                self.show_price_management(q)
+                return
             elif d.startswith("price_page_"):
                 self.show_price_management(q, int(d.replace("price_page_",""))); q.answer(); return
             elif d.startswith("edit_price_"):
@@ -2681,6 +2743,84 @@ class AgentBot:
         self.handlers = AgentBotHandlers(self.core)
         self.updater = Updater(token=token, use_context=True)
         self.dispatcher = self.updater.dispatcher
+        self._watch_thread = None
+        self._watch_stop_flag = False
+
+    def start_headquarters_product_watch(self):
+        """启动总部商品 Change Stream 监听线程"""
+        import threading
+        
+        def _watch_loop():
+            """Change Stream 监听循环"""
+            logger.info("🔍 启动总部商品 Change Stream 监听线程...")
+            fail_count = 0
+            max_fails = 5
+            
+            while not self._watch_stop_flag:
+                try:
+                    # 尝试使用 Change Streams
+                    logger.info("📡 尝试连接 MongoDB Change Streams...")
+                    with self.config.ejfl.watch([
+                        {'$match': {
+                            'operationType': {'$in': ['insert', 'update', 'replace']}
+                        }}
+                    ]) as stream:
+                        logger.info("✅ MongoDB Change Streams 连接成功，开始监听...")
+                        fail_count = 0  # 重置失败计数
+                        
+                        for change in stream:
+                            if self._watch_stop_flag:
+                                break
+                            
+                            try:
+                                op_type = change.get('operationType')
+                                doc_key = change.get('documentKey', {}).get('_id')
+                                logger.info(f"📢 检测到商品变更: {op_type} (doc_id: {doc_key})")
+                                
+                                # 触发同步
+                                synced = self.core.auto_sync_new_products()
+                                if synced > 0:
+                                    logger.info(f"✅ Change Stream 触发同步成功: {synced} 个商品")
+                            except Exception as e:
+                                logger.warning(f"处理 Change Stream 事件异常: {e}")
+                        
+                except Exception as e:
+                    fail_count += 1
+                    error_msg = str(e).lower()
+                    
+                    # 检查是否是副本集未配置错误
+                    if 'repl' in error_msg or 'replica' in error_msg or 'not supported' in error_msg:
+                        logger.warning(f"⚠️ MongoDB Change Streams 不可用（可能未配置副本集）: {e}")
+                        logger.info("💡 已自动回退到轮询模式，Change Stream 监听线程退出")
+                        break
+                    else:
+                        logger.warning(f"❌ Change Stream 连接失败 ({fail_count}/{max_fails}): {e}")
+                    
+                    if fail_count >= max_fails:
+                        logger.warning(f"⚠️ Change Stream 累计失败 {max_fails} 次，退出监听线程，依赖轮询兜底")
+                        break
+                    
+                    # 等待后重试
+                    if not self._watch_stop_flag:
+                        time.sleep(5)
+            
+            logger.info("🛑 Change Stream 监听线程已退出")
+        
+        if self.config.AGENT_ENABLE_PRODUCT_WATCH:
+            self._watch_thread = threading.Thread(target=_watch_loop, daemon=True, name="ProductWatch")
+            self._watch_thread.start()
+            logger.info("✅ Change Stream 监听线程已启动")
+        else:
+            logger.info("ℹ️ Change Stream 监听已禁用（环境变量 AGENT_ENABLE_PRODUCT_WATCH=0）")
+
+    def _job_auto_product_poll(self, context: CallbackContext):
+        """定时轮询商品同步任务（兜底方案）"""
+        try:
+            synced = self.core.auto_sync_new_products()
+            if synced > 0:
+                logger.info(f"✅ 轮询触发商品同步: {synced} 个商品")
+        except Exception as e:
+            logger.warning(f"轮询同步任务异常: {e}")
 
     def setup_handlers(self):
         self.dispatcher.add_handler(CommandHandler("start", self.handlers.start_command))
@@ -2688,6 +2828,7 @@ class AgentBot:
         self.dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, self.handlers.handle_text_message))
         logger.info("✅ 处理器设置完成")
 
+        # ✅ 充值自动校验任务
         try:
             self.updater.job_queue.run_repeating(
                 self._job_auto_recharge_check,
@@ -2697,6 +2838,17 @@ class AgentBot:
             logger.info(f"✅ 已启动充值自动校验任务（间隔 {self.config.RECHARGE_POLL_INTERVAL_SECONDS}s）")
         except Exception as e:
             logger.warning(f"启动自动校验任务失败: {e}")
+        
+        # ✅ 商品同步轮询任务（兜底方案）
+        try:
+            self.updater.job_queue.run_repeating(
+                self._job_auto_product_poll,
+                interval=self.config.PRODUCT_SYNC_POLL_SECONDS,
+                first=10  # 首次延迟10秒启动
+            )
+            logger.info(f"✅ 已启动商品同步轮询任务（间隔 {self.config.PRODUCT_SYNC_POLL_SECONDS}s，兜底方案）")
+        except Exception as e:
+            logger.warning(f"启动商品同步轮询任务失败: {e}")
 
     def _job_auto_recharge_check(self, context: CallbackContext):
         try:
@@ -2707,11 +2859,22 @@ class AgentBot:
     def run(self):
         try:
             self.setup_handlers()
+            
+            # ✅ 启动 Change Stream 监听线程（如果启用）
+            self.start_headquarters_product_watch()
+            
             self.updater.start_polling()
             logger.info("🚀 机器人启动成功，开始监听消息...")
             self.updater.idle()
+        except KeyboardInterrupt:
+            logger.info("👋 收到退出信号，正在停止...")
+            self._watch_stop_flag = True
+            if self._watch_thread and self._watch_thread.is_alive():
+                self._watch_thread.join(timeout=3)
+            raise
         except Exception as e:
             logger.error(f"❌ 机器人运行失败: {e}")
+            self._watch_stop_flag = True
             raise
 
 
