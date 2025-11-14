@@ -282,10 +282,12 @@ class AgentBotCore:
                         continue
                     
                     agent_markup = 0.0  # 初始无加价，后续管理员手动设置
+                    agent_price = round(original_price + agent_markup, 2)  # ✅ 计算代理价格
                     self.config.agent_product_prices.insert_one({
                         'agent_bot_id': self.config.AGENT_BOT_ID,
                         'original_nowuid': nowuid,
-                        'agent_markup': agent_markup,  # ✅ 存储加价（利润标记），不存储固定代理价
+                        'agent_markup': agent_markup,  # ✅ 存储加价（利润标记）
+                        'agent_price': agent_price,  # ✅ 同时存储代理价格
                         'original_price_snapshot': original_price,  # 参考用，不作实际计算
                         'product_name': p.get('projectname', ''),
                         'category': p.get('leixing') or '协议号',
@@ -296,7 +298,7 @@ class AgentBotCore:
                         'updated_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     })
                     synced += 1
-                    logger.info(f"✅ 新增同步商品: {p.get('projectname')} (nowuid: {nowuid})")
+                    logger.info(f"✅ 新增同步商品: {p.get('projectname')} (nowuid: {nowuid}, 总部价: {original_price}U, 代理价: {agent_price}U)")
                 else:
                     # ✅ 已存在的商品：更新商品名称和分类（但不改变价格设置）
                     updates = {}
@@ -308,6 +310,12 @@ class AgentBotCore:
                     # ✅ 更新总部价格快照（仅用于参考）
                     if abs(exists.get('original_price_snapshot', 0) - original_price) > 0.01:
                         updates['original_price_snapshot'] = original_price
+                    
+                    # ✅ 重新计算代理价格（总部价 + 加价）
+                    agent_markup = float(exists.get('agent_markup', 0))
+                    new_agent_price = round(original_price + agent_markup, 2)
+                    if abs(exists.get('agent_price', 0) - new_agent_price) > 0.01:
+                        updates['agent_price'] = new_agent_price
                     
                     if updates:
                         updates['sync_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -520,11 +528,12 @@ class AgentBotCore:
             if new_markup < 0:
                 return False, f"代理价格不能低于总部价格 {op} USDT（当前总部价），您输入的 {new_agent_price} USDT 低于总部价"
             
-            # ✅ 保存加价标记而不是固定代理价
+            # ✅ 保存加价标记和代理价格
             res = self.config.agent_product_prices.update_one(
                 {'agent_bot_id': self.config.AGENT_BOT_ID, 'original_nowuid': product_nowuid},
                 {'$set': {
                     'agent_markup': new_markup,
+                    'agent_price': new_agent_price,  # ✅ 同时更新代理价格
                     'updated_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     'manual_updated': True
                 }}
@@ -1499,11 +1508,10 @@ class AgentBotHandlers:
 
     def start_command(self, update: Update, context: CallbackContext):
         user = update.effective_user
-        # ✅ 启动时触发一次商品同步
-        if user.id in ADMIN_USERS:
-            synced = self.core.auto_sync_new_products()
-            if synced > 0:
-                logger.info(f"✅ 启动时同步了 {synced} 个新商品")
+        # ✅ 启动时触发一次商品同步（所有用户，确保商品列表是最新的）
+        synced = self.core.auto_sync_new_products()
+        if synced > 0:
+            logger.info(f"✅ 启动时同步了 {synced} 个新商品")
         
         if self.core.register_user(user.id, user.username or "", user.first_name or ""):
             text = f"""🎉 欢迎使用 {self.H(self.core.config.AGENT_NAME)}！
@@ -1668,6 +1676,7 @@ class AgentBotHandlers:
     def show_product_categories(self, query):
         """显示商品分类（一级分类）- 从fenlei表读取"""
         try:
+            # ✅ 先自动同步新商品
             self.core.auto_sync_new_products()
             
             # ✅ 从 fenlei 表读分类
@@ -1687,19 +1696,29 @@ class AgentBotHandlers:
             
             kb = []
             
-            # ✅ 统计每个分类的库存
+            # ✅ 统计每个分类的库存（修复：只统计已同步且激活的代理商品）
             for category in all_categories:
                 cat_name = category.get('projectname', '未知分类')
                 
-                # 统计该分类下的所有商品库存
-                # 需要从 ejfl 里找到 leixing 匹配这个分类的商品
+                # ✅ 获取该分类下所有激活的代理商品的nowuid列表
+                agent_products = list(self.core.config.agent_product_prices.find({
+                    'agent_bot_id': self.core.config.AGENT_BOT_ID,
+                    'category': cat_name,
+                    'is_active': True
+                }, {'original_nowuid': 1}))
+                
+                if not agent_products:
+                    continue
+                
+                # ✅ 提取nowuid列表
+                nowuid_list = [ap.get('original_nowuid') for ap in agent_products if ap.get('original_nowuid')]
+                
+                if not nowuid_list:
+                    continue
+                
+                # ✅ 统计这些商品的实际库存
                 stock = self.core.config.hb.count_documents({
-                    'nowuid': {
-                        '$in': [
-                            p.get('nowuid') 
-                            for p in self.core.config.ejfl.find({'leixing': cat_name})
-                        ]
-                    },
+                    'nowuid': {'$in': nowuid_list},
                     'state': 0
                 })
                 
@@ -1721,6 +1740,9 @@ class AgentBotHandlers:
     def show_category_products(self, query, category: str, page: int = 1):
         """显示分类下的商品（二级分类）"""
         try:
+            # ✅ 先自动同步新商品，确保最新商品能显示
+            self.core.auto_sync_new_products()
+            
             skip = (page - 1) * 10
             
             # ✅ 从 agent_product_prices 表按 category 字段查询（这样新商品也能显示）
