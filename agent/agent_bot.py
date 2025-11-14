@@ -1668,6 +1668,7 @@ class AgentBotHandlers:
     def show_product_categories(self, query):
         """显示商品分类（一级分类）- 从fenlei表读取"""
         try:
+            # ✅ 先自动同步新商品
             self.core.auto_sync_new_products()
             
             # ✅ 从 fenlei 表读分类
@@ -1687,19 +1688,29 @@ class AgentBotHandlers:
             
             kb = []
             
-            # ✅ 统计每个分类的库存
+            # ✅ 统计每个分类的库存（修复：只统计已同步且激活的代理商品）
             for category in all_categories:
                 cat_name = category.get('projectname', '未知分类')
                 
-                # 统计该分类下的所有商品库存
-                # 需要从 ejfl 里找到 leixing 匹配这个分类的商品
+                # ✅ 获取该分类下所有激活的代理商品的nowuid列表
+                agent_products = list(self.core.config.agent_product_prices.find({
+                    'agent_bot_id': self.core.config.AGENT_BOT_ID,
+                    'category': cat_name,
+                    'is_active': True
+                }, {'original_nowuid': 1}))
+                
+                if not agent_products:
+                    continue
+                
+                # ✅ 提取nowuid列表
+                nowuid_list = [ap.get('original_nowuid') for ap in agent_products if ap.get('original_nowuid')]
+                
+                if not nowuid_list:
+                    continue
+                
+                # ✅ 统计这些商品的实际库存
                 stock = self.core.config.hb.count_documents({
-                    'nowuid': {
-                        '$in': [
-                            p.get('nowuid') 
-                            for p in self.core.config.ejfl.find({'leixing': cat_name})
-                        ]
-                    },
+                    'nowuid': {'$in': nowuid_list},
                     'state': 0
                 })
                 
