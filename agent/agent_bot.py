@@ -87,6 +87,7 @@ HEADQUARTERS_NOTIFY_CHAT_ID = os.getenv("HQ_NOTIFY_CHAT_ID") or os.getenv("HEADQ
 
 # ✅ 统一协议号分类配置
 AGENT_PROTOCOL_CATEGORY_UNIFIED = os.getenv("AGENT_PROTOCOL_CATEGORY_UNIFIED", "🔥二次协议号（session+json）")
+AGENT_PROTOCOL_CATEGORY_ALIASES = os.getenv("AGENT_PROTOCOL_CATEGORY_ALIASES", "协议号,未分类,,🔥二手TG协议号（session+json）,二手TG协议号（session+json）,二次协议号（session+json）")
 
 class AgentBotConfig:
     """代理机器人配置"""
@@ -147,6 +148,15 @@ class AgentBotConfig:
         self.PRODUCT_SYNC_POLL_SECONDS = int(os.getenv("PRODUCT_SYNC_POLL_SECONDS", "120"))
         if self.PRODUCT_SYNC_POLL_SECONDS < 30:
             self.PRODUCT_SYNC_POLL_SECONDS = 30  # 最小30秒
+        
+        # ✅ 协议号分类统一配置
+        self.AGENT_PROTOCOL_CATEGORY_UNIFIED = AGENT_PROTOCOL_CATEGORY_UNIFIED
+        # 解析别名，并包含 None 和空字符串
+        aliases_str = AGENT_PROTOCOL_CATEGORY_ALIASES
+        self.AGENT_PROTOCOL_CATEGORY_ALIASES = [a.strip() for a in aliases_str.split(",") if a.strip() or a == ""]
+        # 确保包含空字符串和会被映射为None的情况
+        if "" not in self.AGENT_PROTOCOL_CATEGORY_ALIASES:
+            self.AGENT_PROTOCOL_CATEGORY_ALIASES.append("")
 
         try:
             self.client = MongoClient(self.MONGODB_URI)
@@ -206,6 +216,13 @@ class AgentBotCore:
             return 0.0
         except (ValueError, TypeError):
             return 0.0
+    
+    def _unify_category(self, leixing: Any) -> str:
+        """统一分类：将协议号类的别名都映射到统一分类"""
+        # None 也视作别名
+        if leixing is None or leixing in self.config.AGENT_PROTOCOL_CATEGORY_ALIASES:
+            return self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED
+        return leixing
 
     # ---------- UI 辅助 ----------
     def _h(self, s: Any) -> str:
@@ -303,12 +320,9 @@ class AgentBotCore:
                 # ✅ 安全获取总部价格（处理异常情况）
                 original_price = self._safe_price(p.get('money'))
                 
-                # ✅ 统一分类逻辑：协议号类商品统一归入一个分类
+                # ✅ 统一分类逻辑：使用 _unify_category 助手
                 leixing = p.get('leixing')
-                if leixing in [None, '', '协议号', '未分类']:
-                    category = AGENT_PROTOCOL_CATEGORY_UNIFIED
-                else:
-                    category = leixing
+                category = self._unify_category(leixing)
                 
                 if not exists:
                     # ✅ 新商品：创建代理价格记录
@@ -335,7 +349,7 @@ class AgentBotCore:
                         'updated_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     })
                     synced += 1
-                    if category == AGENT_PROTOCOL_CATEGORY_UNIFIED:
+                    if category == self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
                         unified += 1
                     status_msg = "待补价" if needs_price_set else "已激活"
                     logger.info(f"✅ 新增同步商品: {p.get('projectname')} (nowuid: {nowuid}, 总部价: {original_price}U, 代理价: {agent_price}U, 状态: {status_msg}, 分类: {category})")
@@ -349,8 +363,8 @@ class AgentBotCore:
                     old_category = exists.get('category')
                     if old_category != category:
                         updates['category'] = category
-                        # 如果是从旧的协议号分类更新为统一分类，计入unified计数
-                        if category == AGENT_PROTOCOL_CATEGORY_UNIFIED and old_category in [None, '', '协议号', '未分类']:
+                        # 如果是更新为统一分类，计入unified计数（不管旧分类是什么）
+                        if category == self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
                             unified += 1
                     
                     # ✅ 更新总部价格快照
@@ -377,6 +391,30 @@ class AgentBotCore:
                             {'agent_bot_id': self.config.AGENT_BOT_ID, 'original_nowuid': nowuid},
                             {'$set': updates}
                         )
+                        updated += 1
+            
+            # ✅ 处理旧数据：将已存在但未在总部商品中的记录，如果其分类在别名集合中，也统一更新
+            old_aliases_to_unify = [alias for alias in self.config.AGENT_PROTOCOL_CATEGORY_ALIASES if alias != self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED]
+            old_aliases_to_unify.append(None)  # 包含 None
+            
+            # 查找所有需要统一的旧记录
+            old_records = self.config.agent_product_prices.find({
+                'agent_bot_id': self.config.AGENT_BOT_ID,
+                'category': {'$in': old_aliases_to_unify}
+            })
+            
+            for old_rec in old_records:
+                old_cat = old_rec.get('category')
+                if old_cat != self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
+                    result = self.config.agent_product_prices.update_one(
+                        {'_id': old_rec['_id']},
+                        {'$set': {
+                            'category': self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED,
+                            'updated_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        }}
+                    )
+                    if result.modified_count > 0:
+                        unified += 1
                         updated += 1
             
             if synced > 0 or updated > 0 or activated > 0 or unified > 0:
@@ -1758,10 +1796,19 @@ class AgentBotHandlers:
                 self.safe_edit_message(query, "❌ 暂无可用商品分类", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
                 return
             
-            # ✅ 统计每个分类的库存
-            categories_with_stock = []
+            # ✅ 统计每个分类的库存（合并别名）
+            categories_map = {}  # {unified_cat_name: {stock, count, nowuids}}
+            
             for cat_data in categories_data:
                 cat_name = cat_data['_id']
+                
+                # ✅ 将别名归并到统一分类
+                # 检查是否为协议号别名
+                all_aliases = [None] + self.core.config.AGENT_PROTOCOL_CATEGORY_ALIASES
+                if cat_name in all_aliases or cat_name == self.core.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
+                    display_cat_name = self.core.config.AGENT_PROTOCOL_CATEGORY_UNIFIED
+                else:
+                    display_cat_name = cat_name
                 
                 # ✅ 获取该分类下所有激活商品的nowuid列表
                 agent_products = list(self.core.config.agent_product_prices.find({
@@ -1785,11 +1832,22 @@ class AgentBotHandlers:
                     'state': 0
                 })
                 
-                if stock > 0:  # 只显示有库存的分类
+                # 累加到统一分类
+                if display_cat_name not in categories_map:
+                    categories_map[display_cat_name] = {'stock': 0, 'count': 0, 'nowuids': set()}
+                
+                categories_map[display_cat_name]['stock'] += stock
+                categories_map[display_cat_name]['count'] += len(nowuid_list)
+                categories_map[display_cat_name]['nowuids'].update(nowuid_list)
+            
+            # 转换为列表
+            categories_with_stock = []
+            for cat_name, cat_info in categories_map.items():
+                if cat_info['stock'] > 0:  # 只显示有库存的分类
                     categories_with_stock.append({
                         'name': cat_name,
-                        'stock': stock,
-                        'count': len(nowuid_list)
+                        'stock': cat_info['stock'],
+                        'count': cat_info['count']
                     })
             
             if not categories_with_stock:
@@ -1829,13 +1887,28 @@ class AgentBotHandlers:
             
             skip = (page - 1) * 10
             
-            # ✅ 从 agent_product_prices 表按 category 字段查询（这样新商品也能显示）
-            pipeline = [
-                {'$match': {
+            # ✅ 判断是否为统一协议号分类，如果是，查询所有别名
+            all_aliases = [None] + self.core.config.AGENT_PROTOCOL_CATEGORY_ALIASES
+            if category == self.core.config.AGENT_PROTOCOL_CATEGORY_UNIFIED or category in all_aliases:
+                # 查询所有协议号别名（包括统一分类名本身）
+                category_match = {
                     'agent_bot_id': self.core.config.AGENT_BOT_ID,
                     'is_active': True,
-                    'category': category  # ✅ 关键：使用 category 字段，不是 leixing
-                }},
+                    'category': {
+                        '$in': [self.core.config.AGENT_PROTOCOL_CATEGORY_UNIFIED] + self.core.config.AGENT_PROTOCOL_CATEGORY_ALIASES + [None]
+                    }
+                }
+            else:
+                # 其他分类，按原逻辑查询
+                category_match = {
+                    'agent_bot_id': self.core.config.AGENT_BOT_ID,
+                    'is_active': True,
+                    'category': category
+                }
+            
+            # ✅ 从 agent_product_prices 表按 category 字段查询（这样新商品也能显示）
+            pipeline = [
+                {'$match': category_match},
                 {'$lookup': {
                     'from': 'ejfl',
                     'localField': 'original_nowuid',
