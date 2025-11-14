@@ -85,6 +85,9 @@ AGENT_NOTIFY_CHAT_ID = os.getenv("AGENT_NOTIFY_CHAT_ID")
 # ✅ 总部通知群（代理用来监听总部补货等通知）
 HEADQUARTERS_NOTIFY_CHAT_ID = os.getenv("HQ_NOTIFY_CHAT_ID") or os.getenv("HEADQUARTERS_NOTIFY_CHAT_ID")
 
+# ✅ 统一协议号分类配置
+AGENT_PROTOCOL_CATEGORY_UNIFIED = os.getenv("AGENT_PROTOCOL_CATEGORY_UNIFIED", "🔥二次协议号（session+json）")
+
 class AgentBotConfig:
     """代理机器人配置"""
     def __init__(self):
@@ -278,12 +281,13 @@ class AgentBotCore:
             return None
 
     def auto_sync_new_products(self):
-        """自动同步总部新增商品到代理（增强版：支持价格为0的商品预建记录）"""
+        """自动同步总部新增商品到代理（增强版：支持价格为0的商品预建记录 + 统一协议号分类）"""
         try:
             all_products = list(self.config.ejfl.find({}))
             synced = 0
             updated = 0
             activated = 0
+            unified = 0  # 统一分类计数
             
             for p in all_products:
                 nowuid = p.get('nowuid')
@@ -298,6 +302,13 @@ class AgentBotCore:
                 
                 # ✅ 安全获取总部价格（处理异常情况）
                 original_price = self._safe_price(p.get('money'))
+                
+                # ✅ 统一分类逻辑：协议号类商品统一归入一个分类
+                leixing = p.get('leixing')
+                if leixing in [None, '', '协议号', '未分类']:
+                    category = AGENT_PROTOCOL_CATEGORY_UNIFIED
+                else:
+                    category = leixing
                 
                 if not exists:
                     # ✅ 新商品：创建代理价格记录
@@ -315,7 +326,7 @@ class AgentBotCore:
                         'agent_price': agent_price,
                         'original_price_snapshot': original_price,
                         'product_name': p.get('projectname', ''),
-                        'category': p.get('leixing') or '协议号',
+                        'category': category,  # ✅ 使用统一后的分类
                         'is_active': is_active,
                         'needs_price_set': needs_price_set,
                         'auto_created': True,
@@ -324,15 +335,23 @@ class AgentBotCore:
                         'updated_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     })
                     synced += 1
+                    if category == AGENT_PROTOCOL_CATEGORY_UNIFIED:
+                        unified += 1
                     status_msg = "待补价" if needs_price_set else "已激活"
-                    logger.info(f"✅ 新增同步商品: {p.get('projectname')} (nowuid: {nowuid}, 总部价: {original_price}U, 代理价: {agent_price}U, 状态: {status_msg})")
+                    logger.info(f"✅ 新增同步商品: {p.get('projectname')} (nowuid: {nowuid}, 总部价: {original_price}U, 代理价: {agent_price}U, 状态: {status_msg}, 分类: {category})")
                 else:
                     # ✅ 已存在的商品：更新商品名称、分类和价格
                     updates = {}
                     if exists.get('product_name') != p.get('projectname'):
                         updates['product_name'] = p.get('projectname', '')
-                    if exists.get('category') != (p.get('leixing') or '协议号'):
-                        updates['category'] = p.get('leixing') or '协议号'
+                    
+                    # ✅ 更新分类（包括将旧的协议号分类统一到新分类）
+                    old_category = exists.get('category')
+                    if old_category != category:
+                        updates['category'] = category
+                        # 如果是从旧的协议号分类更新为统一分类，计入unified计数
+                        if category == AGENT_PROTOCOL_CATEGORY_UNIFIED and old_category in [None, '', '协议号', '未分类']:
+                            unified += 1
                     
                     # ✅ 更新总部价格快照
                     if abs(exists.get('original_price_snapshot', 0) - original_price) > 0.01:
@@ -360,8 +379,8 @@ class AgentBotCore:
                         )
                         updated += 1
             
-            if synced > 0 or updated > 0 or activated > 0:
-                logger.info(f"✅ 商品同步完成: 新增 {synced} 个, 更新 {updated} 个, 激活 {activated} 个")
+            if synced > 0 or updated > 0 or activated > 0 or unified > 0:
+                logger.info(f"✅ 商品同步完成: 新增 {synced} 个, 更新 {updated} 个, 激活 {activated} 个, Unified protocol category: {unified} items")
             
             return synced
         except Exception as e:
@@ -432,8 +451,19 @@ class AgentBotCore:
         try:
             skip = (page - 1) * limit
             
-            # ✅ 处理 null/空值的情况 - 协议号分类需要包括 leixing 为 null 的商品
-            if category == '协议号' or category == '未分类':
+            # ✅ 处理统一协议号分类查询
+            if category == AGENT_PROTOCOL_CATEGORY_UNIFIED:
+                # 查询所有协议号类商品（leixing 为 None/空/'协议号'/'未分类'）
+                match_condition = {
+                    '$or': [
+                        {'leixing': None}, 
+                        {'leixing': ''}, 
+                        {'leixing': '协议号'},
+                        {'leixing': '未分类'}
+                    ]
+                }
+            # ✅ 兼容旧的协议号/未分类查询（也查统一分类）
+            elif category in ['协议号', '未分类']:
                 match_condition = {
                     '$or': [
                         {'leixing': None}, 
@@ -463,7 +493,7 @@ class AgentBotCore:
             products = list(self.config.ejfl.aggregate(pipeline))
             
             # ✅ 统计总数时也要用同样的条件
-            if category == '协议号' or category == '未分类':
+            if category == AGENT_PROTOCOL_CATEGORY_UNIFIED or category in ['协议号', '未分类']:
                 total = self.config.ejfl.count_documents({
                     '$or': [
                         {'leixing': None}, 
@@ -1898,6 +1928,14 @@ class AgentBotHandlers:
                 self.safe_edit_message(query, "❌ 商品价格未设置", [[InlineKeyboardButton("🔙 返回", callback_data="back_products")]], parse_mode=None)
                 return
             
+            # ✅ 获取商品在代理价格表中的分类（统一后的分类）
+            agent_price_info = self.core.config.agent_product_prices.find_one({
+                'agent_bot_id': self.core.config.AGENT_BOT_ID,
+                'original_nowuid': nowuid
+            })
+            # 使用统一后的分类，如果没有则回退到原leixing
+            category = agent_price_info.get('category') if agent_price_info else (prod.get('leixing') or AGENT_PROTOCOL_CATEGORY_UNIFIED)
+            
             # ✅ 完全按照总部的简洁格式
             product_name = self.H(prod.get('projectname', 'N/A'))
             product_status = "✅您正在购买："
@@ -1918,8 +1956,9 @@ class AgentBotHandlers:
                 text += "\n\n⚠️ 商品缺货"
                 kb.append([InlineKeyboardButton("使用说明", callback_data="help")])
             
+            # ✅ 使用统一后的分类作为返回目标
             kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main"),
-                      InlineKeyboardButton("返回", callback_data=f"category_{prod.get('leixing', '协议号')}")])
+                      InlineKeyboardButton("返回", callback_data=f"category_{category}")])
             
             self.safe_edit_message(query, text, kb, parse_mode=ParseMode.HTML)
         
