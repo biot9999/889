@@ -20,6 +20,7 @@ import zipfile
 import time
 import random
 import requests
+import threading
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
@@ -1780,8 +1781,6 @@ class AgentBotHandlers:
                 button_text = f"{cat['name']}  [{cat['stock']}个]"
                 kb.append([InlineKeyboardButton(button_text, callback_data=f"category_{cat['name']}")])
             
-            # ✅ 添加刷新按钮
-            kb.append([InlineKeyboardButton("🔄 刷新", callback_data="products")])
             kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main")])
             
             self.safe_edit_message(query, text, kb, parse_mode='HTML')
@@ -2261,7 +2260,6 @@ class AgentBotHandlers:
             pag.append(InlineKeyboardButton("➡️ 下一页", callback_data=f"price_page_{page+1}"))
         if pag:
             kb.append(pag)
-        kb.append([InlineKeyboardButton("🔄 同步新品", callback_data="force_sync_products")])
         kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main")])
         self.safe_edit_message(query, text, kb, parse_mode=None)
 
@@ -2480,12 +2478,6 @@ class AgentBotHandlers:
             # 价格管理 / 报表
             elif d == "price_management":
                 self.show_price_management(q); q.answer(); return
-            elif d == "force_sync_products":
-                # ✅ 强制同步新品
-                synced = self.core.auto_sync_new_products()
-                q.answer(f"✅ 同步完成！新增/更新 {synced} 个商品", show_alert=True)
-                self.show_price_management(q)
-                return
             elif d.startswith("price_page_"):
                 self.show_price_management(q, int(d.replace("price_page_",""))); q.answer(); return
             elif d.startswith("edit_price_"):
@@ -2748,7 +2740,6 @@ class AgentBot:
 
     def start_headquarters_product_watch(self):
         """启动总部商品 Change Stream 监听线程"""
-        import threading
         
         def _watch_loop():
             """Change Stream 监听循环"""
