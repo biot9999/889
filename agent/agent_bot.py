@@ -453,42 +453,38 @@ class AgentBotCore:
                 'is_active': True
             }, {'original_nowuid': 1, 'category': 1}))
             
-            # ========== 步骤3：统一映射协议号别名到统一分类 ==========
-            # 对 fenlei 分类名也做统一映射
-            unified_fenlei_categories = [self._unify_category(cat) for cat in fenlei_categories]
-            
-            # ========== 步骤4：构建分类名集合及其 nowuid 映射 ==========
+            # ========== 步骤3：构建分类名集合及其 nowuid 映射 ==========
             categories_map = {}  # {category_name: {'nowuids': set(), 'stock': int}}
             
-            # 4.1 先从 fenlei 分类初始化（即使没有商品也要显示）
-            for unified_cat in set(unified_fenlei_categories):
-                if unified_cat not in categories_map:
-                    categories_map[unified_cat] = {'nowuids': set(), 'stock': 0}
+            # 3.1 先从 fenlei 分类初始化（保持原始名称，不做统一映射）
+            for cat in fenlei_categories:
+                if cat and cat not in categories_map:
+                    categories_map[cat] = {'nowuids': set(), 'stock': 0}
             
-            # 4.2 收集代理端已激活商品的 nowuid 到对应分类
+            # 3.2 确保统一协议号分类存在于分类映射中
+            if self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED not in categories_map:
+                categories_map[self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED] = {'nowuids': set(), 'stock': 0}
+            
+            # 3.3 收集代理端已激活商品的 nowuid 到对应分类
             for prod in agent_products:
                 nowuid = prod.get('original_nowuid')
                 if not nowuid:
                     continue
                 
                 raw_category = prod.get('category')
-                unified_cat = self._unify_category(raw_category)
                 
-                if unified_cat not in categories_map:
-                    categories_map[unified_cat] = {'nowuids': set(), 'stock': 0}
-                
-                # ✅ 特殊处理统一协议号分类：收集所有别名对应的商品
-                if unified_cat == self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
-                    # 检查原始分类是否在别名集合中
-                    if raw_category is None or raw_category in self.config.AGENT_PROTOCOL_CATEGORY_ALIASES:
-                        categories_map[unified_cat]['nowuids'].add(nowuid)
-                    # 也包含已经标记为统一分类的商品
-                    elif raw_category == self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
-                        categories_map[unified_cat]['nowuids'].add(nowuid)
+                # ✅ 检查是否为协议号别名：如果是，归入统一协议号分类
+                if raw_category is None or raw_category in self.config.AGENT_PROTOCOL_CATEGORY_ALIASES or raw_category == self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
+                    # 归入统一协议号分类
+                    categories_map[self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED]['nowuids'].add(nowuid)
                 else:
-                    categories_map[unified_cat]['nowuids'].add(nowuid)
+                    # 其它分类：直接使用原始分类名（不做统一映射）
+                    if raw_category not in categories_map:
+                        # 如果该分类不在 fenlei 中，也添加进来（动态分类）
+                        categories_map[raw_category] = {'nowuids': set(), 'stock': 0}
+                    categories_map[raw_category]['nowuids'].add(nowuid)
             
-            # ========== 步骤5：统计每个分类的库存 ==========
+            # ========== 步骤4：统计每个分类的库存 ==========
             for cat_name, cat_data in categories_map.items():
                 nowuid_set = cat_data['nowuids']
                 if nowuid_set:
@@ -501,7 +497,7 @@ class AgentBotCore:
                 else:
                     cat_data['stock'] = 0
             
-            # ========== 步骤6：根据配置决定是否显示零库存分类 ==========
+            # ========== 步骤5：根据配置决定是否显示零库存分类 ==========
             result = []
             for cat_name, cat_data in categories_map.items():
                 stock = cat_data['stock']
@@ -515,10 +511,10 @@ class AgentBotCore:
                         'count': nowuid_count
                     })
             
-            # ========== 步骤7：按库存降序排序（零库存的在后面） ==========
+            # ========== 步骤6：按库存降序排序（零库存的在后面） ==========
             result.sort(key=lambda x: -x['stock'])
             
-            # ========== 步骤8：容错检查 ==========
+            # ========== 步骤7：容错检查 ==========
             if not result:
                 logger.warning("⚠️ 未获取到任何分类，可能 fenlei 为空且无已激活商品")
                 return []
