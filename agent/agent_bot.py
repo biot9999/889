@@ -157,6 +157,9 @@ class AgentBotConfig:
         # 确保包含空字符串和会被映射为None的情况
         if "" not in self.AGENT_PROTOCOL_CATEGORY_ALIASES:
             self.AGENT_PROTOCOL_CATEGORY_ALIASES.append("")
+        
+        # ✅ 零库存分类显示配置
+        self.AGENT_SHOW_EMPTY_CATEGORIES = os.getenv("AGENT_SHOW_EMPTY_CATEGORIES", "1") in ("1", "true", "True")
 
         try:
             self.client = MongoClient(self.MONGODB_URI)
@@ -166,6 +169,7 @@ class AgentBotConfig:
 
             self.ejfl = self.db['ejfl']
             self.hb = self.db['hb']
+            self.fenlei = self.db['fenlei']  # ✅ 总部分类表
             self.agent_product_prices = self.db['agent_product_prices']
             self.agent_profit_account = self.db['agent_profit_account']
             self.withdrawal_requests = self.db['withdrawal_requests']
@@ -428,58 +432,115 @@ class AgentBotCore:
             return 0
 
     def get_product_categories(self) -> List[Dict]:
-        """获取商品分类列表（一级分类）- 仿照总部bot.py实现"""
+        """获取商品分类列表（一级分类）- 增强版：支持显示零库存分类"""
         try:
             # ✅ 每次获取分类时自动同步新商品
             self.auto_sync_new_products()
             
-            # 获取所有商品和库存信息
-            all_products = list(self.config.ejfl.find({}))
-            categories = {}
+            # ✅ 第一步：从总部 fenlei 表获取所有一级分类（这些分类必须保留，不合并）
+            fenlei_categories = set()
+            try:
+                fenlei_docs = list(self.config.fenlei.find({}, {'projectname': 1}))
+                for doc in fenlei_docs:
+                    cat_name = doc.get('projectname')
+                    if cat_name:
+                        fenlei_categories.add(cat_name)
+                logger.info(f"✅ 从 fenlei 表获取到 {len(fenlei_categories)} 个分类")
+            except Exception as e:
+                logger.warning(f"⚠️ 读取 fenlei 表失败（可能不存在），将仅使用商品分类: {e}")
             
-            for p in all_products:
-                nowuid = p.get('nowuid')
-                if not nowuid:
-                    continue
-                
-                # ✅ 检查商品是否有价格（总部价格）
-                original_price = float(p.get('money', 0))
-                if original_price <= 0:
-                    continue
+            # ✅ 第二步：从 agent_product_prices 获取已有商品的分类
+            all_categories_set = set(fenlei_categories)  # 从 fenlei 分类开始
+            
+            agent_categories = self.config.agent_product_prices.find({
+                'agent_bot_id': self.config.AGENT_BOT_ID,
+                'is_active': True
+            }, {'category': 1})
+            
+            for doc in agent_categories:
+                cat = doc.get('category')
+                if cat:
+                    all_categories_set.add(cat)
+            
+            # ✅ 第三步：处理协议号别名统一（但不影响 fenlei 中的分类）
+            # 只统一那些不在 fenlei 表中的别名
+            protocol_aliases_to_unify = []
+            for cat in list(all_categories_set):
+                # 只统一不在 fenlei 表中的别名
+                if cat not in fenlei_categories:
+                    # 检查是否为协议号别名
+                    if cat is None or cat in self.config.AGENT_PROTOCOL_CATEGORY_ALIASES:
+                        protocol_aliases_to_unify.append(cat)
+            
+            # 移除需要统一的别名，添加统一分类
+            for alias in protocol_aliases_to_unify:
+                all_categories_set.discard(alias)
+            
+            # 只在确实有需要统一的别名，或统一分类已在列表中时，才添加统一分类
+            if protocol_aliases_to_unify or self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED in all_categories_set:
+                all_categories_set.add(self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED)
+            
+            # ✅ 第四步：为每个分类计算库存
+            categories_map = {}
+            
+            for category in all_categories_set:
+                # 判断是否为统一协议号分类
+                if category == self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
+                    # ✅ 统一协议号分类：查询所有别名对应的商品
+                    # 但要排除 fenlei 中的分类（它们应该单独显示）
+                    category_variants = [self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED] + self.config.AGENT_PROTOCOL_CATEGORY_ALIASES + [None]
+                    # 过滤掉在 fenlei 表中的分类名
+                    category_variants = [v for v in category_variants if v not in fenlei_categories]
                     
-                # ✅ 检查是否是激活的代理商品
-                agent_price = self.config.agent_product_prices.find_one({
-                    'agent_bot_id': self.config.AGENT_BOT_ID,
-                    'original_nowuid': nowuid,
-                    'is_active': True
-                })
+                    # 查询这些分类下的所有激活商品
+                    agent_products = list(self.config.agent_product_prices.find({
+                        'agent_bot_id': self.config.AGENT_BOT_ID,
+                        'category': {'$in': category_variants},
+                        'is_active': True
+                    }, {'original_nowuid': 1}))
+                else:
+                    # ✅ 其它分类：直接查询该分类
+                    agent_products = list(self.config.agent_product_prices.find({
+                        'agent_bot_id': self.config.AGENT_BOT_ID,
+                        'category': category,
+                        'is_active': True
+                    }, {'original_nowuid': 1}))
                 
-                if not agent_price:
+                # 提取商品 nowuid 列表
+                nowuid_list = [p.get('original_nowuid') for p in agent_products if p.get('original_nowuid')]
+                
+                # 统计库存
+                if nowuid_list:
+                    stock = self.config.hb.count_documents({
+                        'nowuid': {'$in': nowuid_list},
+                        'state': 0
+                    })
+                else:
+                    stock = 0
+                
+                categories_map[category] = {
+                    'name': category,
+                    'stock': stock,
+                    'count': len(nowuid_list)
+                }
+            
+            # ✅ 第五步：根据配置决定是否显示零库存分类
+            result = []
+            for cat_name, cat_info in categories_map.items():
+                # 如果禁用零库存显示，则跳过零库存分类
+                if not self.config.AGENT_SHOW_EMPTY_CATEGORIES and cat_info['stock'] == 0:
                     continue
                 
-                # 获取库存
-                stock = self.config.hb.count_documents({'nowuid': nowuid, 'state': 0})
-                
-                # 分类名称（处理None情况）
-                category = p.get('leixing') or '协议号'
-                
-                # 累加分类的库存
-                if category not in categories:
-                    categories[category] = {'name': category, 'stock': 0, 'count': 0}
-                categories[category]['stock'] += stock
-                categories[category]['count'] += 1
-            
-            # 转换为列表并按库存排序
-            result = [
-                {
+                result.append({
                     '_id': cat_info['name'],
                     'stock': cat_info['stock'],
                     'count': cat_info['count']
-                }
-                for cat_info in categories.values()
-            ]
-            result.sort(key=lambda x: -x['stock'])  # 库存多的在前面
+                })
             
+            # 按库存降序排序
+            result.sort(key=lambda x: -x['stock'])
+            
+            logger.info(f"✅ 获取商品分类成功: 共 {len(result)} 个分类（包含零库存: {self.config.AGENT_SHOW_EMPTY_CATEGORIES}）")
             return result
         except Exception as e:
             logger.error(f"❌ 获取商品分类失败: {e}")
@@ -1776,86 +1837,14 @@ class AgentBotHandlers:
 
     # ========== 商品相关 ==========
     def show_product_categories(self, query):
-        """显示商品分类（动态分类：基于已同步商品+库存）"""
+        """显示商品分类（增强版：支持显示零库存分类）"""
         try:
-            # ✅ 从 agent_product_prices 聚合所有激活商品的分类
-            pipeline = [
-                {'$match': {
-                    'agent_bot_id': self.core.config.AGENT_BOT_ID,
-                    'is_active': True
-                }},
-                {'$group': {
-                    '_id': '$category',
-                    'product_count': {'$sum': 1}
-                }}
-            ]
+            # ✅ 调用核心方法获取分类列表（包含零库存分类）
+            categories = self.core.get_product_categories()
             
-            categories_data = list(self.core.config.agent_product_prices.aggregate(pipeline))
-            
-            if not categories_data:
+            if not categories:
                 self.safe_edit_message(query, "❌ 暂无可用商品分类", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
                 return
-            
-            # ✅ 统计每个分类的库存（合并别名）
-            categories_map = {}  # {unified_cat_name: {stock, count, nowuids}}
-            
-            for cat_data in categories_data:
-                cat_name = cat_data['_id']
-                
-                # ✅ 将别名归并到统一分类
-                # 检查是否为协议号别名
-                all_aliases = [None] + self.core.config.AGENT_PROTOCOL_CATEGORY_ALIASES
-                if cat_name in all_aliases or cat_name == self.core.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
-                    display_cat_name = self.core.config.AGENT_PROTOCOL_CATEGORY_UNIFIED
-                else:
-                    display_cat_name = cat_name
-                
-                # ✅ 获取该分类下所有激活商品的nowuid列表
-                agent_products = list(self.core.config.agent_product_prices.find({
-                    'agent_bot_id': self.core.config.AGENT_BOT_ID,
-                    'category': cat_name,
-                    'is_active': True
-                }, {'original_nowuid': 1}))
-                
-                if not agent_products:
-                    continue
-                
-                # ✅ 提取nowuid列表
-                nowuid_list = [ap.get('original_nowuid') for ap in agent_products if ap.get('original_nowuid')]
-                
-                if not nowuid_list:
-                    continue
-                
-                # ✅ 统计这些商品的实际库存
-                stock = self.core.config.hb.count_documents({
-                    'nowuid': {'$in': nowuid_list},
-                    'state': 0
-                })
-                
-                # 累加到统一分类
-                if display_cat_name not in categories_map:
-                    categories_map[display_cat_name] = {'stock': 0, 'count': 0, 'nowuids': set()}
-                
-                categories_map[display_cat_name]['stock'] += stock
-                categories_map[display_cat_name]['count'] += len(nowuid_list)
-                categories_map[display_cat_name]['nowuids'].update(nowuid_list)
-            
-            # 转换为列表
-            categories_with_stock = []
-            for cat_name, cat_info in categories_map.items():
-                if cat_info['stock'] > 0:  # 只显示有库存的分类
-                    categories_with_stock.append({
-                        'name': cat_name,
-                        'stock': cat_info['stock'],
-                        'count': cat_info['count']
-                    })
-            
-            if not categories_with_stock:
-                self.safe_edit_message(query, "❌ 暂无库存商品", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
-                return
-            
-            # 按库存降序排序
-            categories_with_stock.sort(key=lambda x: -x['stock'])
             
             text = (
                 "🛒 <b>商品分类 - 请选择所需商品：</b>\n\n"
@@ -1865,9 +1854,9 @@ class AgentBotHandlers:
             )
             
             kb = []
-            for cat in categories_with_stock:
-                button_text = f"{cat['name']}  [{cat['stock']}个]"
-                kb.append([InlineKeyboardButton(button_text, callback_data=f"category_{cat['name']}")])
+            for cat in categories:
+                button_text = f"{cat['_id']}  [{cat['stock']}个]"
+                kb.append([InlineKeyboardButton(button_text, callback_data=f"category_{cat['_id']}")])
             
             kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main")])
             
@@ -1887,16 +1876,29 @@ class AgentBotHandlers:
             
             skip = (page - 1) * 10
             
-            # ✅ 判断是否为统一协议号分类，如果是，查询所有别名
+            # ✅ 获取 fenlei 表中的分类（这些不应该被合并到统一协议号分类）
+            fenlei_categories = set()
+            try:
+                fenlei_docs = list(self.core.config.fenlei.find({}, {'projectname': 1}))
+                for doc in fenlei_docs:
+                    cat_name = doc.get('projectname')
+                    if cat_name:
+                        fenlei_categories.add(cat_name)
+            except Exception:
+                pass
+            
+            # ✅ 判断是否为统一协议号分类，如果是，查询所有别名（但排除 fenlei 中的分类）
             all_aliases = [None] + self.core.config.AGENT_PROTOCOL_CATEGORY_ALIASES
             if category == self.core.config.AGENT_PROTOCOL_CATEGORY_UNIFIED or category in all_aliases:
-                # 查询所有协议号别名（包括统一分类名本身）
+                # 查询所有协议号别名，但排除 fenlei 表中的分类
+                category_variants = [self.core.config.AGENT_PROTOCOL_CATEGORY_UNIFIED] + self.core.config.AGENT_PROTOCOL_CATEGORY_ALIASES + [None]
+                # 过滤掉在 fenlei 表中的分类名
+                category_variants = [v for v in category_variants if v not in fenlei_categories]
+                
                 category_match = {
                     'agent_bot_id': self.core.config.AGENT_BOT_ID,
                     'is_active': True,
-                    'category': {
-                        '$in': [self.core.config.AGENT_PROTOCOL_CATEGORY_UNIFIED] + self.core.config.AGENT_PROTOCOL_CATEGORY_ALIASES + [None]
-                    }
+                    'category': {'$in': category_variants}
                 }
             else:
                 # 其他分类，按原逻辑查询
