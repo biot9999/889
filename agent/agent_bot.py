@@ -1499,11 +1499,10 @@ class AgentBotHandlers:
 
     def start_command(self, update: Update, context: CallbackContext):
         user = update.effective_user
-        # ✅ 启动时触发一次商品同步
-        if user.id in ADMIN_USERS:
-            synced = self.core.auto_sync_new_products()
-            if synced > 0:
-                logger.info(f"✅ 启动时同步了 {synced} 个新商品")
+        # ✅ 启动时触发一次商品同步（所有用户，确保商品列表是最新的）
+        synced = self.core.auto_sync_new_products()
+        if synced > 0:
+            logger.info(f"✅ 启动时同步了 {synced} 个新商品")
         
         if self.core.register_user(user.id, user.username or "", user.first_name or ""):
             text = f"""🎉 欢迎使用 {self.H(self.core.config.AGENT_NAME)}！
@@ -1732,6 +1731,9 @@ class AgentBotHandlers:
     def show_category_products(self, query, category: str, page: int = 1):
         """显示分类下的商品（二级分类）"""
         try:
+            # ✅ 先自动同步新商品，确保最新商品能显示
+            self.core.auto_sync_new_products()
+            
             skip = (page - 1) * 10
             
             # ✅ 从 agent_product_prices 表按 category 字段查询（这样新商品也能显示）
