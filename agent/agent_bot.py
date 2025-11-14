@@ -282,10 +282,12 @@ class AgentBotCore:
                         continue
                     
                     agent_markup = 0.0  # 初始无加价，后续管理员手动设置
+                    agent_price = round(original_price + agent_markup, 2)  # ✅ 计算代理价格
                     self.config.agent_product_prices.insert_one({
                         'agent_bot_id': self.config.AGENT_BOT_ID,
                         'original_nowuid': nowuid,
-                        'agent_markup': agent_markup,  # ✅ 存储加价（利润标记），不存储固定代理价
+                        'agent_markup': agent_markup,  # ✅ 存储加价（利润标记）
+                        'agent_price': agent_price,  # ✅ 同时存储代理价格
                         'original_price_snapshot': original_price,  # 参考用，不作实际计算
                         'product_name': p.get('projectname', ''),
                         'category': p.get('leixing') or '协议号',
@@ -308,6 +310,12 @@ class AgentBotCore:
                     # ✅ 更新总部价格快照（仅用于参考）
                     if abs(exists.get('original_price_snapshot', 0) - original_price) > 0.01:
                         updates['original_price_snapshot'] = original_price
+                    
+                    # ✅ 重新计算代理价格（总部价 + 加价）
+                    agent_markup = float(exists.get('agent_markup', 0))
+                    new_agent_price = round(original_price + agent_markup, 2)
+                    if abs(exists.get('agent_price', 0) - new_agent_price) > 0.01:
+                        updates['agent_price'] = new_agent_price
                     
                     if updates:
                         updates['sync_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -520,11 +528,12 @@ class AgentBotCore:
             if new_markup < 0:
                 return False, f"代理价格不能低于总部价格 {op} USDT（当前总部价），您输入的 {new_agent_price} USDT 低于总部价"
             
-            # ✅ 保存加价标记而不是固定代理价
+            # ✅ 保存加价标记和代理价格
             res = self.config.agent_product_prices.update_one(
                 {'agent_bot_id': self.config.AGENT_BOT_ID, 'original_nowuid': product_nowuid},
                 {'$set': {
                     'agent_markup': new_markup,
+                    'agent_price': new_agent_price,  # ✅ 同时更新代理价格
                     'updated_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     'manual_updated': True
                 }}
