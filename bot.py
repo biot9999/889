@@ -13930,6 +13930,10 @@ def main():
     # 这样底部按钮（商品列表、个人中心等）才能正常响应
     dispatcher.add_handler(MessageHandler(Filters.chat_type.private & Filters.reply, huifu), )
     
+    # 🔧 代理机器人创建向导文本处理器 - 必须在textkeyboard之前注册
+    # 这样向导激活时能优先处理文本输入，不被textkeyboard拦截
+    dispatcher.add_handler(MessageHandler(Filters.private & Filters.text & ~Filters.command, handle_agent_create_text, run_async=True))
+    
     # ✅ 主要的消息处理器 - 处理底部按钮和所有用户交互（最高优先级）
     dispatcher.add_handler(MessageHandler(
         (Filters.text | Filters.photo | Filters.animation | Filters.video | Filters.document) & ~(Filters.command),
@@ -13943,9 +13947,6 @@ def main():
         handle_user_withdrawal_txid,
         run_async=True
     ))
-    
-    # 代理机器人创建向导文本处理器 - 必须在一般文本处理器之前
-    dispatcher.add_handler(MessageHandler(Filters.private & Filters.text & ~Filters.command, handle_agent_create_text, run_async=True))
     
     # handle_admin_txhash_message 放在最后，用于处理管理员输入交易哈希
     # ✅ 添加 Filters.private 使 filter 更精确，只处理私聊消息  
