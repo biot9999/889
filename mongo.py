@@ -783,8 +783,8 @@ def get_agent_stats(agent_bot_id):
             {
                 '$group': {
                     '_id': None,
-                    'total_sales': {'$sum': '$agent_price'},
-                    'total_commission': {'$sum': '$commission'},
+                    'total_sales': {'$sum': {'$multiply': ['$agent_price', '$quantity']}},
+                    'total_commission': {'$sum': {'$multiply': ['$commission', '$quantity']}},
                     'order_count': {'$sum': 1}
                 }
             }
