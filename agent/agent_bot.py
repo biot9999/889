@@ -3428,12 +3428,18 @@ class AgentBotHandlers:
         try:
             # 防止循环：只处理来自总部通知群的消息
             if not update.message or not update.message.chat:
+                logger.debug("⚠️ handle_headquarters_message: 无消息或聊天对象")
                 return
             
             chat_id = update.message.chat.id
+            chat_type = update.message.chat.type
+            
+            # ✅ 调试日志：记录所有接收到的群组/频道消息
+            logger.info(f"🔍 收到群组/频道消息: chat_id={chat_id}, chat_type={chat_type}, title={update.message.chat.title}")
             
             # 检查是否来自总部通知群
             if not self.core.config.HEADQUARTERS_NOTIFY_CHAT_ID:
+                logger.warning("⚠️ HEADQUARTERS_NOTIFY_CHAT_ID 未配置")
                 return
             
             # 将配置中的 chat_id 转换为整数进行比较
@@ -3443,15 +3449,24 @@ class AgentBotHandlers:
                 logger.warning(f"⚠️ HEADQUARTERS_NOTIFY_CHAT_ID 格式错误: {self.core.config.HEADQUARTERS_NOTIFY_CHAT_ID}")
                 return
             
+            logger.debug(f"🔍 比较: chat_id={chat_id}, hq_chat_id={hq_chat_id}, 匹配={chat_id == hq_chat_id}")
+            
             if chat_id != hq_chat_id:
+                logger.debug(f"⚠️ 消息不是来自总部通知群（来自 {chat_id}，期望 {hq_chat_id}）")
                 return
             
             # 检查是否有补货通知目标群
             if not self.core.config.AGENT_RESTOCK_NOTIFY_CHAT_ID:
+                logger.warning("⚠️ AGENT_RESTOCK_NOTIFY_CHAT_ID 未配置，无法转发补货通知")
                 return
+            
+            logger.info(f"✅ 消息来自总部通知群 {hq_chat_id}")
             
             # 获取消息内容用于关键词匹配
             message_text = update.message.text or update.message.caption or ""
+            
+            logger.debug(f"🔍 消息文本: {message_text[:100]}...")
+            logger.debug(f"🔍 配置的关键词: {self.core.config.RESTOCK_KEYWORDS}")
             
             # 检查是否包含补货关键词
             is_restock = False
@@ -3463,6 +3478,7 @@ class AgentBotHandlers:
                     break
             
             if not is_restock:
+                logger.debug(f"⚠️ 消息不包含补货关键词，跳过转发")
                 return
             
             logger.info(f"🔔 检测到补货通知（关键词: {matched_keyword}）: {message_text[:50]}...")
@@ -3662,17 +3678,18 @@ class AgentBot:
         self.dispatcher.add_handler(CommandHandler("start", self.handlers.start_command))
         self.dispatcher.add_handler(CallbackQueryHandler(self.handlers.button_callback))
         
+        # ✅ 群组/频道消息处理（补货通知镜像）- 放在私聊处理器之前
+        # 使用更宽松的过滤器，让handler内部进行chat_id检查
+        self.dispatcher.add_handler(MessageHandler(
+            (Filters.text | Filters.photo | Filters.video | Filters.document) & 
+            ~Filters.chat_type.private,  # 任何非私聊的消息（群组、超级群组、频道）
+            self.handlers.handle_headquarters_message
+        ))
+        
         # ✅ 私聊文本消息处理（用户输入处理）
         self.dispatcher.add_handler(MessageHandler(
             Filters.text & ~Filters.command & Filters.chat_type.private, 
             self.handlers.handle_text_message
-        ))
-        
-        # ✅ 群组/频道消息处理（补货通知镜像）
-        self.dispatcher.add_handler(MessageHandler(
-            (Filters.text | Filters.photo | Filters.video | Filters.document) & 
-            (Filters.chat_type.groups | Filters.chat_type.channel),
-            self.handlers.handle_headquarters_message
         ))
         
         logger.info("✅ 处理器设置完成")
