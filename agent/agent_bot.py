@@ -154,7 +154,9 @@ class AgentBotConfig:
         self.RESTOCK_KEYWORDS = [k.strip() for k in os.getenv("RESTOCK_KEYWORDS", default_keywords).split(",") if k.strip()]
         
         # ✅ 补货通知按钮重写开关（默认关闭，提高安全性）
-        self.RESTOCK_REWRITE_BUTTONS = os.getenv("RESTOCK_REWRITE_BUTTONS", "0") in ("1", "true", "True")
+        # 支持两个环境变量名：HQ_RESTOCK_REWRITE_BUTTONS（新）和 RESTOCK_REWRITE_BUTTONS（旧，兼容性）
+        button_rewrite_flag = os.getenv("HQ_RESTOCK_REWRITE_BUTTONS") or os.getenv("RESTOCK_REWRITE_BUTTONS", "0")
+        self.HQ_RESTOCK_REWRITE_BUTTONS = button_rewrite_flag in ("1", "true", "True")
 
         # 取消订单后是否删除原消息 (默认删除)
         self.RECHARGE_DELETE_ON_CANCEL = os.getenv("RECHARGE_DELETE_ON_CANCEL", "1") in ("1", "true", "True")
@@ -2100,12 +2102,118 @@ class AgentBotHandlers:
 
     def start_command(self, update: Update, context: CallbackContext):
         user = update.effective_user
+        
+        # ✅ 解析深度链接参数（payload）
+        payload = None
+        if context.args and len(context.args) > 0:
+            payload = context.args[0]
+            logger.info(f"📥 收到深度链接启动: payload={payload}, user_id={user.id}")
+        
         # ✅ 启动时触发一次商品同步（所有用户，确保商品列表是最新的）
         synced = self.core.auto_sync_new_products()
         if synced > 0:
             logger.info(f"✅ 启动时同步了 {synced} 个新商品")
         
         if self.core.register_user(user.id, user.username or "", user.first_name or ""):
+            # ✅ 处理 restock 深度链接 - 直接显示商品分类（无欢迎消息）
+            if payload == "restock":
+                try:
+                    # 直接获取并显示商品分类
+                    categories = self.core.get_product_categories()
+                    
+                    if not categories:
+                        text = "❌ 暂无可用商品分类"
+                        kb = [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]]
+                    else:
+                        text = (
+                            "🛒 <b>商品分类 - 请选择所需商品：</b>\n\n"
+                            "「快送商品区」-「热选择所需商品」\n\n"
+                            "<b>❗️首次购买请先少量测试，避免纠纷</b>！\n\n"
+                            "<b>❗️长期未使用账户可能会出现问题，联系客服处理</b>。"
+                        )
+                        
+                        kb = []
+                        for cat in categories:
+                            button_text = f"{cat['_id']}  [{cat['stock']}个]"
+                            kb.append([InlineKeyboardButton(button_text, callback_data=f"category_{cat['_id']}")])
+                        
+                        kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main")])
+                    
+                    update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+                    logger.info(f"✅ 已为用户 {user.id} 直接显示商品分类")
+                    return
+                    
+                except Exception as e:
+                    logger.error(f"❌ 显示商品分类失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    text = "❌ 加载失败，请重试"
+                    kb = [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]]
+                    update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+                    return
+            
+            # ✅ 处理 product_<nowuid> 深度链接 - 直接显示商品购买页面
+            if payload and payload.startswith("product_"):
+                nowuid = payload.replace("product_", "")
+                try:
+                    # 直接显示商品详情（购买页面）
+                    prod = self.core.config.ejfl.find_one({'nowuid': nowuid})
+                    if not prod:
+                        text = "❌ 商品不存在"
+                        kb = [[InlineKeyboardButton("🔙 返回商品列表", callback_data="products")]]
+                    else:
+                        price = self.core.get_product_price(nowuid)
+                        stock = self.core.get_product_stock(nowuid)
+                        
+                        if price is None:
+                            text = "❌ 商品价格未设置"
+                            kb = [[InlineKeyboardButton("🔙 返回商品列表", callback_data="products")]]
+                        else:
+                            # ✅ 获取商品在代理价格表中的分类（统一后的分类）
+                            agent_price_info = self.core.config.agent_product_prices.find_one({
+                                'agent_bot_id': self.core.config.AGENT_BOT_ID,
+                                'original_nowuid': nowuid
+                            })
+                            # 使用统一后的分类，如果没有则回退到原leixing
+                            category = agent_price_info.get('category') if agent_price_info else (prod.get('leixing') or AGENT_PROTOCOL_CATEGORY_UNIFIED)
+                            
+                            # ✅ 完全按照总部的简洁格式
+                            product_name = self.H(prod.get('projectname', 'N/A'))
+                            product_status = "✅您正在购买："
+                            
+                            text = (
+                                f"<b>{product_status} {product_name}\n\n</b>"
+                                f"<b>💰 价格: {price:.2f} USDT\n\n</b>"
+                                f"<b>📦 库存: {stock}个\n\n</b>"
+                                f"<b>❗未使用过的本店商品的，请先少量购买测试，以免造成不必要的争执！谢谢合作！\n</b>"
+                            )
+                            
+                            kb = []
+                            if stock > 0:
+                                kb.append([InlineKeyboardButton("✅ 购买", callback_data=f"buy_{nowuid}"),
+                                          InlineKeyboardButton("❗使用说明", callback_data="help")])
+                            else:
+                                text += "\n\n⚠️ 商品缺货"
+                                kb.append([InlineKeyboardButton("使用说明", callback_data="help")])
+                            
+                            # ✅ 使用统一后的分类作为返回目标
+                            kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main"),
+                                      InlineKeyboardButton("返回", callback_data=f"category_{category}")])
+                    
+                    update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+                    logger.info(f"✅ 已为用户 {user.id} 直接显示商品 {nowuid} 购买页面")
+                    return
+                    
+                except Exception as e:
+                    logger.error(f"❌ 显示商品购买页面失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    text = "❌ 加载失败，请重试"
+                    kb = [[InlineKeyboardButton("🔙 返回商品列表", callback_data="products")]]
+                    update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+                    return
+            
+            # ✅ 默认启动消息
             text = f"""🎉 欢迎使用 {self.H(self.core.config.AGENT_NAME)}！
 
 👤 用户信息
@@ -3486,108 +3594,196 @@ class AgentBotHandlers:
             
             logger.info(f"🔔 检测到补货通知（关键词: {matched_keyword}）: {message_text[:50]}...")
             
-            # 尝试使用 copy_message 转发消息
             target_chat_id = self.core.config.AGENT_RESTOCK_NOTIFY_CHAT_ID
             
-            try:
-                # 优先使用 copy_message（保留原始格式）
-                result = context.bot.copy_message(
-                    chat_id=target_chat_id,
-                    from_chat_id=chat_id,
-                    message_id=message.message_id
-                )
-                
-                logger.info(f"✅ 补货通知已镜像到 {target_chat_id} (message_id: {result.message_id})")
-                
-                # 如果启用按钮重写，在原消息下方发送带有新按钮的消息
-                if self.core.config.RESTOCK_REWRITE_BUTTONS and message.reply_markup:
-                    self._send_rewritten_buttons(context, target_chat_id, result.message_id)
-                
-                return
-                
-            except Exception as copy_err:
-                logger.warning(f"⚠️ copy_message 失败（可能是权限问题）: {copy_err}")
-                logger.info("🔄 尝试使用 send_message 回退方案...")
+            # ✅ 决定是否重写按钮
+            enable_button_rewrite = self.core.config.HQ_RESTOCK_REWRITE_BUTTONS
             
-            # 回退方案：使用 send_message
-            try:
-                # 根据消息类型选择不同的发送方法
-                if message.photo:
-                    # 带图片的消息
-                    photo = message.photo[-1]  # 取最大尺寸
-                    context.bot.send_photo(
-                        chat_id=target_chat_id,
-                        photo=photo.file_id,
-                        caption=message_text or None,
-                        parse_mode=ParseMode.HTML if message_text else None
-                    )
-                elif message.video:
-                    # 带视频的消息
-                    context.bot.send_video(
-                        chat_id=target_chat_id,
-                        video=message.video.file_id,
-                        caption=message_text or None,
-                        parse_mode=ParseMode.HTML if message_text else None
-                    )
-                elif message.document:
-                    # 带文档的消息
-                    context.bot.send_document(
-                        chat_id=target_chat_id,
-                        document=message.document.file_id,
-                        caption=message_text or None,
-                        parse_mode=ParseMode.HTML if message_text else None
-                    )
-                else:
-                    # 纯文本消息
-                    if message_text:
-                        context.bot.send_message(
+            if enable_button_rewrite:
+                logger.info("🔄 按钮重写已启用，将发送带重写按钮的新消息")
+                # 当启用按钮重写时，发送新消息而不是使用 copy_message
+                try:
+                    # 获取机器人用户名用于构建按钮URL
+                    bot_info = context.bot.get_me()
+                    bot_username = bot_info.username
+                    
+                    # ✅ 尝试从原始消息中提取商品ID（nowuid）
+                    nowuid = None
+                    
+                    # 方法1：从原始消息的按钮中提取
+                    if message.reply_markup and hasattr(message.reply_markup, 'inline_keyboard'):
+                        for row in message.reply_markup.inline_keyboard:
+                            for button in row:
+                                if button.url and 'start=' in button.url:
+                                    # 从URL中提取参数，例如: https://t.me/bot?start=buy_123456
+                                    try:
+                                        start_param = button.url.split('start=')[1].split('&')[0]
+                                        if start_param.startswith('buy_'):
+                                            nowuid = start_param.replace('buy_', '')
+                                            logger.info(f"🔍 从按钮URL提取到商品ID: {nowuid}")
+                                            break
+                                    except:
+                                        pass
+                                elif button.callback_data and button.callback_data.startswith('gmsp '):
+                                    # 从callback_data中提取，例如: gmsp 123456
+                                    try:
+                                        nowuid = button.callback_data.replace('gmsp ', '').strip()
+                                        logger.info(f"🔍 从按钮callback提取到商品ID: {nowuid}")
+                                        break
+                                    except:
+                                        pass
+                            if nowuid:
+                                break
+                    
+                    # 方法2：从消息文本中使用正则表达式提取（补货通知通常包含商品名称或ID）
+                    if not nowuid and message_text:
+                        import re
+                        # 尝试匹配常见的ID格式
+                        id_patterns = [
+                            r'ID[：:]\s*([a-zA-Z0-9]+)',
+                            r'商品ID[：:]\s*([a-zA-Z0-9]+)',
+                            r'nowuid[：:]\s*([a-zA-Z0-9]+)',
+                        ]
+                        for pattern in id_patterns:
+                            match = re.search(pattern, message_text, re.IGNORECASE)
+                            if match:
+                                nowuid = match.group(1)
+                                logger.info(f"🔍 从消息文本提取到商品ID: {nowuid}")
+                                break
+                    
+                    # 构建重写后的按钮
+                    # ✅ 优先使用深度链接，如果没有用户名则使用callback按钮
+                    if bot_username:
+                        if nowuid:
+                            # 如果提取到商品ID，使用product_深度链接
+                            keyboard = [[
+                                InlineKeyboardButton("🛒 购买商品", url=f"https://t.me/{bot_username}?start=product_{nowuid}")
+                            ]]
+                            logger.info(f"🔗 使用商品深度链接按钮: https://t.me/{bot_username}?start=product_{nowuid}")
+                        else:
+                            # 否则使用通用的restock链接
+                            keyboard = [[
+                                InlineKeyboardButton("🛒 购买商品", url=f"https://t.me/{bot_username}?start=restock")
+                            ]]
+                            logger.info(f"🔗 使用通用补货深度链接按钮: https://t.me/{bot_username}?start=restock")
+                    else:
+                        if nowuid:
+                            keyboard = [[
+                                InlineKeyboardButton("🛒 购买商品", callback_data=f"product_{nowuid}")
+                            ]]
+                        else:
+                            keyboard = [[
+                                InlineKeyboardButton("🛒 购买商品", callback_data="products")
+                            ]]
+                        logger.warning("⚠️ 未获取到机器人用户名，使用callback按钮作为回退方案")
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    # 根据消息类型发送带有重写按钮的新消息
+                    if message.photo:
+                        photo = message.photo[-1]  # 取最大尺寸
+                        result = context.bot.send_photo(
                             chat_id=target_chat_id,
-                            text=message_text,
-                            parse_mode=ParseMode.HTML
+                            photo=photo.file_id,
+                            caption=message_text or None,
+                            parse_mode=ParseMode.HTML if message_text else None,
+                            reply_markup=reply_markup
                         )
+                        logger.info(f"✅ 补货通知(图片+重写按钮)已发送到 {target_chat_id} (message_id: {result.message_id})")
+                    elif message.video:
+                        result = context.bot.send_video(
+                            chat_id=target_chat_id,
+                            video=message.video.file_id,
+                            caption=message_text or None,
+                            parse_mode=ParseMode.HTML if message_text else None,
+                            reply_markup=reply_markup
+                        )
+                        logger.info(f"✅ 补货通知(视频+重写按钮)已发送到 {target_chat_id} (message_id: {result.message_id})")
+                    elif message.document:
+                        result = context.bot.send_document(
+                            chat_id=target_chat_id,
+                            document=message.document.file_id,
+                            caption=message_text or None,
+                            parse_mode=ParseMode.HTML if message_text else None,
+                            reply_markup=reply_markup
+                        )
+                        logger.info(f"✅ 补货通知(文档+重写按钮)已发送到 {target_chat_id} (message_id: {result.message_id})")
+                    else:
+                        # 纯文本消息
+                        if message_text:
+                            result = context.bot.send_message(
+                                chat_id=target_chat_id,
+                                text=message_text,
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=reply_markup
+                            )
+                            logger.info(f"✅ 补货通知(文本+重写按钮)已发送到 {target_chat_id} (message_id: {result.message_id})")
+                        else:
+                            logger.warning("⚠️ 消息无文本内容，跳过发送")
+                    
+                    return
+                    
+                except Exception as rewrite_err:
+                    logger.error(f"❌ 发送带重写按钮的消息失败: {rewrite_err}")
+                    traceback.print_exc()
+                    return
+            
+            else:
+                logger.info("📋 按钮重写未启用，使用 copy_message 转发原始消息")
+                # 当未启用按钮重写时，使用 copy_message 保留原样
+                try:
+                    result = context.bot.copy_message(
+                        chat_id=target_chat_id,
+                        from_chat_id=chat_id,
+                        message_id=message.message_id
+                    )
+                    
+                    logger.info(f"✅ 补货通知已原样镜像到 {target_chat_id} (message_id: {result.message_id})")
+                    return
+                    
+                except Exception as copy_err:
+                    logger.warning(f"⚠️ copy_message 失败（可能是权限问题）: {copy_err}")
+                    logger.info("🔄 尝试使用 send_message 回退方案...")
                 
-                logger.info(f"✅ 补货通知已通过回退方案发送到 {target_chat_id}")
-                
-            except Exception as send_err:
-                logger.error(f"❌ 回退方案也失败: {send_err}")
+                # 回退方案：使用 send_message（无按钮重写）
+                try:
+                    if message.photo:
+                        photo = message.photo[-1]  # 取最大尺寸
+                        context.bot.send_photo(
+                            chat_id=target_chat_id,
+                            photo=photo.file_id,
+                            caption=message_text or None,
+                            parse_mode=ParseMode.HTML if message_text else None
+                        )
+                    elif message.video:
+                        context.bot.send_video(
+                            chat_id=target_chat_id,
+                            video=message.video.file_id,
+                            caption=message_text or None,
+                            parse_mode=ParseMode.HTML if message_text else None
+                        )
+                    elif message.document:
+                        context.bot.send_document(
+                            chat_id=target_chat_id,
+                            document=message.document.file_id,
+                            caption=message_text or None,
+                            parse_mode=ParseMode.HTML if message_text else None
+                        )
+                    else:
+                        if message_text:
+                            context.bot.send_message(
+                                chat_id=target_chat_id,
+                                text=message_text,
+                                parse_mode=ParseMode.HTML
+                            )
+                    
+                    logger.info(f"✅ 补货通知已通过回退方案发送到 {target_chat_id}")
+                    
+                except Exception as send_err:
+                    logger.error(f"❌ 回退方案也失败: {send_err}")
         
         except Exception as e:
             logger.error(f"❌ 处理总部消息异常: {e}")
             traceback.print_exc()
-    
-    def _send_rewritten_buttons(self, context: CallbackContext, chat_id: Union[int, str], reply_to_message_id: int):
-        """
-        发送重写后的按钮（指向代理机器人）
-        
-        Args:
-            context: CallbackContext
-            chat_id: 目标群组ID
-            reply_to_message_id: 回复的消息ID
-        """
-        try:
-            # 获取机器人用户名
-            bot_info = context.bot.get_me()
-            bot_username = bot_info.username
-            
-            # 构建新的按钮
-            keyboard = [
-                [
-                    InlineKeyboardButton("🛒 购买商品", callback_data="products"),
-                    InlineKeyboardButton("🤖 打开机器人", url=f"https://t.me/{bot_username}")
-                ]
-            ]
-            
-            context.bot.send_message(
-                chat_id=chat_id,
-                text="👆 点击上方查看补货详情",
-                reply_to_message_id=reply_to_message_id,
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            
-            logger.info(f"✅ 补货通知按钮已重写")
-            
-        except Exception as e:
-            logger.warning(f"⚠️ 重写按钮失败: {e}")
 
 
 class AgentBot:

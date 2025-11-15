@@ -30,13 +30,17 @@ When headquarters posts a restock notice in the HQ notify channel/group, the age
 
 ### 4. 可选按钮重写 / Optional Button Rewriting
 - ✅ 可选功能：重写按钮指向代理机器人（默认关闭，提高安全性和简洁性）
-- ✅ 如果启用，会在转发消息下方添加：
-  - "🛒 购买商品" (callback_data=products)
-  - "🤖 打开机器人" (url: https://t.me/{agent_bot_username})
+- ✅ 如果启用，会将HQ消息中的按钮重写为指向代理机器人的按钮：
+  - "🛒 购买商品" (url: https://t.me/{agent_bot_username}?start=restock)
+  - 深度链接会直接打开商品中心
+  - 如果机器人用户名不可用，会回退到 callback 按钮 (callback_data=products)
+- ✅ 当启用按钮重写时，不使用 copy_message，而是发送新消息并附带重写的按钮
 - ✅ Optional: rewrite buttons to point to agent bot (off by default for safety and simplicity)
-- ✅ If enabled, adds buttons below the forwarded message:
-  - "🛒 购买商品" (callback_data=products)
-  - "🤖 打开机器人" (url: https://t.me/{agent_bot_username})
+- ✅ If enabled, rewrites HQ message buttons to point to agent bot:
+  - "🛒 购买商品" (url: https://t.me/{agent_bot_username}?start=restock)
+  - Deep link directly opens the product center
+  - Falls back to callback button (callback_data=products) if bot username unavailable
+- ✅ When button rewriting is enabled, does NOT use copy_message; sends new message with rewritten buttons
 
 ## 环境变量配置 / Environment Variables
 
@@ -67,7 +71,7 @@ RESTOCK_KEYWORDS=补货通知,库存更新,新品上架,restock,new stock,invent
 
 # 是否启用按钮重写（1=启用，0=禁用，默认禁用）
 # Enable button rewriting (1=enable, 0=disable, default is disabled)
-RESTOCK_REWRITE_BUTTONS=0
+HQ_RESTOCK_REWRITE_BUTTONS=0
 ```
 
 ## 配置示例 / Configuration Examples
@@ -108,7 +112,7 @@ RESTOCK_KEYWORDS=补货,上新,到货,新货,补充库存,restock,new arrival,ba
 
 HEADQUARTERS_NOTIFY_CHAT_ID=-1001234567890
 AGENT_NOTIFY_CHAT_ID=-1009876543210
-RESTOCK_REWRITE_BUTTONS=1
+HQ_RESTOCK_REWRITE_BUTTONS=1
 ```
 
 ## 权限要求 / Permission Requirements
@@ -135,22 +139,24 @@ graph LR
     B -->|否| Z[忽略]
     B -->|是| C{是否包含关键词?}
     C -->|否| Z
-    C -->|是| D[尝试 copy_message]
-    D -->|成功| E[✅ 转发成功]
-    D -->|失败| F[尝试 send_message]
-    F -->|成功| E
-    F -->|失败| G[❌ 记录错误]
-    E --> H{是否启用按钮重写?}
-    H -->|是| I[发送重写按钮]
-    H -->|否| J[完成]
+    C -->|是| D{是否启用按钮重写?}
+    D -->|是| E[发送新消息+重写按钮]
+    D -->|否| F[尝试 copy_message]
+    E -->|成功| G[✅ 转发成功]
+    E -->|失败| H[❌ 记录错误]
+    F -->|成功| G
+    F -->|失败| I[尝试 send_message]
+    I -->|成功| G
+    I -->|失败| H
 ```
 
 ## 日志示例 / Log Examples
 
-### 成功转发 / Successful Forwarding
+### 成功转发（未启用按钮重写）/ Successful Forwarding (Button Rewrite Disabled)
 ```
 INFO - 🔔 检测到补货通知（关键词: 补货通知）: 🎉 【新品上架】TG账号大批量补货...
-INFO - ✅ 补货通知已镜像到 -1009876543210 (message_id: 12345)
+INFO - 📋 按钮重写未启用，使用 copy_message 转发原始消息
+INFO - ✅ 补货通知已原样镜像到 -1009876543210 (message_id: 12345)
 ```
 
 ### copy_message 失败回退 / copy_message Fallback
@@ -160,10 +166,11 @@ INFO - 🔄 尝试使用 send_message 回退方案...
 INFO - ✅ 补货通知已通过回退方案发送到 -1009876543210
 ```
 
-### 按钮重写 / Button Rewriting
+### 按钮重写（启用时）/ Button Rewriting (When Enabled)
 ```
-INFO - ✅ 补货通知已镜像到 -1009876543210 (message_id: 12345)
-INFO - ✅ 补货通知按钮已重写
+INFO - 🔔 检测到补货通知（关键词: 补货通知）: 🎉 【新品上架】TG账号大批量补货...
+INFO - 🔄 按钮重写已启用，将发送带重写按钮的新消息
+INFO - ✅ 补货通知(图片+重写按钮)已发送到 -1009876543210 (message_id: 12345)
 ```
 
 ## 故障排除 / Troubleshooting
@@ -194,14 +201,14 @@ INFO - ✅ 补货通知按钮已重写
 ### 问题 3：按钮重写不工作 / Issue 3: Button Rewriting Not Working
 
 **可能原因 / Possible Causes:**
-1. `RESTOCK_REWRITE_BUTTONS` 未设置为 `1`
-2. 原消息没有按钮
-3. 机器人没有回复消息权限
+1. `HQ_RESTOCK_REWRITE_BUTTONS` 未设置为 `1`
+2. 机器人没有在目标群组发送消息的权限
+3. 消息发送失败
 
 **解决方案 / Solutions:**
-1. 设置 `RESTOCK_REWRITE_BUTTONS=1`
-2. 确认原消息确实包含 reply_markup
-3. 检查机器人权限
+1. 设置 `HQ_RESTOCK_REWRITE_BUTTONS=1`
+2. 检查机器人在 `AGENT_RESTOCK_NOTIFY_CHAT_ID` 的权限
+3. 查看日志了解详细错误信息
 
 ## 安全性考虑 / Security Considerations
 
@@ -276,6 +283,8 @@ for keyword in self.core.config.RESTOCK_KEYWORDS:
 ```
 
 ### 转发优先级 / Forwarding Priority
+
+当 `HQ_RESTOCK_REWRITE_BUTTONS=0`（默认）时：
 1. **copy_message** (优先 / Priority)
    - 完整保留格式、媒体、caption
    - 保留原始消息的所有特性
@@ -283,6 +292,63 @@ for keyword in self.core.config.RESTOCK_KEYWORDS:
 2. **send_message** (回退 / Fallback)
    - 根据消息类型选择不同方法
    - send_photo / send_video / send_document / send_message
+
+When `HQ_RESTOCK_REWRITE_BUTTONS=0` (default):
+1. **copy_message** (Priority)
+   - Fully preserves formatting, media, and captions
+   - Retains all original message features
+   
+2. **send_message** (Fallback)
+   - Selects method based on message type
+   - send_photo / send_video / send_document / send_message
+
+当 `HQ_RESTOCK_REWRITE_BUTTONS=1` 时：
+- 直接发送新消息，不使用 copy_message
+- 根据消息类型（图片/视频/文档/文本）发送带重写按钮的新消息
+- 按钮内容：`"🛒 购买商品"` 指向 `https://t.me/{agent_bot_username}?start=restock`
+- 深度链接参数 `start=restock` 会触发 /start 命令并直接打开商品中心
+- 如果无法获取机器人用户名，回退到 callback 按钮 (callback_data=products)
+
+When `HQ_RESTOCK_REWRITE_BUTTONS=1`:
+- Sends new message directly, does NOT use copy_message
+- Sends new message with rewritten buttons based on message type (photo/video/document/text)
+- Button content: `"🛒 购买商品"` pointing to `https://t.me/{agent_bot_username}?start=restock`
+- Deep link parameter `start=restock` triggers /start command and directly opens product center
+- Falls back to callback button (callback_data=products) if bot username unavailable
+
+### 深度链接支持 / Deep Link Support
+
+代理机器人的 /start 命令支持以下深度链接：
+
+**`/start restock`**
+- 用于补货通知按钮（当无法提取商品ID时）
+- 直接显示商品分类列表，无需额外点击
+- 用户可立即选择商品分类进行购买
+
+**`/start product_<nowuid>`**
+- 用于补货通知按钮（从HQ消息中提取商品ID后）
+- 直接显示该商品的购买页面："✅您正在购买：xxx"
+- 用户可立即点击"购买"按钮下单
+- 商品ID提取方式：
+  - 从原始消息的按钮URL中提取（如 `start=buy_123456`）
+  - 从原始消息的按钮callback_data中提取（如 `gmsp 123456`）
+  - 从消息文本中使用正则表达式提取（如 `ID: 123456`）
+
+The agent bot's /start command supports the following deep links:
+
+**`/start restock`**
+- Used for restock notification buttons (when product ID cannot be extracted)
+- Directly shows product category list without extra clicks
+- Users can immediately select product categories to purchase
+
+**`/start product_<nowuid>`**
+- Used for restock notification buttons (after extracting product ID from HQ message)
+- Directly shows the product purchase page: "✅您正在购买：xxx"
+- Users can immediately click "Buy" button to place order
+- Product ID extraction methods:
+  - From button URL in original message (e.g., `start=buy_123456`)
+  - From button callback_data in original message (e.g., `gmsp 123456`)
+  - From message text using regex (e.g., `ID: 123456`)
 
 ## 常见问题 / FAQ
 
