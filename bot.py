@@ -12285,12 +12285,20 @@ def show_agent_info_detail(update: Update, context: CallbackContext, agent_bot_i
                     'total_sales': 0.0,
                     'total_commission': 0.0,
                     'available_balance': 0.0,
+                    'withdrawn_amount': 0.0,
                     'total_users': 0,
-                    'order_count': 0
+                    'order_count': 0,
+                    'pending_withdrawal_count': 0,
+                    'pending_withdrawal_amount': 0.0
                 }
             
             status_icon = "🟢" if agent_info['status'] == 'active' else "🔴"
             status_text = "运行中" if agent_info['status'] == 'active' else "已停用"
+            
+            # 构建提现信息
+            withdrawal_info = ""
+            if stats['pending_withdrawal_count'] > 0:
+                withdrawal_info = f"\n• 待处理提现：{stats['pending_withdrawal_count']} 笔 ({stats['pending_withdrawal_amount']:.2f} USDT)"
             
             text = f"""🤖 <b>{agent_info['agent_name']} 详情</b>
 
@@ -12303,12 +12311,14 @@ def show_agent_info_detail(update: Update, context: CallbackContext, agent_bot_i
 
 💰 <b>财务数据</b>
 • 总销售额：{stats['total_sales']:.2f} USDT
-• 总佣金：{stats['total_commission']:.2f} USDT
-• 可用余额：{stats['available_balance']:.2f} USDT
+• 总佣金收入：{stats['total_commission']:.2f} USDT
+• 已提现金额：{stats['withdrawn_amount']:.2f} USDT
+• 可用余额：{stats['available_balance']:.2f} USDT{withdrawal_info}
 
 📊 <b>运营数据</b>
-• 用户数量：{stats['total_users']} 人
-• 订单数量：{stats['order_count']} 笔
+• 注册用户：{stats['total_users']} 人
+• 订单总数：{stats['order_count']} 笔
+• 平均订单额：{(stats['total_sales'] / stats['order_count']) if stats['order_count'] > 0 else 0:.2f} USDT
 
 📅 <b>创建时间</b>
 {agent_info['creation_time']}"""
@@ -12369,12 +12379,20 @@ def show_agent_report_detail(update: Update, context: CallbackContext, agent_bot
                     'total_sales': 0.0,
                     'total_commission': 0.0,
                     'available_balance': 0.0,
+                    'withdrawn_amount': 0.0,
                     'total_users': 0,
-                    'order_count': 0
+                    'order_count': 0,
+                    'pending_withdrawal_count': 0,
+                    'pending_withdrawal_amount': 0.0
                 }
             
             from datetime import datetime
             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # 构建提现信息
+            withdrawal_info = ""
+            if stats['pending_withdrawal_count'] > 0:
+                withdrawal_info = f"\n• 待处理提现：{stats['pending_withdrawal_count']} 笔 ({stats['pending_withdrawal_amount']:.2f} USDT)"
             
             text = f"""📊 <b>{agent_info['agent_name']} 报表</b>
 📅 {current_time}
@@ -12382,8 +12400,8 @@ def show_agent_report_detail(update: Update, context: CallbackContext, agent_bot
 💰 <b>财务报表</b>
 • 总销售额：{stats['total_sales']:.2f} USDT
 • 总佣金收入：{stats['total_commission']:.2f} USDT
-• 可用余额：{stats['available_balance']:.2f} USDT
-• 已提现金额：{agent_info.get('withdrawn_amount', 0):.2f} USDT
+• 已提现金额：{stats['withdrawn_amount']:.2f} USDT
+• 可用余额：{stats['available_balance']:.2f} USDT{withdrawal_info}
 
 📈 <b>业务报表</b>
 • 总订单数：{stats['order_count']} 笔

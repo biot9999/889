@@ -802,19 +802,53 @@ def get_agent_stats(agent_bot_id):
             total_commission = 0.0
             order_count = 0
         
-        # 获取余额（从agent_bots）
-        available_balance = float(agent_info.get('available_balance', 0))
+        # 计算已提现金额（从agent_withdrawals，只统计已完成的提现）
+        withdrawal_pipeline = [
+            {
+                '$match': {
+                    'agent_bot_id': agent_bot_id,
+                    'status': 'completed'
+                }
+            },
+            {
+                '$group': {
+                    '_id': None,
+                    'total_withdrawn': {'$sum': '$amount'}
+                }
+            }
+        ]
+        
+        withdrawal_result = list(agent_withdrawals.aggregate(withdrawal_pipeline))
+        
+        if withdrawal_result:
+            withdrawn_amount = float(withdrawal_result[0].get('total_withdrawn', 0))
+        else:
+            withdrawn_amount = 0.0
+        
+        # 计算可用余额 = 总佣金 - 已提现金额
+        available_balance = total_commission - withdrawn_amount
         
         # 获取用户数量
         agent_users = get_agent_bot_user_collection(agent_bot_id)
         total_users = agent_users.count_documents({})
         
+        # 获取待处理提现数量和金额
+        pending_withdrawals = list(agent_withdrawals.find({
+            'agent_bot_id': agent_bot_id,
+            'status': 'pending'
+        }))
+        pending_withdrawal_count = len(pending_withdrawals)
+        pending_withdrawal_amount = sum(w.get('amount', 0) for w in pending_withdrawals)
+        
         return {
             'total_sales': total_sales,
             'total_commission': total_commission,
             'available_balance': available_balance,
+            'withdrawn_amount': withdrawn_amount,
             'total_users': total_users,
-            'order_count': order_count
+            'order_count': order_count,
+            'pending_withdrawal_count': pending_withdrawal_count,
+            'pending_withdrawal_amount': float(pending_withdrawal_amount)
         }
     except Exception as e:
         logging.error(f"❌ 获取代理统计数据失败：{e}")
