@@ -765,11 +765,15 @@ def generate_agent_bot_id():
     return f"agent_{timestamp}{random_part}"
 
 def get_agent_stats(agent_bot_id, period='all'):
-    """获取代理机器人的统计数据
+    """获取代理机器人的统计数据（基于 agent_orders 集合，兼容 agent_{id}_gmjlu 回退）
     
     Args:
         agent_bot_id: 代理机器人ID
         period: 时间周期 '7d'|'17d'|'30d'|'90d'|'all'
+    
+    Returns:
+        dict: 统计数据字典，包含销售额、佣金、订单数等信息
+        None: 如果发生错误
     """
     try:
         logging.info(f"🔍 get_agent_stats called for agent_bot_id: {agent_bot_id}, period: {period}")
@@ -780,56 +784,138 @@ def get_agent_stats(agent_bot_id, period='all'):
             logging.warning(f"❌ Agent not found: {agent_bot_id}")
             return None
         
-        logging.info(f"✅ Found agent: {agent_info.get('agent_name')}")
+        commission_rate = agent_info.get('commission_rate', 0) / 100
+        logging.info(f"✅ Found agent: {agent_info.get('agent_name')}, commission_rate: {commission_rate}")
         
         # 计算时间范围
-        time_filter = {}
+        start_time = None
         if period != 'all':
             days_map = {'7d': 7, '17d': 17, '30d': 30, '90d': 90}
             days = days_map.get(period, 30)
             start_time = datetime.now() - timedelta(days=days)
-            start_time_str = start_time.strftime('%Y-%m-%d %H:%M:%S')
-            time_filter = {'timer': {'$gte': start_time_str}}
-            logging.info(f"📅 Time filter: orders since {start_time_str}")
+            logging.info(f"📅 Time filter: orders since {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         
-        # 获取代理的 gmjlu 集合（代理端实际记录订单的地方）
-        agent_gmjlu = get_agent_bot_gmjlu_collection(agent_bot_id)
+        # ========== 主统计源：agent_orders 集合 ==========
+        total_sales = 0.0
+        order_count = 0
+        total_commission = 0.0
+        data_source = "agent_orders"
         
-        # 计算总销售额和订单数（从agent_{id}_gmjlu，只统计purchase类型）
-        match_filter = {'leixing': 'purchase'}
-        # 添加时间过滤
-        if time_filter:
-            match_filter.update(time_filter)
-        
-        pipeline = [
-            {'$match': match_filter},
-            {
+        try:
+            # 构建时间过滤管道（兼容 datetime 和 string 格式）
+            pipeline = []
+            
+            # 1. 匹配代理机器人
+            match_stage = {'agent_bot_id': agent_bot_id}
+            pipeline.append({'$match': match_stage})
+            
+            # 2. 归一化 order_time 字段为 datetime 类型
+            pipeline.append({
+                '$addFields': {
+                    '_orderTime': {
+                        '$cond': {
+                            'if': {'$eq': [{'$type': '$order_time'}, 'date']},
+                            'then': '$order_time',
+                            'else': {
+                                '$dateFromString': {
+                                    'dateString': '$order_time',
+                                    'onError': None,
+                                    'onNull': None
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            
+            # 3. 时间过滤（如果需要）
+            if start_time:
+                pipeline.append({
+                    '$match': {
+                        '_orderTime': {'$gte': start_time}
+                    }
+                })
+            
+            # 4. 聚合计算
+            pipeline.append({
                 '$group': {
                     '_id': None,
-                    'total_sales': {'$sum': '$ts'},
+                    'total_sales': {
+                        '$sum': {
+                            '$multiply': [
+                                {'$ifNull': ['$agent_price', 0]},
+                                {'$ifNull': ['$quantity', 1]}
+                            ]
+                        }
+                    },
+                    'total_commission': {
+                        '$sum': {
+                            '$ifNull': ['$commission', 0]
+                        }
+                    },
                     'order_count': {'$sum': 1}
                 }
-            }
-        ]
+            })
+            
+            result = list(agent_orders.aggregate(pipeline))
+            
+            if result and result[0]['order_count'] > 0:
+                stats = result[0]
+                total_sales = float(stats.get('total_sales', 0))
+                order_count = stats.get('order_count', 0)
+                total_commission = float(stats.get('total_commission', 0))
+                
+                # 如果 commission 字段缺失，回退计算
+                if total_commission == 0 and total_sales > 0:
+                    total_commission = total_sales * commission_rate
+                    logging.info(f"📊 Commission calculated from commission_rate (fallback)")
+                
+                logging.info(f"📊 Data source: agent_orders - Sales: {total_sales:.2f}, Commission: {total_commission:.2f}, Orders: {order_count}")
+            else:
+                # agent_orders 无数据，回退到 agent_{id}_gmjlu
+                logging.warning(f"⚠️ No data in agent_orders, falling back to agent_{agent_bot_id}_gmjlu")
+                data_source = f"agent_{agent_bot_id}_gmjlu"
+                raise Exception("Fallback to gmjlu")
+                
+        except Exception as e:
+            # ========== 回退统计源：agent_{id}_gmjlu 集合 ==========
+            logging.info(f"⚠️ Falling back to {data_source}: {str(e)}")
+            data_source = f"agent_{agent_bot_id}_gmjlu"
+            
+            agent_gmjlu = get_agent_bot_gmjlu_collection(agent_bot_id)
+            
+            # 构建时间过滤
+            match_filter = {'leixing': 'purchase'}
+            if start_time:
+                start_time_str = start_time.strftime('%Y-%m-%d %H:%M:%S')
+                match_filter['timer'] = {'$gte': start_time_str}
+            
+            pipeline = [
+                {'$match': match_filter},
+                {
+                    '$group': {
+                        '_id': None,
+                        'total_sales': {'$sum': '$ts'},
+                        'order_count': {'$sum': 1}
+                    }
+                }
+            ]
+            
+            result = list(agent_gmjlu.aggregate(pipeline))
+            
+            if result:
+                stats = result[0]
+                total_sales = float(stats.get('total_sales', 0))
+                order_count = stats.get('order_count', 0)
+                total_commission = total_sales * commission_rate
+                logging.info(f"📊 Data source: {data_source} (fallback) - Sales: {total_sales:.2f}, Commission: {total_commission:.2f}, Orders: {order_count}")
+            else:
+                total_sales = 0.0
+                order_count = 0
+                total_commission = 0.0
+                logging.info(f"📊 Data source: {data_source} (fallback) - No data found")
         
-        result = list(agent_gmjlu.aggregate(pipeline))
-        
-        if result:
-            stats = result[0]
-            total_sales = float(stats.get('total_sales', 0))
-            order_count = stats.get('order_count', 0)
-        else:
-            total_sales = 0.0
-            order_count = 0
-        
-        # 计算佣金 = 总销售额 * 佣金率
-        commission_rate = agent_info.get('commission_rate', 0) / 100
-        total_commission = total_sales * commission_rate
-        
-        logging.info(f"📊 Orders stats - Sales: {total_sales}, Commission: {total_commission}, Orders: {order_count}")
-        
-        # 计算已提现金额（从agent_withdrawals，只统计已完成的提现）
-        # 提现金额始终显示总额，不受时间周期限制
+        # ========== 计算已提现金额（全部时间，从 agent_withdrawals） ==========
         withdrawal_pipeline = [
             {
                 '$match': {
@@ -846,40 +932,71 @@ def get_agent_stats(agent_bot_id, period='all'):
         ]
         
         withdrawal_result = list(agent_withdrawals.aggregate(withdrawal_pipeline))
+        withdrawn_amount = float(withdrawal_result[0].get('total_withdrawn', 0)) if withdrawal_result else 0.0
         
-        if withdrawal_result:
-            withdrawn_amount = float(withdrawal_result[0].get('total_withdrawn', 0))
-        else:
-            withdrawn_amount = 0.0
-        
-        # 计算可用余额 = 总佣金（全部时间）- 已提现金额
-        # 需要获取全部时间的总佣金来计算余额
+        # ========== 计算可用余额（全部时间累计佣金 - 已提现金额） ==========
+        # 如果当前周期不是"全部"，需要重新计算全部时间的佣金
         if period != 'all':
-            all_sales_pipeline = [
-                {'$match': {'leixing': 'purchase'}},
-                {
-                    '$group': {
-                        '_id': None,
-                        'total_sales': {'$sum': '$ts'}
+            try:
+                # 先尝试从 agent_orders 获取全部时间佣金
+                all_time_pipeline = [
+                    {'$match': {'agent_bot_id': agent_bot_id}},
+                    {
+                        '$group': {
+                            '_id': None,
+                            'total_sales': {
+                                '$sum': {
+                                    '$multiply': [
+                                        {'$ifNull': ['$agent_price', 0]},
+                                        {'$ifNull': ['$quantity', 1]}
+                                    ]
+                                }
+                            },
+                            'total_commission': {
+                                '$sum': {'$ifNull': ['$commission', 0]}
+                            }
+                        }
                     }
-                }
-            ]
-            all_sales_result = list(agent_gmjlu.aggregate(all_sales_pipeline))
-            all_total_sales = float(all_sales_result[0].get('total_sales', 0)) if all_sales_result else 0.0
-            all_total_commission = all_total_sales * commission_rate
+                ]
+                
+                all_result = list(agent_orders.aggregate(all_time_pipeline))
+                
+                if all_result and all_result[0].get('total_sales', 0) > 0:
+                    all_total_commission = float(all_result[0].get('total_commission', 0))
+                    if all_total_commission == 0:
+                        all_total_sales = float(all_result[0].get('total_sales', 0))
+                        all_total_commission = all_total_sales * commission_rate
+                else:
+                    raise Exception("Fallback to gmjlu for all-time commission")
+                    
+            except Exception:
+                # 回退到 agent_{id}_gmjlu
+                agent_gmjlu = get_agent_bot_gmjlu_collection(agent_bot_id)
+                all_sales_pipeline = [
+                    {'$match': {'leixing': 'purchase'}},
+                    {
+                        '$group': {
+                            '_id': None,
+                            'total_sales': {'$sum': '$ts'}
+                        }
+                    }
+                ]
+                all_sales_result = list(agent_gmjlu.aggregate(all_sales_pipeline))
+                all_total_sales = float(all_sales_result[0].get('total_sales', 0)) if all_sales_result else 0.0
+                all_total_commission = all_total_sales * commission_rate
+            
             available_balance = all_total_commission - withdrawn_amount
         else:
             available_balance = total_commission - withdrawn_amount
         
-        logging.info(f"💰 Withdrawn: {withdrawn_amount}, Available: {available_balance}")
+        logging.info(f"💰 Withdrawn: {withdrawn_amount:.2f}, Available balance: {available_balance:.2f}")
         
-        # 获取用户数量（不受时间周期限制）
+        # ========== 获取用户数量（全部时间） ==========
         agent_users = get_agent_bot_user_collection(agent_bot_id)
         total_users = agent_users.count_documents({})
-        
         logging.info(f"👥 Total users: {total_users}")
         
-        # 获取待处理提现数量和金额（不受时间周期限制）
+        # ========== 获取待处理提现（全部时间） ==========
         pending_withdrawals = list(agent_withdrawals.find({
             'agent_bot_id': agent_bot_id,
             'status': 'pending'
@@ -887,7 +1004,7 @@ def get_agent_stats(agent_bot_id, period='all'):
         pending_withdrawal_count = len(pending_withdrawals)
         pending_withdrawal_amount = sum(w.get('amount', 0) for w in pending_withdrawals)
         
-        # 计算平均订单额和利润率
+        # ========== 计算平均订单额和利润率 ==========
         avg_order = (total_sales / order_count) if order_count > 0 else 0.0
         profit_rate = (total_commission / total_sales * 100) if total_sales > 0 else agent_info.get('commission_rate', 0)
         
@@ -902,17 +1019,33 @@ def get_agent_stats(agent_bot_id, period='all'):
             'pending_withdrawal_amount': float(pending_withdrawal_amount),
             'avg_order': avg_order,
             'profit_rate': profit_rate,
-            'period': period
+            'period': period,
+            'data_source': data_source  # 用于调试
         }
         
         logging.info(f"✅ get_agent_stats returning: {result_stats}")
         
         return result_stats
+        
     except Exception as e:
         logging.error(f"❌ 获取代理统计数据失败：{e}")
         import traceback
         traceback.print_exc()
-        return None
+        # 返回安全的零值对象
+        return {
+            'total_sales': 0.0,
+            'total_commission': 0.0,
+            'available_balance': 0.0,
+            'withdrawn_amount': 0.0,
+            'total_users': 0,
+            'order_count': 0,
+            'pending_withdrawal_count': 0,
+            'pending_withdrawal_amount': 0.0,
+            'avg_order': 0.0,
+            'profit_rate': 0.0,
+            'period': period,
+            'data_source': 'error'
+        }
 
 # ================================ 初始化多机器人分销系统 ================================
 

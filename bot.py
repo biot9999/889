@@ -1634,6 +1634,71 @@ def admin(update: Update, context: CallbackContext):
 
     show_admin_panel(update, context, user_id)
 
+def diag_db(update: Update, context: CallbackContext):
+    """数据库诊断命令 - 显示当前 MongoDB 配置信息"""
+    user_id = update.effective_user.id
+    
+    # 检查权限 - 只有总部管理员才能使用
+    if not multi_bot_system.is_master_admin(user_id):
+        update.message.reply_text("❌ 您没有权限使用此命令")
+        return
+    
+    from mongo import Config, MONGO_URI, MONGO_DB_BOT, MONGO_DB_XCHP, MONGO_DB_MAIN
+    
+    # 获取数据库统计信息
+    try:
+        from mongo import db_manager
+        
+        # 获取代理机器人数量
+        agent_count = agent_bots.count_documents({})
+        active_agent_count = agent_bots.count_documents({'status': 'active'})
+        
+        # 获取订单数量
+        orders_count = agent_orders.count_documents({})
+        
+        # 获取提现申请数量
+        withdrawal_count = agent_withdrawals.count_documents({})
+        pending_withdrawal_count = agent_withdrawals.count_documents({'status': 'pending'})
+        
+        # 掩码处理 URI（隐藏敏感信息）
+        masked_uri = MONGO_URI
+        if '@' in masked_uri:
+            # mongodb://username:password@host:port/ -> mongodb://***:***@host:port/
+            parts = masked_uri.split('@')
+            if len(parts) == 2:
+                prefix = parts[0].split('//')[0] + '//'
+                masked_uri = f"{prefix}***:***@{parts[1]}"
+        
+        text = f"""🔍 <b>数据库诊断信息</b>
+
+<b>📊 MongoDB 配置</b>
+• URI: <code>{masked_uri}</code>
+• 主数据库: <code>{MONGO_DB_MAIN}</code>
+• 机器人数据库: <code>{MONGO_DB_BOT}</code>
+• 选品数据库: <code>{MONGO_DB_XCHP}</code>
+
+<b>📈 数据统计</b>
+• 代理机器人: {agent_count} 个（{active_agent_count} 个活跃）
+• 代理订单记录: {orders_count} 条
+• 提现申请: {withdrawal_count} 条（{pending_withdrawal_count} 条待处理）
+
+<b>⏰ 系统时间</b>
+• 当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+<b>ℹ️ 说明</b>
+此命令用于诊断数据库连接和配置，确保所有代理使用统一的数据库。
+"""
+        
+        update.message.reply_text(text, parse_mode='HTML')
+        logging.info(f"✅ Database diagnostics requested by user {user_id}")
+        
+    except Exception as e:
+        error_text = f"❌ 获取数据库诊断信息失败：{str(e)}"
+        update.message.reply_text(error_text)
+        logging.error(f"Database diagnostics failed: {e}")
+        import traceback
+        traceback.print_exc()
+
 def export_gmjlu_records(update: Update, context: CallbackContext):
     """导出用户购买记录 - 优化版"""
     query = update.callback_query
@@ -14238,6 +14303,7 @@ def main():
     dispatcher.add_handler(CommandHandler('admin', admin, run_async=True))
     dispatcher.add_handler(CommandHandler("admin_add", admin_add, run_async=True))
     dispatcher.add_handler(CommandHandler("admin_remove", admin_remove, run_async=True))
+    dispatcher.add_handler(CommandHandler("diag_db", diag_db, run_async=True))  # Database diagnostics
     # 🆕 用户提现管理命令
     dispatcher.add_handler(CommandHandler("my_withdrawals", check_my_withdrawals, run_async=True))
     # 在main()函数的dispatcher部分添加：
