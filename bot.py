@@ -7398,6 +7398,10 @@ def get_current_rate():
 def textkeyboard(update: Update, context: CallbackContext):
     chat = update.effective_chat
     if chat.type == 'private':
+        # ✅ 如果代理创建向导正在进行，不处理该消息
+        if WIZARD_STATE_KEY in context.user_data:
+            return
+        
         user_id = chat.id
         username = chat.username
         firstname = chat.first_name
