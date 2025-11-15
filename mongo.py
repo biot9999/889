@@ -789,14 +789,14 @@ def get_agent_stats(agent_bot_id, period='all'):
             days = days_map.get(period, 30)
             start_time = datetime.now() - timedelta(days=days)
             start_time_str = start_time.strftime('%Y-%m-%d %H:%M:%S')
-            time_filter = {'order_time': {'$gte': start_time_str}}
+            time_filter = {'timer': {'$gte': start_time_str}}
             logging.info(f"📅 Time filter: orders since {start_time_str}")
         
-        # 计算总销售额和总佣金（从agent_orders，排除取消订单）
-        match_filter = {
-            'agent_bot_id': agent_bot_id,
-            'status': {'$ne': 'canceled'}
-        }
+        # 获取代理的 gmjlu 集合（代理端实际记录订单的地方）
+        agent_gmjlu = get_agent_bot_gmjlu_collection(agent_bot_id)
+        
+        # 计算总销售额和订单数（从agent_{id}_gmjlu，只统计purchase类型）
+        match_filter = {'leixing': 'purchase'}
         # 添加时间过滤
         if time_filter:
             match_filter.update(time_filter)
@@ -806,24 +806,25 @@ def get_agent_stats(agent_bot_id, period='all'):
             {
                 '$group': {
                     '_id': None,
-                    'total_sales': {'$sum': {'$multiply': ['$agent_price', '$quantity']}},
-                    'total_commission': {'$sum': {'$multiply': ['$commission', '$quantity']}},
+                    'total_sales': {'$sum': '$ts'},
                     'order_count': {'$sum': 1}
                 }
             }
         ]
         
-        result = list(agent_orders.aggregate(pipeline))
+        result = list(agent_gmjlu.aggregate(pipeline))
         
         if result:
             stats = result[0]
             total_sales = float(stats.get('total_sales', 0))
-            total_commission = float(stats.get('total_commission', 0))
             order_count = stats.get('order_count', 0)
         else:
             total_sales = 0.0
-            total_commission = 0.0
             order_count = 0
+        
+        # 计算佣金 = 总销售额 * 佣金率
+        commission_rate = agent_info.get('commission_rate', 0) / 100
+        total_commission = total_sales * commission_rate
         
         logging.info(f"📊 Orders stats - Sales: {total_sales}, Commission: {total_commission}, Orders: {order_count}")
         
@@ -854,22 +855,18 @@ def get_agent_stats(agent_bot_id, period='all'):
         # 计算可用余额 = 总佣金（全部时间）- 已提现金额
         # 需要获取全部时间的总佣金来计算余额
         if period != 'all':
-            all_commission_pipeline = [
-                {
-                    '$match': {
-                        'agent_bot_id': agent_bot_id,
-                        'status': {'$ne': 'canceled'}
-                    }
-                },
+            all_sales_pipeline = [
+                {'$match': {'leixing': 'purchase'}},
                 {
                     '$group': {
                         '_id': None,
-                        'total_commission': {'$sum': {'$multiply': ['$commission', '$quantity']}}
+                        'total_sales': {'$sum': '$ts'}
                     }
                 }
             ]
-            all_commission_result = list(agent_orders.aggregate(all_commission_pipeline))
-            all_total_commission = float(all_commission_result[0].get('total_commission', 0)) if all_commission_result else 0.0
+            all_sales_result = list(agent_gmjlu.aggregate(all_sales_pipeline))
+            all_total_sales = float(all_sales_result[0].get('total_sales', 0)) if all_sales_result else 0.0
+            all_total_commission = all_total_sales * commission_rate
             available_balance = all_total_commission - withdrawn_amount
         else:
             available_balance = total_commission - withdrawn_amount
