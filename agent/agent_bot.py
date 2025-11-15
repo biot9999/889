@@ -213,6 +213,8 @@ class AgentBotConfig:
             self.agent_profit_account = self.db['agent_profit_account']
             self.withdrawal_requests = self.db['withdrawal_requests']
             self.recharge_orders = self.db['recharge_orders']
+            self.agent_bots = self.db['agent_bots']  # ✅ 代理机器人信息
+            self.agent_orders = self.db['agent_orders']  # ✅ 代理订单记录
         except Exception as e:
             logger.error(f"❌ 数据库连接失败: {e}")
             raise

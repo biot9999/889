@@ -105,7 +105,9 @@ class AgentBotCore:
             
             # 记录订单到代理数据库
             order_id = f"order_{datetime.now().strftime('%Y%m%d%H%M%S')}{user_id}"
+            order_time = datetime.now()
             
+            # 写入旧格式（保持兼容性）
             agent_gmjlu = self.config.get_agent_gmjlu_collection()
             order_record = {
                 'leixing': 'purchase',
@@ -114,11 +116,45 @@ class AgentBotCore:
                 'projectname': original_product['projectname'],
                 'text': delivered_items[0] if delivered_items else '',
                 'ts': total_cost,
-                'timer': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'timer': order_time.strftime('%Y-%m-%d %H:%M:%S'),
                 'count': quantity
             }
             
             agent_gmjlu.insert_one(order_record)
+            
+            # 写入新格式（用于总部统计）
+            # 获取原始商品价格（成本价）
+            cost_price = float(original_product.get('money', 0))
+            profit = agent_price - cost_price
+            
+            # 获取代理佣金比例
+            try:
+                agent_info = self.config.agent_bots.find_one({'agent_bot_id': self.config.AGENT_BOT_ID})
+                commission_rate = float(agent_info.get('commission_rate', 0)) / 100 if agent_info else 0
+            except Exception as e:
+                logger.warning(f"⚠️ 获取佣金比例失败: {e}")
+                commission_rate = 0
+            
+            # 计算佣金
+            commission = total_cost * commission_rate
+            
+            # 写入agent_orders集合（用于总部统计）
+            agent_order_record = {
+                'order_id': order_id,
+                'agent_bot_id': self.config.AGENT_BOT_ID,
+                'customer_id': user_id,
+                'original_nowuid': product_nowuid,
+                'quantity': quantity,
+                'agent_price': agent_price,
+                'cost_price': cost_price,
+                'profit': profit,
+                'commission': commission,
+                'status': 'completed',
+                'order_time': order_time,  # datetime对象，不是字符串
+                'delivery_content': '\n'.join(delivered_items) if delivered_items else ''
+            }
+            
+            self.config.agent_orders.insert_one(agent_order_record)
             
             logger.info(f"✅ 购买完成: 用户{user_id} 购买 {original_product['projectname']} x{quantity}")
             logger.info(f"📁 文件发送统计: {files_sent_count}/{len(available_items)} 个文件发送成功")
