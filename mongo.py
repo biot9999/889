@@ -767,10 +767,15 @@ def generate_agent_bot_id():
 def get_agent_stats(agent_bot_id):
     """获取代理机器人的统计数据"""
     try:
+        logging.info(f"🔍 get_agent_stats called for agent_bot_id: {agent_bot_id}")
+        
         # 获取代理机器人基本信息
         agent_info = agent_bots.find_one({'agent_bot_id': agent_bot_id})
         if not agent_info:
+            logging.warning(f"❌ Agent not found: {agent_bot_id}")
             return None
+        
+        logging.info(f"✅ Found agent: {agent_info.get('agent_name')}")
         
         # 计算总销售额和总佣金（从agent_orders，排除取消订单）
         pipeline = [
@@ -802,6 +807,8 @@ def get_agent_stats(agent_bot_id):
             total_commission = 0.0
             order_count = 0
         
+        logging.info(f"📊 Orders stats - Sales: {total_sales}, Commission: {total_commission}, Orders: {order_count}")
+        
         # 计算已提现金额（从agent_withdrawals，只统计已完成的提现）
         withdrawal_pipeline = [
             {
@@ -828,9 +835,13 @@ def get_agent_stats(agent_bot_id):
         # 计算可用余额 = 总佣金 - 已提现金额
         available_balance = total_commission - withdrawn_amount
         
+        logging.info(f"💰 Withdrawn: {withdrawn_amount}, Available: {available_balance}")
+        
         # 获取用户数量
         agent_users = get_agent_bot_user_collection(agent_bot_id)
         total_users = agent_users.count_documents({})
+        
+        logging.info(f"👥 Total users: {total_users}")
         
         # 获取待处理提现数量和金额
         pending_withdrawals = list(agent_withdrawals.find({
@@ -840,7 +851,7 @@ def get_agent_stats(agent_bot_id):
         pending_withdrawal_count = len(pending_withdrawals)
         pending_withdrawal_amount = sum(w.get('amount', 0) for w in pending_withdrawals)
         
-        return {
+        result_stats = {
             'total_sales': total_sales,
             'total_commission': total_commission,
             'available_balance': available_balance,
@@ -850,8 +861,14 @@ def get_agent_stats(agent_bot_id):
             'pending_withdrawal_count': pending_withdrawal_count,
             'pending_withdrawal_amount': float(pending_withdrawal_amount)
         }
+        
+        logging.info(f"✅ get_agent_stats returning: {result_stats}")
+        
+        return result_stats
     except Exception as e:
         logging.error(f"❌ 获取代理统计数据失败：{e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 # ================================ 初始化多机器人分销系统 ================================
