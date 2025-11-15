@@ -45,7 +45,8 @@ from mongo import (
     create_agent_bot_data, create_agent_product_price_data, create_agent_order_data,
     create_agent_withdrawal_data, create_agent_user_data, get_agent_bot_info,
     get_agent_bot_user_collection, get_agent_bot_user, update_agent_bot_user_balance,
-    get_agent_product_price, get_real_time_stock, generate_agent_bot_id
+    get_agent_product_price, get_real_time_stock, generate_agent_bot_id, get_agent_stats,
+    get_agent_bot_topup_collection, get_agent_bot_gmjlu_collection
 )
 # ✅ 先定义变量（在文件顶部）
 NOTIFY_CHANNEL_ID = os.getenv("NOTIFY_CHANNEL_ID")
@@ -151,6 +152,69 @@ class MultiBotDistributionSystem:
         except Exception as e:
             print(f"❌ 获取代理机器人列表失败: {e}")
             return []
+    
+    def delete_agent_bot(self, agent_bot_id):
+        """删除代理机器人及其所有相关数据"""
+        try:
+            print(f"🗑️ 开始删除代理机器人: {agent_bot_id}")
+            
+            # 检查代理机器人是否存在
+            agent_info = agent_bots.find_one({'agent_bot_id': agent_bot_id})
+            if not agent_info:
+                return False, "代理机器人不存在"
+            
+            # 1. 删除代理机器人主记录
+            result = agent_bots.delete_one({'agent_bot_id': agent_bot_id})
+            print(f"✅ 删除代理机器人主记录: {result.deleted_count} 条")
+            
+            # 2. 删除代理商品价格
+            result = agent_product_prices.delete_many({'agent_bot_id': agent_bot_id})
+            print(f"✅ 删除代理商品价格: {result.deleted_count} 条")
+            
+            # 3. 删除代理订单
+            result = agent_orders.delete_many({'agent_bot_id': agent_bot_id})
+            print(f"✅ 删除代理订单: {result.deleted_count} 条")
+            
+            # 4. 删除代理提现申请
+            result = agent_withdrawals.delete_many({'agent_bot_id': agent_bot_id})
+            print(f"✅ 删除代理提现申请: {result.deleted_count} 条")
+            
+            # 5. 删除代理机器人独立集合
+            try:
+                # 用户集合
+                user_collection = get_agent_bot_user_collection(agent_bot_id)
+                if user_collection is not None:
+                    user_collection.drop()
+                    print(f"✅ 删除代理用户集合: agent_{agent_bot_id}_users")
+            except Exception as e:
+                print(f"⚠️ 删除用户集合失败: {e}")
+            
+            try:
+                # 充值记录集合
+                topup_collection = get_agent_bot_topup_collection(agent_bot_id)
+                if topup_collection is not None:
+                    topup_collection.drop()
+                    print(f"✅ 删除代理充值集合: agent_{agent_bot_id}_topup")
+            except Exception as e:
+                print(f"⚠️ 删除充值集合失败: {e}")
+            
+            try:
+                # 购买记录集合
+                gmjlu_collection = get_agent_bot_gmjlu_collection(agent_bot_id)
+                if gmjlu_collection is not None:
+                    gmjlu_collection.drop()
+                    print(f"✅ 删除代理购买记录集合: agent_{agent_bot_id}_gmjlu")
+            except Exception as e:
+                print(f"⚠️ 删除购买记录集合失败: {e}")
+            
+            print(f"✅ 代理机器人删除完成: {agent_info.get('agent_name')}")
+            return True, "删除成功"
+            
+        except Exception as e:
+            print(f"❌ 删除代理机器人失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False, f"删除失败: {str(e)}"
     
     def validate_bot_token(self, token):
         """验证机器人Token（基础验证）"""
@@ -10431,7 +10495,132 @@ def handle_all_callbacks(update: Update, context: CallbackContext):
             # 弹窗显示地址供手动复制
             query.answer(w['withdrawal_address'], show_alert=True)           
             
-    # ========== 代理机器人详情 ==========
+    # ========== 代理机器人查看 ==========
+    elif query.data.startswith("agent_view:"):
+        agent_bot_id = query.data.split(":", 1)[1]
+        query.answer()
+        
+        if not multi_bot_system.is_master_admin(query.from_user.id):
+            try:
+                query.edit_message_text("❌ 权限错误")
+            except:
+                context.bot.send_message(chat_id=query.from_user.id, text="❌ 权限错误")
+            return
+        
+        show_agent_info_detail(update, context, agent_bot_id)
+    
+    # ========== 代理机器人报表 ==========
+    elif query.data.startswith("agent_report:"):
+        agent_bot_id = query.data.split(":", 1)[1]
+        query.answer()
+        
+        if not multi_bot_system.is_master_admin(query.from_user.id):
+            try:
+                query.edit_message_text("❌ 权限错误")
+            except:
+                context.bot.send_message(chat_id=query.from_user.id, text="❌ 权限错误")
+            return
+        
+        show_agent_report_detail(update, context, agent_bot_id)
+    
+    # ========== 代理机器人删除确认 ==========
+    elif query.data.startswith("agent_delete:"):
+        agent_bot_id = query.data.split(":", 1)[1]
+        query.answer()
+        
+        if not multi_bot_system.is_master_admin(query.from_user.id):
+            try:
+                query.edit_message_text("❌ 权限错误")
+            except:
+                context.bot.send_message(chat_id=query.from_user.id, text="❌ 权限错误")
+            return
+        
+        # 获取代理信息
+        agent_info = get_agent_bot_info(agent_bot_id)
+        if not agent_info:
+            try:
+                query.edit_message_text("❌ 代理机器人不存在")
+            except:
+                context.bot.send_message(chat_id=query.from_user.id, text="❌ 代理机器人不存在")
+            return
+        
+        text = f"""⚠️ <b>确认删除代理机器人</b>
+
+<b>代理名称:</b> {agent_info['agent_name']}
+<b>机器人:</b> @{agent_info.get('agent_username', 'unknown')}
+
+<b>警告：</b>
+• 将删除所有用户数据
+• 将删除所有订单记录
+• 将删除所有充值记录
+• 此操作无法撤销
+
+确定要删除吗？"""
+        
+        keyboard = [
+            [InlineKeyboardButton("✅ 确认删除", callback_data=f"agent_del_confirm:{agent_bot_id}"),
+             InlineKeyboardButton("❌ 取消", callback_data=f"agent_view:{agent_bot_id}")],
+        ]
+        
+        try:
+            query.edit_message_text(
+                text=text,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                pass
+            else:
+                print(f"编辑消息失败: {e}")
+                context.bot.send_message(
+                    chat_id=query.from_user.id,
+                    text=text,
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+    
+    # ========== 代理机器人删除执行 ==========
+    elif query.data.startswith("agent_del_confirm:"):
+        agent_bot_id = query.data.split(":", 1)[1]
+        query.answer()
+        
+        if not multi_bot_system.is_master_admin(query.from_user.id):
+            try:
+                query.edit_message_text("❌ 权限错误")
+            except:
+                context.bot.send_message(chat_id=query.from_user.id, text="❌ 权限错误")
+            return
+        
+        # 执行删除
+        success, message = multi_bot_system.delete_agent_bot(agent_bot_id)
+        
+        if success:
+            text = f"✅ <b>删除成功</b>\n\n{message}"
+        else:
+            text = f"❌ <b>删除失败</b>\n\n{message}"
+        
+        keyboard = [[InlineKeyboardButton("🔙 返回列表", callback_data="agent_bot_list")]]
+        
+        try:
+            query.edit_message_text(
+                text=text,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                pass
+            else:
+                print(f"编辑消息失败: {e}")
+                context.bot.send_message(
+                    chat_id=query.from_user.id,
+                    text=text,
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+
+    # ========== 代理机器人详情（旧版兼容） ==========
     elif query.data.startswith("agent_bot_detail_agent_"):
         agent_id = query.data.replace("agent_bot_detail_agent_", "")
         query.answer()
@@ -11969,7 +12158,7 @@ def agent_bot_list(update: Update, context: CallbackContext):
                 keyboard.append([
                     InlineKeyboardButton(
                         f"📊 {bot['agent_name'][:10]}",
-                        callback_data=f"agent_bot_detail_{bot['agent_bot_id']}"
+                        callback_data=f"agent_view:{bot['agent_bot_id']}"
                     )
                 ])
             
@@ -11991,11 +12180,189 @@ def agent_bot_list(update: Update, context: CallbackContext):
         text = "❌ 获取代理机器人列表失败"
         keyboard = [[InlineKeyboardButton("🔙 返回", callback_data='agent_bot_management')]]
     
-    query.edit_message_text(
-        text=text,
-        parse_mode='HTML',
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        query.edit_message_text(
+            text=text,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        if "not modified" in str(e).lower():
+            pass
+        else:
+            print(f"编辑消息失败: {e}")
+            context.bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+def show_agent_info_detail(update: Update, context: CallbackContext, agent_bot_id: str):
+    """显示代理机器人详细信息"""
+    query = update.callback_query
+    
+    try:
+        # 获取代理机器人信息
+        agent_info = get_agent_bot_info(agent_bot_id)
+        if not agent_info:
+            text = "❌ 代理机器人不存在"
+            keyboard = [[InlineKeyboardButton("🔙 返回列表", callback_data="agent_bot_list")]]
+        else:
+            # 获取统计数据
+            stats = get_agent_stats(agent_bot_id)
+            if not stats:
+                stats = {
+                    'total_sales': 0.0,
+                    'total_commission': 0.0,
+                    'available_balance': 0.0,
+                    'total_users': 0,
+                    'order_count': 0
+                }
+            
+            status_icon = "🟢" if agent_info['status'] == 'active' else "🔴"
+            status_text = "运行中" if agent_info['status'] == 'active' else "已停用"
+            
+            text = f"""🤖 <b>{agent_info['agent_name']} 详情</b>
+
+📝 <b>基本信息</b>
+• 代理名称：{agent_info['agent_name']}
+• 机器人：@{agent_info.get('agent_username', 'unknown')}
+• 佣金率：{agent_info['commission_rate']}%
+• 状态：{status_icon} {status_text}
+• 代理ID：<code>{agent_bot_id}</code>
+
+💰 <b>财务数据</b>
+• 总销售额：{stats['total_sales']:.2f} USDT
+• 总佣金：{stats['total_commission']:.2f} USDT
+• 可用余额：{stats['available_balance']:.2f} USDT
+
+📊 <b>运营数据</b>
+• 用户数量：{stats['total_users']} 人
+• 订单数量：{stats['order_count']} 笔
+
+📅 <b>创建时间</b>
+{agent_info['creation_time']}"""
+            
+            keyboard = [
+                [InlineKeyboardButton("📊 查看报表", callback_data=f"agent_report:{agent_bot_id}"),
+                 InlineKeyboardButton("🗑 删除", callback_data=f"agent_delete:{agent_bot_id}")],
+                [InlineKeyboardButton("🔙 返回列表", callback_data="agent_bot_list")]
+            ]
+        
+        try:
+            query.edit_message_text(
+                text=text,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                pass
+            else:
+                print(f"编辑消息失败: {e}")
+                context.bot.send_message(
+                    chat_id=query.from_user.id,
+                    text=text,
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+    except Exception as e:
+        print(f"❌ 显示代理详情失败: {e}")
+        import traceback
+        traceback.print_exc()
+        text = "❌ 获取代理详情失败"
+        keyboard = [[InlineKeyboardButton("🔙 返回列表", callback_data="agent_bot_list")]]
+        try:
+            query.edit_message_text(text=text, reply_markup=InlineKeyboardMarkup(keyboard))
+        except:
+            context.bot.send_message(
+                chat_id=query.from_user.id,
+                text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+def show_agent_report_detail(update: Update, context: CallbackContext, agent_bot_id: str):
+    """显示代理机器人报表"""
+    query = update.callback_query
+    
+    try:
+        # 获取代理机器人信息
+        agent_info = get_agent_bot_info(agent_bot_id)
+        if not agent_info:
+            text = "❌ 代理机器人不存在"
+            keyboard = [[InlineKeyboardButton("🔙 返回列表", callback_data="agent_bot_list")]]
+        else:
+            # 获取统计数据
+            stats = get_agent_stats(agent_bot_id)
+            if not stats:
+                stats = {
+                    'total_sales': 0.0,
+                    'total_commission': 0.0,
+                    'available_balance': 0.0,
+                    'total_users': 0,
+                    'order_count': 0
+                }
+            
+            from datetime import datetime
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            text = f"""📊 <b>{agent_info['agent_name']} 报表</b>
+📅 {current_time}
+
+💰 <b>财务报表</b>
+• 总销售额：{stats['total_sales']:.2f} USDT
+• 总佣金收入：{stats['total_commission']:.2f} USDT
+• 可用余额：{stats['available_balance']:.2f} USDT
+• 已提现金额：{agent_info.get('withdrawn_amount', 0):.2f} USDT
+
+📈 <b>业务报表</b>
+• 总订单数：{stats['order_count']} 笔
+• 注册用户：{stats['total_users']} 人
+• 平均订单额：{(stats['total_sales'] / stats['order_count']) if stats['order_count'] > 0 else 0:.2f} USDT
+
+⚙️ <b>代理设置</b>
+• 佣金率：{agent_info['commission_rate']}%
+• 状态：{'🟢 运行中' if agent_info['status'] == 'active' else '🔴 已停用'}
+• 创建时间：{agent_info['creation_time']}"""
+            
+            keyboard = [
+                [InlineKeyboardButton("🔙 返回详情", callback_data=f"agent_view:{agent_bot_id}"),
+                 InlineKeyboardButton("📋 返回列表", callback_data="agent_bot_list")]
+            ]
+        
+        try:
+            query.edit_message_text(
+                text=text,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                pass
+            else:
+                print(f"编辑消息失败: {e}")
+                context.bot.send_message(
+                    chat_id=query.from_user.id,
+                    text=text,
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+    except Exception as e:
+        print(f"❌ 显示代理报表失败: {e}")
+        import traceback
+        traceback.print_exc()
+        text = "❌ 获取代理报表失败"
+        keyboard = [[InlineKeyboardButton("🔙 返回列表", callback_data="agent_bot_list")]]
+        try:
+            query.edit_message_text(text=text, reply_markup=InlineKeyboardMarkup(keyboard))
+        except:
+            context.bot.send_message(
+                chat_id=query.from_user.id,
+                text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
 def check_agent_token(update: Update, context: CallbackContext):
     """检查代理Token - 临时调试函数"""
     user_id = update.effective_user.id

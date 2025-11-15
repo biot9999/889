@@ -764,6 +764,62 @@ def generate_agent_bot_id():
     random_part = str(uuid.uuid4()).replace('-', '')[:16]
     return f"agent_{timestamp}{random_part}"
 
+def get_agent_stats(agent_bot_id):
+    """获取代理机器人的统计数据"""
+    try:
+        # 获取代理机器人基本信息
+        agent_info = agent_bots.find_one({'agent_bot_id': agent_bot_id})
+        if not agent_info:
+            return None
+        
+        # 计算总销售额和总佣金（从agent_orders，排除取消订单）
+        pipeline = [
+            {
+                '$match': {
+                    'agent_bot_id': agent_bot_id,
+                    'status': {'$ne': 'canceled'}
+                }
+            },
+            {
+                '$group': {
+                    '_id': None,
+                    'total_sales': {'$sum': '$agent_price'},
+                    'total_commission': {'$sum': '$commission'},
+                    'order_count': {'$sum': 1}
+                }
+            }
+        ]
+        
+        result = list(agent_orders.aggregate(pipeline))
+        
+        if result:
+            stats = result[0]
+            total_sales = float(stats.get('total_sales', 0))
+            total_commission = float(stats.get('total_commission', 0))
+            order_count = stats.get('order_count', 0)
+        else:
+            total_sales = 0.0
+            total_commission = 0.0
+            order_count = 0
+        
+        # 获取余额（从agent_bots）
+        available_balance = float(agent_info.get('available_balance', 0))
+        
+        # 获取用户数量
+        agent_users = get_agent_bot_user_collection(agent_bot_id)
+        total_users = agent_users.count_documents({})
+        
+        return {
+            'total_sales': total_sales,
+            'total_commission': total_commission,
+            'available_balance': available_balance,
+            'total_users': total_users,
+            'order_count': order_count
+        }
+    except Exception as e:
+        logging.error(f"❌ 获取代理统计数据失败：{e}")
+        return None
+
 # ================================ 初始化多机器人分销系统 ================================
 
 def init_multi_bot_distribution_system():
