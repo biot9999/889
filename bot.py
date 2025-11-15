@@ -10511,7 +10511,9 @@ def handle_all_callbacks(update: Update, context: CallbackContext):
     
     # ========== 代理机器人报表 ==========
     elif query.data.startswith("agent_report:"):
-        agent_bot_id = query.data.split(":", 1)[1]
+        parts = query.data.split(":")
+        agent_bot_id = parts[1]
+        period = parts[2] if len(parts) > 2 else '30d'  # 默认30天
         query.answer()
         
         if not multi_bot_system.is_master_admin(query.from_user.id):
@@ -10521,7 +10523,7 @@ def handle_all_callbacks(update: Update, context: CallbackContext):
                 context.bot.send_message(chat_id=query.from_user.id, text="❌ 权限错误")
             return
         
-        show_agent_report_detail(update, context, agent_bot_id)
+        show_agent_report_detail(update, context, agent_bot_id, period)
     
     # ========== 代理机器人删除确认 ==========
     elif query.data.startswith("agent_delete:"):
@@ -12361,8 +12363,13 @@ def show_agent_info_detail(update: Update, context: CallbackContext, agent_bot_i
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
 
-def show_agent_report_detail(update: Update, context: CallbackContext, agent_bot_id: str):
-    """显示代理机器人报表"""
+def show_agent_report_detail(update: Update, context: CallbackContext, agent_bot_id: str, period: str = '30d'):
+    """显示代理机器人报表
+    
+    Args:
+        agent_bot_id: 代理机器人ID
+        period: 时间周期 '7d'|'17d'|'30d'|'90d'|'all'
+    """
     query = update.callback_query
     
     try:
@@ -12372,8 +12379,8 @@ def show_agent_report_detail(update: Update, context: CallbackContext, agent_bot
             text = "❌ 代理机器人不存在"
             keyboard = [[InlineKeyboardButton("🔙 返回列表", callback_data="agent_bot_list")]]
         else:
-            # 获取统计数据
-            stats = get_agent_stats(agent_bot_id)
+            # 获取统计数据（带时间周期）
+            stats = get_agent_stats(agent_bot_id, period)
             if not stats:
                 stats = {
                     'total_sales': 0.0,
@@ -12383,37 +12390,65 @@ def show_agent_report_detail(update: Update, context: CallbackContext, agent_bot
                     'total_users': 0,
                     'order_count': 0,
                     'pending_withdrawal_count': 0,
-                    'pending_withdrawal_amount': 0.0
+                    'pending_withdrawal_amount': 0.0,
+                    'avg_order': 0.0,
+                    'profit_rate': 0.0
                 }
             
             from datetime import datetime
             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # 时间周期描述
+            period_name_map = {
+                '7d': '7天',
+                '17d': '17天',
+                '30d': '30天',
+                '90d': '90天',
+                'all': '全部'
+            }
+            period_name = period_name_map.get(period, '30天')
             
             # 构建提现信息
             withdrawal_info = ""
             if stats['pending_withdrawal_count'] > 0:
                 withdrawal_info = f"\n• 待处理提现：{stats['pending_withdrawal_count']} 笔 ({stats['pending_withdrawal_amount']:.2f} USDT)"
             
-            text = f"""📊 <b>{agent_info['agent_name']} 报表</b>
+            text = f"""📊 <b>{agent_info['agent_name']} 报表（{period_name}）</b>
 📅 {current_time}
 
 💰 <b>财务报表</b>
-• 总销售额：{stats['total_sales']:.2f} USDT
-• 总佣金收入：{stats['total_commission']:.2f} USDT
+• 销售额：{stats['total_sales']:.2f} USDT
+• 佣金收入：{stats['total_commission']:.2f} USDT
 • 已提现金额：{stats['withdrawn_amount']:.2f} USDT
 • 可用余额：{stats['available_balance']:.2f} USDT{withdrawal_info}
 
 📈 <b>业务报表</b>
-• 总订单数：{stats['order_count']} 笔
+• 订单数：{stats['order_count']} 笔
 • 注册用户：{stats['total_users']} 人
-• 平均订单额：{(stats['total_sales'] / stats['order_count']) if stats['order_count'] > 0 else 0:.2f} USDT
+• 平均订单额：{stats.get('avg_order', 0):.2f} USDT
+• 利润率：{stats.get('profit_rate', 0):.1f}%
 
 ⚙️ <b>代理设置</b>
 • 佣金率：{agent_info['commission_rate']}%
 • 状态：{'🟢 运行中' if agent_info['status'] == 'active' else '🔴 已停用'}
 • 创建时间：{agent_info['creation_time']}"""
             
+            # 构建时间周期选择按钮
+            period_buttons = [
+                InlineKeyboardButton(
+                    f"{'📅 ' if p == period else ''}7天" if p == '7d' else 
+                    f"{'📅 ' if p == period else ''}17天" if p == '17d' else 
+                    f"{'📅 ' if p == period else ''}30天" if p == '30d' else 
+                    f"{'📅 ' if p == period else ''}90天" if p == '90d' else 
+                    f"{'📅 ' if p == period else ''}全部",
+                    callback_data=f"agent_report:{agent_bot_id}:{p}"
+                )
+                for p in ['7d', '17d', '30d', '90d', 'all']
+            ]
+            
             keyboard = [
+                period_buttons[:3],  # 7天, 17天, 30天
+                period_buttons[3:],  # 90天, 全部
                 [InlineKeyboardButton("🔙 返回详情", callback_data=f"agent_view:{agent_bot_id}"),
                  InlineKeyboardButton("📋 返回列表", callback_data="agent_bot_list")]
             ]
