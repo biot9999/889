@@ -655,19 +655,32 @@ def create_agent_withdrawal_data(withdrawal_id, agent_bot_id, amount, payment_me
 
 # ================================ 代理机器人独立用户系统函数 ================================
 
+def _get_agent_id_suffix(agent_bot_id):
+    """
+    从完整的agent_bot_id中提取ID后缀
+    例如: agent_62448807124351dfe5cc48d4 -> 62448807124351dfe5cc48d4
+    如果没有agent_前缀，直接返回原值
+    """
+    if agent_bot_id.startswith('agent_'):
+        return agent_bot_id[6:]  # 去掉 'agent_' 前缀
+    return agent_bot_id
+
 def get_agent_bot_user_collection(agent_bot_id):
     """获取代理机器人的独立用户集合"""
-    collection_name = f"agent_{agent_bot_id}_users"
+    id_suffix = _get_agent_id_suffix(agent_bot_id)
+    collection_name = f"agent_users_{id_suffix}"
     return db_manager.bot_db[collection_name]
 
 def get_agent_bot_topup_collection(agent_bot_id):
     """获取代理机器人的独立充值记录集合"""
-    collection_name = f"agent_{agent_bot_id}_topup"
+    id_suffix = _get_agent_id_suffix(agent_bot_id)
+    collection_name = f"agent_topup_{id_suffix}"
     return db_manager.bot_db[collection_name]
 
 def get_agent_bot_gmjlu_collection(agent_bot_id):
     """获取代理机器人的独立购买记录集合"""
-    collection_name = f"agent_gmjlu_{agent_bot_id}"
+    id_suffix = _get_agent_id_suffix(agent_bot_id)
+    collection_name = f"agent_gmjlu_{id_suffix}"
     return db_manager.bot_db[collection_name]
 
 def create_agent_user_data(agent_bot_id, user_id, username, fullname, creation_time):
@@ -784,8 +797,12 @@ def get_agent_stats(agent_bot_id, period='all'):
             logging.warning(f"❌ Agent not found: {agent_bot_id}")
             return None
         
+        # 提取ID后缀用于集合名称
+        id_suffix = _get_agent_id_suffix(agent_bot_id)
+        logging.info(f"✅ Found agent: {agent_info.get('agent_name')}, ID suffix: {id_suffix}")
+        
         commission_rate = agent_info.get('commission_rate', 0) / 100
-        logging.info(f"✅ Found agent: {agent_info.get('agent_name')}, commission_rate: {commission_rate}")
+        logging.info(f"📊 Commission rate: {commission_rate}")
         
         # 计算时间范围
         start_time = None
@@ -872,15 +889,15 @@ def get_agent_stats(agent_bot_id, period='all'):
                 
                 logging.info(f"📊 Data source: agent_orders - Sales: {total_sales:.2f}, Commission: {total_commission:.2f}, Orders: {order_count}")
             else:
-                # agent_orders 无数据，回退到 agent_gmjlu_{id}
-                logging.warning(f"⚠️ No data in agent_orders, falling back to agent_gmjlu_{agent_bot_id}")
-                data_source = f"agent_gmjlu_{agent_bot_id}"
+                # agent_orders 无数据，回退到 agent_gmjlu_{id_suffix}
+                logging.warning(f"⚠️ No data in agent_orders, falling back to agent_gmjlu_{id_suffix}")
+                data_source = f"agent_gmjlu_{id_suffix}"
                 raise Exception("Fallback to gmjlu")
                 
         except Exception as e:
-            # ========== 回退统计源：agent_gmjlu_{id} 集合 ==========
-            logging.info(f"⚠️ Falling back to {data_source}: {str(e)}")
-            data_source = f"agent_gmjlu_{agent_bot_id}"
+            # ========== 回退统计源：agent_gmjlu_{id_suffix} 集合 ==========
+            logging.info(f"⚠️ Falling back to gmjlu collection: {str(e)}")
+            data_source = f"agent_gmjlu_{id_suffix}"
             
             agent_gmjlu = get_agent_bot_gmjlu_collection(agent_bot_id)
             
