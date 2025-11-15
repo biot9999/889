@@ -246,10 +246,11 @@ class AgentBotCore:
         """
         检测商品是否为协议号类商品（HQ克隆模式使用）
         
-        检测规则：
-        1. leixing 为 None/空/在别名列表中/等于统一分类名 -> True
-        2. projectname 包含关键词（协议、协议号、年老号、老号等）-> True
-        3. projectname 包含年份范围模式（如 [1-8] 或 [3-8 年]）-> True
+        检测规则（按优先级）：
+        1. leixing 在别名列表中或等于统一分类名 -> True（已标记为协议号）
+        2. projectname 包含关键词（协议、协议号、年老号、老号等）-> True（检测误标记）
+        3. projectname 包含年份范围模式（如 [1-8] 或 [3-8 年]）-> True（检测误标记）
+        4. leixing 为 None/空 -> True（未分类商品归入协议号）
         
         Args:
             name: 商品名称 (projectname)
@@ -258,25 +259,25 @@ class AgentBotCore:
         Returns:
             True 如果商品应归入协议号分类，否则 False
         """
-        # 规则1: leixing 为 None/空/别名/统一分类
-        if leixing is None or leixing == '' or leixing in self.config.AGENT_PROTOCOL_CATEGORY_ALIASES:
+        # 规则1: leixing 在别名列表中或等于统一分类名（已经是协议号类）
+        if leixing in self.config.AGENT_PROTOCOL_CATEGORY_ALIASES:
             return True
         if leixing == self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
             return True
         
-        # 如果没有商品名称，无法进一步检测
-        if not name:
-            return False
-        
-        # 规则2: 检查商品名称是否包含协议号关键词
-        for keyword in self.config.AGENT_PROTOCOL_CATEGORY_KEYWORDS:
-            if keyword and keyword in name:
+        # 规则2: 检查商品名称是否包含协议号关键词（检测误标记的协议号商品）
+        if name:
+            for keyword in self.config.AGENT_PROTOCOL_CATEGORY_KEYWORDS:
+                if keyword and keyword in name:
+                    return True
+            
+            # 规则3: 检查年份范围模式（检测误标记的协议号商品）
+            year_range_pattern = r'\[\s*\d+\s*-\s*\d+\s*(?:年)?\s*\]'
+            if re.search(year_range_pattern, name):
                 return True
         
-        # 规则3: 检查年份范围模式，例如 "[1-8]" 或 "[3-8 年]"
-        # 模式: 方括号内包含 数字-数字 的形式
-        year_range_pattern = r'\[\s*\d+\s*-\s*\d+\s*(?:年)?\s*\]'
-        if re.search(year_range_pattern, name):
+        # 规则4: leixing 为 None/空（未分类商品默认归入协议号）
+        if leixing is None or leixing == '':
             return True
         
         return False
