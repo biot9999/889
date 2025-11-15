@@ -254,6 +254,10 @@ if not logging.getLogger('').handlers:
 
 logging.info("✅ 日志系统初始化完成")
 
+# ✅ 全局状态管理字典
+WAITING_TXHASH = {}  # 用于跟踪等待输入交易哈希的用户
+WAITING_USER_TXID = {}  # 用于跟踪用户提现申请
+
 # ✅ 管理员验证辅助函数
 def is_admin(user_id: int) -> bool:
     """检查用户是否为管理员"""
