@@ -667,7 +667,7 @@ def get_agent_bot_topup_collection(agent_bot_id):
 
 def get_agent_bot_gmjlu_collection(agent_bot_id):
     """获取代理机器人的独立购买记录集合"""
-    collection_name = f"agent_{agent_bot_id}_gmjlu"
+    collection_name = f"agent_gmjlu_{agent_bot_id}"
     return db_manager.bot_db[collection_name]
 
 def create_agent_user_data(agent_bot_id, user_id, username, fullname, creation_time):
@@ -765,7 +765,7 @@ def generate_agent_bot_id():
     return f"agent_{timestamp}{random_part}"
 
 def get_agent_stats(agent_bot_id, period='all'):
-    """获取代理机器人的统计数据（基于 agent_orders 集合，兼容 agent_{id}_gmjlu 回退）
+    """获取代理机器人的统计数据（基于 agent_orders 集合，兼容 agent_gmjlu_{id} 回退）
     
     Args:
         agent_bot_id: 代理机器人ID
@@ -872,15 +872,15 @@ def get_agent_stats(agent_bot_id, period='all'):
                 
                 logging.info(f"📊 Data source: agent_orders - Sales: {total_sales:.2f}, Commission: {total_commission:.2f}, Orders: {order_count}")
             else:
-                # agent_orders 无数据，回退到 agent_{id}_gmjlu
-                logging.warning(f"⚠️ No data in agent_orders, falling back to agent_{agent_bot_id}_gmjlu")
-                data_source = f"agent_{agent_bot_id}_gmjlu"
+                # agent_orders 无数据，回退到 agent_gmjlu_{id}
+                logging.warning(f"⚠️ No data in agent_orders, falling back to agent_gmjlu_{agent_bot_id}")
+                data_source = f"agent_gmjlu_{agent_bot_id}"
                 raise Exception("Fallback to gmjlu")
                 
         except Exception as e:
-            # ========== 回退统计源：agent_{id}_gmjlu 集合 ==========
+            # ========== 回退统计源：agent_gmjlu_{id} 集合 ==========
             logging.info(f"⚠️ Falling back to {data_source}: {str(e)}")
-            data_source = f"agent_{agent_bot_id}_gmjlu"
+            data_source = f"agent_gmjlu_{agent_bot_id}"
             
             agent_gmjlu = get_agent_bot_gmjlu_collection(agent_bot_id)
             

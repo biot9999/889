@@ -203,7 +203,7 @@ class MultiBotDistributionSystem:
                 gmjlu_collection = get_agent_bot_gmjlu_collection(agent_bot_id)
                 if gmjlu_collection is not None:
                     gmjlu_collection.drop()
-                    print(f"✅ 删除代理购买记录集合: agent_{agent_bot_id}_gmjlu")
+                    print(f"✅ 删除代理购买记录集合: agent_gmjlu_{agent_bot_id}")
             except Exception as e:
                 print(f"⚠️ 删除购买记录集合失败: {e}")
             
@@ -12829,7 +12829,7 @@ def manage_individual_user(update: Update, context: CallbackContext):
         
         # 获取用户购买记录统计
         try:
-            agent_gmjlu_collection = bot_db[f"agent_{agent_bot_id}_gmjlu"]
+            agent_gmjlu_collection = bot_db[f"agent_gmjlu_{agent_bot_id}"]
             total_orders = agent_gmjlu_collection.count_documents({'user_id': target_user_id})
         except:
             total_orders = 0
