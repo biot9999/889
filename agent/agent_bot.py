@@ -2102,12 +2102,49 @@ class AgentBotHandlers:
 
     def start_command(self, update: Update, context: CallbackContext):
         user = update.effective_user
+        
+        # ✅ 解析深度链接参数（payload）
+        payload = None
+        if context.args and len(context.args) > 0:
+            payload = context.args[0]
+            logger.info(f"📥 收到深度链接启动: payload={payload}, user_id={user.id}")
+        
         # ✅ 启动时触发一次商品同步（所有用户，确保商品列表是最新的）
         synced = self.core.auto_sync_new_products()
         if synced > 0:
             logger.info(f"✅ 启动时同步了 {synced} 个新商品")
         
         if self.core.register_user(user.id, user.username or "", user.first_name or ""):
+            # ✅ 处理 restock 深度链接 - 直接跳转到商品中心
+            if payload == "restock":
+                text = f"""🎉 欢迎查看最新补货商品！
+
+👤 用户: {self.H(user.first_name or user.username or '未设置')}
+
+请点击下方按钮查看商品分类："""
+                kb = [
+                    [InlineKeyboardButton("🛍️ 查看商品分类", callback_data="products")]
+                ]
+                update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+                logger.info(f"✅ 已为用户 {user.id} 显示补货商品入口")
+                return
+            
+            # ✅ 处理 product_<nowuid> 深度链接（预留）
+            if payload and payload.startswith("product_"):
+                nowuid = payload.replace("product_", "")
+                text = f"""🎉 欢迎使用 {self.H(self.core.config.AGENT_NAME)}！
+
+正在为您打开商品详情...
+
+👤 用户: {self.H(user.first_name or user.username or '未设置')}"""
+                kb = [
+                    [InlineKeyboardButton("🛍️ 查看商品详情", callback_data=f"product_{nowuid}")]
+                ]
+                update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+                logger.info(f"✅ 已为用户 {user.id} 显示商品 {nowuid} 详情入口")
+                return
+            
+            # ✅ 默认启动消息
             text = f"""🎉 欢迎使用 {self.H(self.core.config.AGENT_NAME)}！
 
 👤 用户信息
@@ -3502,9 +3539,17 @@ class AgentBotHandlers:
                     bot_username = bot_info.username
                     
                     # 构建重写后的按钮
-                    keyboard = [[
-                        InlineKeyboardButton("🛒 购买商品", url=f"https://t.me/{bot_username}")
-                    ]]
+                    # ✅ 优先使用深度链接，如果没有用户名则使用callback按钮
+                    if bot_username:
+                        keyboard = [[
+                            InlineKeyboardButton("🛒 购买商品", url=f"https://t.me/{bot_username}?start=restock")
+                        ]]
+                        logger.info(f"🔗 使用深度链接按钮: https://t.me/{bot_username}?start=restock")
+                    else:
+                        keyboard = [[
+                            InlineKeyboardButton("🛒 购买商品", callback_data="products")
+                        ]]
+                        logger.warning("⚠️ 未获取到机器人用户名，使用callback按钮作为回退方案")
                     reply_markup = InlineKeyboardMarkup(keyboard)
                     
                     # 根据消息类型发送带有重写按钮的新消息

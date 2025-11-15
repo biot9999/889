@@ -31,11 +31,15 @@ When headquarters posts a restock notice in the HQ notify channel/group, the age
 ### 4. 可选按钮重写 / Optional Button Rewriting
 - ✅ 可选功能：重写按钮指向代理机器人（默认关闭，提高安全性和简洁性）
 - ✅ 如果启用，会将HQ消息中的按钮重写为指向代理机器人的按钮：
-  - "🛒 购买商品" (url: https://t.me/{agent_bot_username})
+  - "🛒 购买商品" (url: https://t.me/{agent_bot_username}?start=restock)
+  - 深度链接会直接打开商品中心
+  - 如果机器人用户名不可用，会回退到 callback 按钮 (callback_data=products)
 - ✅ 当启用按钮重写时，不使用 copy_message，而是发送新消息并附带重写的按钮
 - ✅ Optional: rewrite buttons to point to agent bot (off by default for safety and simplicity)
 - ✅ If enabled, rewrites HQ message buttons to point to agent bot:
-  - "🛒 购买商品" (url: https://t.me/{agent_bot_username})
+  - "🛒 购买商品" (url: https://t.me/{agent_bot_username}?start=restock)
+  - Deep link directly opens the product center
+  - Falls back to callback button (callback_data=products) if bot username unavailable
 - ✅ When button rewriting is enabled, does NOT use copy_message; sends new message with rewritten buttons
 
 ## 环境变量配置 / Environment Variables
@@ -301,12 +305,40 @@ When `HQ_RESTOCK_REWRITE_BUTTONS=0` (default):
 当 `HQ_RESTOCK_REWRITE_BUTTONS=1` 时：
 - 直接发送新消息，不使用 copy_message
 - 根据消息类型（图片/视频/文档/文本）发送带重写按钮的新消息
-- 按钮内容：`"🛒 购买商品"` 指向 `https://t.me/{agent_bot_username}`
+- 按钮内容：`"🛒 购买商品"` 指向 `https://t.me/{agent_bot_username}?start=restock`
+- 深度链接参数 `start=restock` 会触发 /start 命令并直接打开商品中心
+- 如果无法获取机器人用户名，回退到 callback 按钮 (callback_data=products)
 
 When `HQ_RESTOCK_REWRITE_BUTTONS=1`:
 - Sends new message directly, does NOT use copy_message
 - Sends new message with rewritten buttons based on message type (photo/video/document/text)
-- Button content: `"🛒 购买商品"` pointing to `https://t.me/{agent_bot_username}`
+- Button content: `"🛒 购买商品"` pointing to `https://t.me/{agent_bot_username}?start=restock`
+- Deep link parameter `start=restock` triggers /start command and directly opens product center
+- Falls back to callback button (callback_data=products) if bot username unavailable
+
+### 深度链接支持 / Deep Link Support
+
+代理机器人的 /start 命令支持以下深度链接：
+
+**`/start restock`**
+- 用于补货通知按钮
+- 显示补货欢迎消息
+- 提供直接进入商品中心的按钮
+
+**`/start product_<nowuid>`**（预留）
+- 用于特定商品的直接链接
+- 直接打开商品详情页
+
+The agent bot's /start command supports the following deep links:
+
+**`/start restock`**
+- Used for restock notification buttons
+- Shows restock welcome message
+- Provides button to directly enter product center
+
+**`/start product_<nowuid>`** (reserved)
+- For direct links to specific products
+- Opens product detail page directly
 
 ## 常见问题 / FAQ
 
