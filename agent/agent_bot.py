@@ -86,6 +86,9 @@ AGENT_NOTIFY_CHAT_ID = os.getenv("AGENT_NOTIFY_CHAT_ID")
 # ✅ 总部通知群（代理用来监听总部补货等通知）
 HEADQUARTERS_NOTIFY_CHAT_ID = os.getenv("HQ_NOTIFY_CHAT_ID") or os.getenv("HEADQUARTERS_NOTIFY_CHAT_ID")
 
+# ✅ 代理补货通知群（补货通知转发到这里，如未设置则回退到AGENT_NOTIFY_CHAT_ID）
+AGENT_RESTOCK_NOTIFY_CHAT_ID = os.getenv("AGENT_RESTOCK_NOTIFY_CHAT_ID")
+
 # ✅ 统一协议号分类配置
 AGENT_PROTOCOL_CATEGORY_UNIFIED = os.getenv("AGENT_PROTOCOL_CATEGORY_UNIFIED", "🔥二次协议号（session+json）")
 AGENT_PROTOCOL_CATEGORY_ALIASES = os.getenv("AGENT_PROTOCOL_CATEGORY_ALIASES", "协议号,未分类,,🔥二手TG协议号（session+json）,二手TG协议号（session+json）,二次协议号（session+json）")
@@ -140,6 +143,18 @@ class AgentBotConfig:
         self.HEADQUARTERS_NOTIFY_CHAT_ID = HEADQUARTERS_NOTIFY_CHAT_ID
         if not self.HEADQUARTERS_NOTIFY_CHAT_ID:
             logger.warning("⚠️ 未设置 HEADQUARTERS_NOTIFY_CHAT_ID")
+        
+        # ✅ 代理补货通知群（回退到AGENT_NOTIFY_CHAT_ID）
+        self.AGENT_RESTOCK_NOTIFY_CHAT_ID = AGENT_RESTOCK_NOTIFY_CHAT_ID or self.AGENT_NOTIFY_CHAT_ID
+        if not self.AGENT_RESTOCK_NOTIFY_CHAT_ID:
+            logger.warning("⚠️ 未设置 AGENT_RESTOCK_NOTIFY_CHAT_ID 或 AGENT_NOTIFY_CHAT_ID，补货通知可能无法发送")
+        
+        # ✅ 补货通知关键词配置（支持中英文）
+        default_keywords = "补货通知,库存更新,新品上架,restock,new stock,inventory update"
+        self.RESTOCK_KEYWORDS = [k.strip() for k in os.getenv("RESTOCK_KEYWORDS", default_keywords).split(",") if k.strip()]
+        
+        # ✅ 补货通知按钮重写开关（默认关闭，提高安全性）
+        self.RESTOCK_REWRITE_BUTTONS = os.getenv("RESTOCK_REWRITE_BUTTONS", "0") in ("1", "true", "True")
 
         # 取消订单后是否删除原消息 (默认删除)
         self.RECHARGE_DELETE_ON_CANCEL = os.getenv("RECHARGE_DELETE_ON_CANCEL", "1") in ("1", "true", "True")
@@ -3397,6 +3412,164 @@ class AgentBotHandlers:
             if uid in self.user_states:
                 self.user_states.pop(uid, None)
 
+    # ========== 补货通知镜像功能 ==========
+    def handle_headquarters_message(self, update: Update, context: CallbackContext):
+        """
+        监听总部通知群的消息，自动转发补货通知到代理补货通知群
+        
+        功能：
+        1. 监听 HEADQUARTERS_NOTIFY_CHAT_ID 的消息
+        2. 匹配补货关键词
+        3. 使用 copy_message 转发消息（保留格式、媒体、caption）
+        4. 如果 copy_message 失败，回退到 send_message
+        5. 防止循环：只处理 chat.id == HEADQUARTERS_NOTIFY_CHAT_ID 的消息
+        6. 可选：重写按钮指向代理机器人（默认关闭）
+        """
+        try:
+            # 防止循环：只处理来自总部通知群的消息
+            if not update.message or not update.message.chat:
+                return
+            
+            chat_id = update.message.chat.id
+            
+            # 检查是否来自总部通知群
+            if not self.core.config.HEADQUARTERS_NOTIFY_CHAT_ID:
+                return
+            
+            # 将配置中的 chat_id 转换为整数进行比较
+            try:
+                hq_chat_id = int(self.core.config.HEADQUARTERS_NOTIFY_CHAT_ID)
+            except (ValueError, TypeError):
+                logger.warning(f"⚠️ HEADQUARTERS_NOTIFY_CHAT_ID 格式错误: {self.core.config.HEADQUARTERS_NOTIFY_CHAT_ID}")
+                return
+            
+            if chat_id != hq_chat_id:
+                return
+            
+            # 检查是否有补货通知目标群
+            if not self.core.config.AGENT_RESTOCK_NOTIFY_CHAT_ID:
+                return
+            
+            # 获取消息内容用于关键词匹配
+            message_text = update.message.text or update.message.caption or ""
+            
+            # 检查是否包含补货关键词
+            is_restock = False
+            matched_keyword = None
+            for keyword in self.core.config.RESTOCK_KEYWORDS:
+                if keyword and keyword.lower() in message_text.lower():
+                    is_restock = True
+                    matched_keyword = keyword
+                    break
+            
+            if not is_restock:
+                return
+            
+            logger.info(f"🔔 检测到补货通知（关键词: {matched_keyword}）: {message_text[:50]}...")
+            
+            # 尝试使用 copy_message 转发消息
+            target_chat_id = self.core.config.AGENT_RESTOCK_NOTIFY_CHAT_ID
+            
+            try:
+                # 优先使用 copy_message（保留原始格式）
+                result = context.bot.copy_message(
+                    chat_id=target_chat_id,
+                    from_chat_id=chat_id,
+                    message_id=update.message.message_id
+                )
+                
+                logger.info(f"✅ 补货通知已镜像到 {target_chat_id} (message_id: {result.message_id})")
+                
+                # 如果启用按钮重写，在原消息下方发送带有新按钮的消息
+                if self.core.config.RESTOCK_REWRITE_BUTTONS and update.message.reply_markup:
+                    self._send_rewritten_buttons(context, target_chat_id, result.message_id)
+                
+                return
+                
+            except Exception as copy_err:
+                logger.warning(f"⚠️ copy_message 失败（可能是权限问题）: {copy_err}")
+                logger.info("🔄 尝试使用 send_message 回退方案...")
+            
+            # 回退方案：使用 send_message
+            try:
+                # 根据消息类型选择不同的发送方法
+                if update.message.photo:
+                    # 带图片的消息
+                    photo = update.message.photo[-1]  # 取最大尺寸
+                    context.bot.send_photo(
+                        chat_id=target_chat_id,
+                        photo=photo.file_id,
+                        caption=message_text or None,
+                        parse_mode=ParseMode.HTML if message_text else None
+                    )
+                elif update.message.video:
+                    # 带视频的消息
+                    context.bot.send_video(
+                        chat_id=target_chat_id,
+                        video=update.message.video.file_id,
+                        caption=message_text or None,
+                        parse_mode=ParseMode.HTML if message_text else None
+                    )
+                elif update.message.document:
+                    # 带文档的消息
+                    context.bot.send_document(
+                        chat_id=target_chat_id,
+                        document=update.message.document.file_id,
+                        caption=message_text or None,
+                        parse_mode=ParseMode.HTML if message_text else None
+                    )
+                else:
+                    # 纯文本消息
+                    if message_text:
+                        context.bot.send_message(
+                            chat_id=target_chat_id,
+                            text=message_text,
+                            parse_mode=ParseMode.HTML
+                        )
+                
+                logger.info(f"✅ 补货通知已通过回退方案发送到 {target_chat_id}")
+                
+            except Exception as send_err:
+                logger.error(f"❌ 回退方案也失败: {send_err}")
+        
+        except Exception as e:
+            logger.error(f"❌ 处理总部消息异常: {e}")
+            traceback.print_exc()
+    
+    def _send_rewritten_buttons(self, context: CallbackContext, chat_id: Union[int, str], reply_to_message_id: int):
+        """
+        发送重写后的按钮（指向代理机器人）
+        
+        Args:
+            context: CallbackContext
+            chat_id: 目标群组ID
+            reply_to_message_id: 回复的消息ID
+        """
+        try:
+            # 获取机器人用户名
+            bot_info = context.bot.get_me()
+            bot_username = bot_info.username
+            
+            # 构建新的按钮
+            keyboard = [
+                [
+                    InlineKeyboardButton("🛒 购买商品", callback_data="products"),
+                    InlineKeyboardButton("🤖 打开机器人", url=f"https://t.me/{bot_username}")
+                ]
+            ]
+            
+            context.bot.send_message(
+                chat_id=chat_id,
+                text="👆 点击上方查看补货详情",
+                reply_to_message_id=reply_to_message_id,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+            logger.info(f"✅ 补货通知按钮已重写")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ 重写按钮失败: {e}")
+
 
 class AgentBot:
     """主入口（自动轮询充值）"""
@@ -3488,7 +3661,20 @@ class AgentBot:
     def setup_handlers(self):
         self.dispatcher.add_handler(CommandHandler("start", self.handlers.start_command))
         self.dispatcher.add_handler(CallbackQueryHandler(self.handlers.button_callback))
-        self.dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, self.handlers.handle_text_message))
+        
+        # ✅ 私聊文本消息处理（用户输入处理）
+        self.dispatcher.add_handler(MessageHandler(
+            Filters.text & ~Filters.command & Filters.chat_type.private, 
+            self.handlers.handle_text_message
+        ))
+        
+        # ✅ 群组/频道消息处理（补货通知镜像）
+        self.dispatcher.add_handler(MessageHandler(
+            (Filters.text | Filters.photo | Filters.video | Filters.document) & 
+            (Filters.chat_type.groups | Filters.chat_type.channel),
+            self.handlers.handle_headquarters_message
+        ))
+        
         logger.info("✅ 处理器设置完成")
 
         # ✅ 充值自动校验任务
