@@ -321,24 +321,34 @@ When `HQ_RESTOCK_REWRITE_BUTTONS=1`:
 代理机器人的 /start 命令支持以下深度链接：
 
 **`/start restock`**
-- 用于补货通知按钮
-- 显示补货欢迎消息
-- 提供直接进入商品中心的按钮
+- 用于补货通知按钮（当无法提取商品ID时）
+- 直接显示商品分类列表，无需额外点击
+- 用户可立即选择商品分类进行购买
 
-**`/start product_<nowuid>`**（预留）
-- 用于特定商品的直接链接
-- 直接打开商品详情页
+**`/start product_<nowuid>`**
+- 用于补货通知按钮（从HQ消息中提取商品ID后）
+- 直接显示该商品的购买页面："✅您正在购买：xxx"
+- 用户可立即点击"购买"按钮下单
+- 商品ID提取方式：
+  - 从原始消息的按钮URL中提取（如 `start=buy_123456`）
+  - 从原始消息的按钮callback_data中提取（如 `gmsp 123456`）
+  - 从消息文本中使用正则表达式提取（如 `ID: 123456`）
 
 The agent bot's /start command supports the following deep links:
 
 **`/start restock`**
-- Used for restock notification buttons
-- Shows restock welcome message
-- Provides button to directly enter product center
+- Used for restock notification buttons (when product ID cannot be extracted)
+- Directly shows product category list without extra clicks
+- Users can immediately select product categories to purchase
 
-**`/start product_<nowuid>`** (reserved)
-- For direct links to specific products
-- Opens product detail page directly
+**`/start product_<nowuid>`**
+- Used for restock notification buttons (after extracting product ID from HQ message)
+- Directly shows the product purchase page: "✅您正在购买：xxx"
+- Users can immediately click "Buy" button to place order
+- Product ID extraction methods:
+  - From button URL in original message (e.g., `start=buy_123456`)
+  - From button callback_data in original message (e.g., `gmsp 123456`)
+  - From message text using regex (e.g., `ID: 123456`)
 
 ## 常见问题 / FAQ
 

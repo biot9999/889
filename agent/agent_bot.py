@@ -2115,34 +2115,103 @@ class AgentBotHandlers:
             logger.info(f"✅ 启动时同步了 {synced} 个新商品")
         
         if self.core.register_user(user.id, user.username or "", user.first_name or ""):
-            # ✅ 处理 restock 深度链接 - 直接跳转到商品中心
+            # ✅ 处理 restock 深度链接 - 直接显示商品分类（无欢迎消息）
             if payload == "restock":
-                text = f"""🎉 欢迎查看最新补货商品！
-
-👤 用户: {self.H(user.first_name or user.username or '未设置')}
-
-请点击下方按钮查看商品分类："""
-                kb = [
-                    [InlineKeyboardButton("🛍️ 查看商品分类", callback_data="products")]
-                ]
-                update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-                logger.info(f"✅ 已为用户 {user.id} 显示补货商品入口")
-                return
+                try:
+                    # 直接获取并显示商品分类
+                    categories = self.core.get_product_categories()
+                    
+                    if not categories:
+                        text = "❌ 暂无可用商品分类"
+                        kb = [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]]
+                    else:
+                        text = (
+                            "🛒 <b>商品分类 - 请选择所需商品：</b>\n\n"
+                            "「快送商品区」-「热选择所需商品」\n\n"
+                            "<b>❗️首次购买请先少量测试，避免纠纷</b>！\n\n"
+                            "<b>❗️长期未使用账户可能会出现问题，联系客服处理</b>。"
+                        )
+                        
+                        kb = []
+                        for cat in categories:
+                            button_text = f"{cat['_id']}  [{cat['stock']}个]"
+                            kb.append([InlineKeyboardButton(button_text, callback_data=f"category_{cat['_id']}")])
+                        
+                        kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main")])
+                    
+                    update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+                    logger.info(f"✅ 已为用户 {user.id} 直接显示商品分类")
+                    return
+                    
+                except Exception as e:
+                    logger.error(f"❌ 显示商品分类失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    text = "❌ 加载失败，请重试"
+                    kb = [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]]
+                    update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+                    return
             
-            # ✅ 处理 product_<nowuid> 深度链接（预留）
+            # ✅ 处理 product_<nowuid> 深度链接 - 直接显示商品购买页面
             if payload and payload.startswith("product_"):
                 nowuid = payload.replace("product_", "")
-                text = f"""🎉 欢迎使用 {self.H(self.core.config.AGENT_NAME)}！
-
-正在为您打开商品详情...
-
-👤 用户: {self.H(user.first_name or user.username or '未设置')}"""
-                kb = [
-                    [InlineKeyboardButton("🛍️ 查看商品详情", callback_data=f"product_{nowuid}")]
-                ]
-                update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-                logger.info(f"✅ 已为用户 {user.id} 显示商品 {nowuid} 详情入口")
-                return
+                try:
+                    # 直接显示商品详情（购买页面）
+                    prod = self.core.config.ejfl.find_one({'nowuid': nowuid})
+                    if not prod:
+                        text = "❌ 商品不存在"
+                        kb = [[InlineKeyboardButton("🔙 返回商品列表", callback_data="products")]]
+                    else:
+                        price = self.core.get_product_price(nowuid)
+                        stock = self.core.get_product_stock(nowuid)
+                        
+                        if price is None:
+                            text = "❌ 商品价格未设置"
+                            kb = [[InlineKeyboardButton("🔙 返回商品列表", callback_data="products")]]
+                        else:
+                            # ✅ 获取商品在代理价格表中的分类（统一后的分类）
+                            agent_price_info = self.core.config.agent_product_prices.find_one({
+                                'agent_bot_id': self.core.config.AGENT_BOT_ID,
+                                'original_nowuid': nowuid
+                            })
+                            # 使用统一后的分类，如果没有则回退到原leixing
+                            category = agent_price_info.get('category') if agent_price_info else (prod.get('leixing') or AGENT_PROTOCOL_CATEGORY_UNIFIED)
+                            
+                            # ✅ 完全按照总部的简洁格式
+                            product_name = self.H(prod.get('projectname', 'N/A'))
+                            product_status = "✅您正在购买："
+                            
+                            text = (
+                                f"<b>{product_status} {product_name}\n\n</b>"
+                                f"<b>💰 价格: {price:.2f} USDT\n\n</b>"
+                                f"<b>📦 库存: {stock}个\n\n</b>"
+                                f"<b>❗未使用过的本店商品的，请先少量购买测试，以免造成不必要的争执！谢谢合作！\n</b>"
+                            )
+                            
+                            kb = []
+                            if stock > 0:
+                                kb.append([InlineKeyboardButton("✅ 购买", callback_data=f"buy_{nowuid}"),
+                                          InlineKeyboardButton("❗使用说明", callback_data="help")])
+                            else:
+                                text += "\n\n⚠️ 商品缺货"
+                                kb.append([InlineKeyboardButton("使用说明", callback_data="help")])
+                            
+                            # ✅ 使用统一后的分类作为返回目标
+                            kb.append([InlineKeyboardButton("🏠 主菜单", callback_data="back_main"),
+                                      InlineKeyboardButton("返回", callback_data=f"category_{category}")])
+                    
+                    update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+                    logger.info(f"✅ 已为用户 {user.id} 直接显示商品 {nowuid} 购买页面")
+                    return
+                    
+                except Exception as e:
+                    logger.error(f"❌ 显示商品购买页面失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    text = "❌ 加载失败，请重试"
+                    kb = [[InlineKeyboardButton("🔙 返回商品列表", callback_data="products")]]
+                    update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+                    return
             
             # ✅ 默认启动消息
             text = f"""🎉 欢迎使用 {self.H(self.core.config.AGENT_NAME)}！
@@ -3538,17 +3607,74 @@ class AgentBotHandlers:
                     bot_info = context.bot.get_me()
                     bot_username = bot_info.username
                     
+                    # ✅ 尝试从原始消息中提取商品ID（nowuid）
+                    nowuid = None
+                    
+                    # 方法1：从原始消息的按钮中提取
+                    if message.reply_markup and hasattr(message.reply_markup, 'inline_keyboard'):
+                        for row in message.reply_markup.inline_keyboard:
+                            for button in row:
+                                if button.url and 'start=' in button.url:
+                                    # 从URL中提取参数，例如: https://t.me/bot?start=buy_123456
+                                    try:
+                                        start_param = button.url.split('start=')[1].split('&')[0]
+                                        if start_param.startswith('buy_'):
+                                            nowuid = start_param.replace('buy_', '')
+                                            logger.info(f"🔍 从按钮URL提取到商品ID: {nowuid}")
+                                            break
+                                    except:
+                                        pass
+                                elif button.callback_data and button.callback_data.startswith('gmsp '):
+                                    # 从callback_data中提取，例如: gmsp 123456
+                                    try:
+                                        nowuid = button.callback_data.replace('gmsp ', '').strip()
+                                        logger.info(f"🔍 从按钮callback提取到商品ID: {nowuid}")
+                                        break
+                                    except:
+                                        pass
+                            if nowuid:
+                                break
+                    
+                    # 方法2：从消息文本中使用正则表达式提取（补货通知通常包含商品名称或ID）
+                    if not nowuid and message_text:
+                        import re
+                        # 尝试匹配常见的ID格式
+                        id_patterns = [
+                            r'ID[：:]\s*([a-zA-Z0-9]+)',
+                            r'商品ID[：:]\s*([a-zA-Z0-9]+)',
+                            r'nowuid[：:]\s*([a-zA-Z0-9]+)',
+                        ]
+                        for pattern in id_patterns:
+                            match = re.search(pattern, message_text, re.IGNORECASE)
+                            if match:
+                                nowuid = match.group(1)
+                                logger.info(f"🔍 从消息文本提取到商品ID: {nowuid}")
+                                break
+                    
                     # 构建重写后的按钮
                     # ✅ 优先使用深度链接，如果没有用户名则使用callback按钮
                     if bot_username:
-                        keyboard = [[
-                            InlineKeyboardButton("🛒 购买商品", url=f"https://t.me/{bot_username}?start=restock")
-                        ]]
-                        logger.info(f"🔗 使用深度链接按钮: https://t.me/{bot_username}?start=restock")
+                        if nowuid:
+                            # 如果提取到商品ID，使用product_深度链接
+                            keyboard = [[
+                                InlineKeyboardButton("🛒 购买商品", url=f"https://t.me/{bot_username}?start=product_{nowuid}")
+                            ]]
+                            logger.info(f"🔗 使用商品深度链接按钮: https://t.me/{bot_username}?start=product_{nowuid}")
+                        else:
+                            # 否则使用通用的restock链接
+                            keyboard = [[
+                                InlineKeyboardButton("🛒 购买商品", url=f"https://t.me/{bot_username}?start=restock")
+                            ]]
+                            logger.info(f"🔗 使用通用补货深度链接按钮: https://t.me/{bot_username}?start=restock")
                     else:
-                        keyboard = [[
-                            InlineKeyboardButton("🛒 购买商品", callback_data="products")
-                        ]]
+                        if nowuid:
+                            keyboard = [[
+                                InlineKeyboardButton("🛒 购买商品", callback_data=f"product_{nowuid}")
+                            ]]
+                        else:
+                            keyboard = [[
+                                InlineKeyboardButton("🛒 购买商品", callback_data="products")
+                            ]]
                         logger.warning("⚠️ 未获取到机器人用户名，使用callback按钮作为回退方案")
                     reply_markup = InlineKeyboardMarkup(keyboard)
                     
