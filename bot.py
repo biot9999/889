@@ -12209,11 +12209,19 @@ def agent_bot_list(update: Update, context: CallbackContext):
             for i, bot in enumerate(agent_bots_list[:10], 1):  # 显示前10个
                 status_icon = "🟢" if bot['status'] == 'active' else "🔴"
                 
+                # 获取实时统计数据
+                stats = get_agent_stats(bot['agent_bot_id'])
+                if not stats:
+                    stats = {
+                        'total_sales': 0.0,
+                        'available_balance': 0.0
+                    }
+                
                 text += f"{i}. {status_icon} <b>{bot['agent_name']}</b>\n"
                 text += f"   ├─ 机器人：@{bot.get('agent_username', 'unknown')}\n"
                 text += f"   ├─ 佣金率：{bot['commission_rate']}%\n"
-                text += f"   ├─ 销售额：{bot.get('total_sales', 0):.2f} USDT\n"
-                text += f"   ├─ 余额：{bot.get('available_balance', 0):.2f} USDT\n"
+                text += f"   ├─ 销售额：{stats.get('total_sales', 0):.2f} USDT\n"
+                text += f"   ├─ 余额：{stats.get('available_balance', 0):.2f} USDT\n"
                 text += f"   └─ 创建：{bot['creation_time'][:10]}\n\n"
                 
                 keyboard.append([
