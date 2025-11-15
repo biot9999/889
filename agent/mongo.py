@@ -605,7 +605,12 @@ def create_agent_product_price_data(agent_bot_id, original_nowuid, agent_price, 
 
 def create_agent_order_data(order_id, agent_bot_id, customer_id, original_nowuid, quantity, 
                            agent_price, cost_price, profit, commission, order_time):
-    """创建代理订单记录"""
+    """
+    创建代理订单记录
+    
+    Args:
+        order_time: 订单时间，必须为datetime对象（不是字符串）
+    """
     try:
         agent_orders.insert_one({
             'order_id': order_id,                   # 订单ID
@@ -779,6 +784,183 @@ def init_multi_bot_distribution_system():
     except Exception as e:
         logging.error(f"❌ 多机器人分销系统初始化失败：{e}")
         return False
+
+# ================================ 代理统计函数 ================================
+
+def get_agent_stats(agent_bot_id, period='all'):
+    """
+    获取代理机器人统计数据
+    
+    Args:
+        agent_bot_id: 代理机器人ID
+        period: 时间周期 '7d'|'17d'|'30d'|'90d'|'all'
+        
+    Returns:
+        dict: 统计数据字典
+        {
+            'total_sales': float,          # 总销售额（周期内）
+            'order_count': int,            # 订单数量（周期内）
+            'avg_order': float,            # 平均订单额
+            'total_commission': float,     # 总佣金（周期内）
+            'profit_rate': float,          # 利润率%
+            'withdrawn_amount': float,     # 已提现总额（全部时间）
+            'available_balance': float,    # 可提现余额
+            'pending_withdrawal_count': int,     # 待处理提现数量
+            'pending_withdrawal_amount': float,  # 待处理提现金额
+            'total_users': int            # 用户数量
+        }
+    """
+    try:
+        # 计算时间范围
+        time_filter = {}
+        if period != 'all':
+            period_days = {
+                '7d': 7,
+                '17d': 17,
+                '30d': 30,
+                '90d': 90
+            }
+            days = period_days.get(period, 30)
+            start_time = datetime.now() - timedelta(days=days)
+            # 使用datetime过滤
+            time_filter = {'order_time': {'$gte': start_time}}
+        
+        # 1. 从 agent_orders 聚合订单数据
+        order_pipeline = [
+            {'$match': {
+                'agent_bot_id': agent_bot_id,
+                'status': 'completed',
+                **time_filter
+            }},
+            {'$group': {
+                '_id': None,
+                'total_sales': {
+                    '$sum': {
+                        '$multiply': [
+                            {'$ifNull': ['$agent_price', 0]},
+                            {'$ifNull': ['$quantity', 0]}
+                        ]
+                    }
+                },
+                'total_commission': {
+                    '$sum': {'$ifNull': ['$commission', 0]}
+                },
+                'order_count': {'$sum': 1}
+            }}
+        ]
+        
+        order_result = list(agent_orders.aggregate(order_pipeline))
+        order_stats = order_result[0] if order_result else {
+            'total_sales': 0.0,
+            'total_commission': 0.0,
+            'order_count': 0
+        }
+        
+        # 2. 计算全部时间的总佣金（用于可提现余额计算）
+        all_time_commission_pipeline = [
+            {'$match': {
+                'agent_bot_id': agent_bot_id,
+                'status': 'completed'
+            }},
+            {'$group': {
+                '_id': None,
+                'all_time_commission': {
+                    '$sum': {'$ifNull': ['$commission', 0]}
+                }
+            }}
+        ]
+        
+        all_commission_result = list(agent_orders.aggregate(all_time_commission_pipeline))
+        all_time_commission = all_commission_result[0]['all_time_commission'] if all_commission_result else 0.0
+        
+        # 3. 获取已提现金额（全部时间，status='completed'）
+        withdrawn_pipeline = [
+            {'$match': {
+                'agent_bot_id': agent_bot_id,
+                'status': 'completed'
+            }},
+            {'$group': {
+                '_id': None,
+                'withdrawn_amount': {'$sum': '$amount'}
+            }}
+        ]
+        
+        withdrawn_result = list(agent_withdrawals.aggregate(withdrawn_pipeline))
+        withdrawn_amount = withdrawn_result[0]['withdrawn_amount'] if withdrawn_result else 0.0
+        
+        # 4. 获取待处理提现数据
+        pending_withdrawals = list(agent_withdrawals.find({
+            'agent_bot_id': agent_bot_id,
+            'status': 'pending'
+        }))
+        pending_withdrawal_count = len(pending_withdrawals)
+        pending_withdrawal_amount = sum(w.get('amount', 0) for w in pending_withdrawals)
+        
+        # 5. 获取用户数量
+        agent_users_collection = get_agent_bot_user_collection(agent_bot_id)
+        try:
+            total_users = agent_users_collection.count_documents({})
+        except:
+            total_users = 0
+        
+        # 6. 计算派生指标
+        total_sales = float(order_stats['total_sales'])
+        total_commission = float(order_stats['total_commission'])
+        order_count = int(order_stats['order_count'])
+        
+        # 平均订单额
+        avg_order = total_sales / order_count if order_count > 0 else 0.0
+        
+        # 利润率
+        profit_rate = (total_commission / total_sales * 100) if total_sales > 0 else 0.0
+        
+        # 可提现余额 = 全部时间累计佣金 - 已提现金额
+        available_balance = all_time_commission - withdrawn_amount
+        
+        # 7. 兼容性：如果没有commission字段的旧订单，尝试从agent_bots获取commission_rate回退计算
+        if total_commission == 0 and total_sales > 0:
+            agent_info = agent_bots.find_one({'agent_bot_id': agent_bot_id})
+            if agent_info and 'commission_rate' in agent_info:
+                commission_rate = float(agent_info['commission_rate']) / 100
+                total_commission = total_sales * commission_rate
+                all_time_commission = total_commission
+                available_balance = all_time_commission - withdrawn_amount
+                profit_rate = agent_info['commission_rate']
+                logging.info(f"⚠️ 代理 {agent_bot_id} 使用commission_rate回退计算佣金")
+        
+        result = {
+            'total_sales': round(total_sales, 2),
+            'order_count': order_count,
+            'avg_order': round(avg_order, 2),
+            'total_commission': round(total_commission, 2),
+            'profit_rate': round(profit_rate, 2),
+            'withdrawn_amount': round(withdrawn_amount, 2),
+            'available_balance': round(available_balance, 2),
+            'pending_withdrawal_count': pending_withdrawal_count,
+            'pending_withdrawal_amount': round(pending_withdrawal_amount, 2),
+            'total_users': total_users
+        }
+        
+        logging.info(f"✅ 获取代理统计成功：{agent_bot_id}, period={period}, orders={order_count}, sales={total_sales:.2f}")
+        return result
+        
+    except Exception as e:
+        logging.error(f"❌ 获取代理统计失败：agent_bot_id={agent_bot_id}, period={period}, error={e}")
+        import traceback
+        traceback.print_exc()
+        # 返回安全的全0结构
+        return {
+            'total_sales': 0.0,
+            'order_count': 0,
+            'avg_order': 0.0,
+            'total_commission': 0.0,
+            'profit_rate': 0.0,
+            'withdrawn_amount': 0.0,
+            'available_balance': 0.0,
+            'pending_withdrawal_count': 0,
+            'pending_withdrawal_amount': 0.0,
+            'total_users': 0
+        }
 
 # 初始化系统
 init_multi_bot_distribution_system()
