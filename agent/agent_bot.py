@@ -3613,40 +3613,6 @@ class AgentBotHandlers:
         except Exception as e:
             logger.error(f"❌ 处理总部消息异常: {e}")
             traceback.print_exc()
-    
-    def _send_rewritten_buttons(self, context: CallbackContext, chat_id: Union[int, str], reply_to_message_id: int):
-        """
-        发送重写后的按钮（指向代理机器人）
-        
-        Args:
-            context: CallbackContext
-            chat_id: 目标群组ID
-            reply_to_message_id: 回复的消息ID
-        """
-        try:
-            # 获取机器人用户名
-            bot_info = context.bot.get_me()
-            bot_username = bot_info.username
-            
-            # 构建新的按钮
-            keyboard = [
-                [
-                    InlineKeyboardButton("🛒 购买商品", callback_data="products"),
-                    InlineKeyboardButton("🤖 打开机器人", url=f"https://t.me/{bot_username}")
-                ]
-            ]
-            
-            context.bot.send_message(
-                chat_id=chat_id,
-                text="👆 点击上方查看补货详情",
-                reply_to_message_id=reply_to_message_id,
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            
-            logger.info(f"✅ 补货通知按钮已重写")
-            
-        except Exception as e:
-            logger.warning(f"⚠️ 重写按钮失败: {e}")
 
 
 class AgentBot:

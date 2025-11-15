@@ -94,15 +94,15 @@ RESTOCK_KEYWORDS=补货,上新,到货,新货,库存补充
 
 #### 启用按钮重写
 
-如果需要在转发的消息下添加指向代理机器人的按钮：
+如果需要重写HQ消息的按钮，使其指向代理机器人：
 
 ```bash
-RESTOCK_REWRITE_BUTTONS=1
+HQ_RESTOCK_REWRITE_BUTTONS=1
 ```
 
-效果：在转发的消息下方会添加：
-- "🛒 购买商品" 按钮
-- "🤖 打开机器人" 按钮
+效果：
+- 不使用 copy_message，而是发送新消息
+- 附带重写的按钮："🛒 购买商品" → https://t.me/{agent_bot_username}
 
 ### 常见问题
 
@@ -223,15 +223,15 @@ RESTOCK_KEYWORDS=restock,new stock,back in stock,restocked,new arrival
 
 #### Enable Button Rewriting
 
-To add buttons pointing to agent bot below forwarded messages:
+To rewrite HQ message buttons to point to agent bot:
 
 ```bash
-RESTOCK_REWRITE_BUTTONS=1
+HQ_RESTOCK_REWRITE_BUTTONS=1
 ```
 
-Effect: Adds buttons below forwarded message:
-- "🛒 购买商品" (Buy Products) button
-- "🤖 打开机器人" (Open Bot) button
+Effect:
+- Does NOT use copy_message, sends new message instead
+- Attaches rewritten button: "🛒 购买商品" → https://t.me/{agent_bot_username}
 
 ### FAQ
 
