@@ -10660,27 +10660,88 @@ def handle_all_callbacks(update: Update, context: CallbackContext):
     elif query.data == "agent_system_report":
         query.answer()
         
+        if not multi_bot_system.is_master_admin(query.from_user.id):
+            try:
+                query.edit_message_text("❌ 权限错误")
+            except:
+                context.bot.send_message(chat_id=query.from_user.id, text="❌ 权限错误")
+            return
+        
         from datetime import datetime
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
-        text = f"""📊 <b>系统报表</b>
+        try:
+            # 获取所有代理机器人
+            agent_bots_list = multi_bot_system.get_agent_bot_list()
+            
+            # 统计数据
+            total_agents = len(agent_bots_list)
+            active_agents = len([bot for bot in agent_bots_list if bot.get('status') == 'active'])
+            
+            # 汇总所有代理的统计数据
+            total_sales = 0.0
+            total_commission = 0.0
+            total_users = 0
+            total_orders = 0
+            
+            for bot in agent_bots_list:
+                stats = get_agent_stats(bot['agent_bot_id'])
+                if stats:
+                    total_sales += stats.get('total_sales', 0)
+                    total_commission += stats.get('total_commission', 0)
+                    total_users += stats.get('total_users', 0)
+                    total_orders += stats.get('order_count', 0)
+            
+            text = f"""📊 <b>系统报表</b>
 📅 {current_time}
 
-🤖 代理统计：1个活跃
-💰 总销售额：2.40 USDT
-👥 总用户数：15人
-📈 今日订单：3笔
-✅ 系统运行正常"""
+🤖 <b>代理统计</b>
+• 总代理数：{total_agents} 个
+• 活跃代理：{active_agents} 个
+• 停用代理：{total_agents - active_agents} 个
 
+💰 <b>财务统计</b>
+• 总销售额：{total_sales:.2f} USDT
+• 总佣金：{total_commission:.2f} USDT
+
+👥 <b>业务统计</b>
+• 总用户数：{total_users} 人
+• 总订单数：{total_orders} 笔
+• 平均订单额：{(total_sales / total_orders) if total_orders > 0 else 0:.2f} USDT
+
+✅ 系统运行正常"""
+        
+        except Exception as e:
+            print(f"❌ 获取系统报表失败: {e}")
+            import traceback
+            traceback.print_exc()
+            text = f"""📊 <b>系统报表</b>
+📅 {current_time}
+
+❌ 获取统计数据失败
+请稍后重试"""
+        
         keyboard = [
             [InlineKeyboardButton("🔙 返回", callback_data="agent_bot_list")]
         ]
         
-        query.edit_message_text(
-            text=text,
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        try:
+            query.edit_message_text(
+                text=text,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                pass
+            else:
+                print(f"编辑消息失败: {e}")
+                context.bot.send_message(
+                    chat_id=query.from_user.id,
+                    text=text,
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
 
     # ========== 其他按钮的回调 ==========
     elif query.data.startswith(("create_agent_bot_guide", "agent_user_management", 
