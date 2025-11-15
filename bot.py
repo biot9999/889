@@ -7400,6 +7400,7 @@ def textkeyboard(update: Update, context: CallbackContext):
     if chat.type == 'private':
         # ✅ 如果代理创建向导正在进行，不处理该消息
         if WIZARD_STATE_KEY in context.user_data:
+            print(f"🔍 textkeyboard: Wizard active, skipping for user {chat.id}")
             return
         
         user_id = chat.id
@@ -11432,6 +11433,10 @@ def start_agent_create_callback(update: Update, context: CallbackContext):
 
 def handle_agent_create_text(update: Update, context: CallbackContext):
     """处理向导中的文本输入"""
+    # 检查消息是否存在
+    if not update.message:
+        return
+    
     # 只在私聊且向导激活时处理
     if update.message.chat.type != 'private':
         return
@@ -11446,9 +11451,19 @@ def handle_agent_create_text(update: Update, context: CallbackContext):
     if not multi_bot_system.is_master_admin(user_id):
         return
     
+    # 记录日志以便调试
+    print(f"🔍 Wizard handler activated for user {user_id}")
+    print(f"🔍 Current step: {context.user_data.get(WIZARD_STATE_KEY)}")
+    
     current_step = context.user_data[WIZARD_STATE_KEY]
     wizard_data = context.user_data[WIZARD_DATA_KEY]
-    text = update.message.text.strip()
+    text = update.message.text.strip() if update.message.text else ""
+    
+    if not text:
+        print(f"🔍 Empty text received, ignoring")
+        return
+    
+    print(f"🔍 Processing text: {text[:50]}...")
     
     if current_step == WIZARD_STEP_TOKEN:
         # 处理Token输入
