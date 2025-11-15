@@ -21,6 +21,7 @@ import time
 import random
 import requests
 import threading
+import re
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
@@ -160,6 +161,19 @@ class AgentBotConfig:
         
         # ✅ 零库存分类显示配置
         self.AGENT_SHOW_EMPTY_CATEGORIES = os.getenv("AGENT_SHOW_EMPTY_CATEGORIES", "1") in ("1", "true", "True")
+        
+        # ✅ HQ克隆模式配置（需求：克隆总部分类显示）
+        self.AGENT_CLONE_HEADQUARTERS_CATEGORIES = os.getenv("AGENT_CLONE_HEADQUARTERS_CATEGORIES", "1") in ("1", "true", "True")
+        
+        # ✅ 统一协议号分类在总部分类中的位置（默认第2位，即索引1）
+        self.HQ_PROTOCOL_CATEGORY_INDEX = int(os.getenv("HQ_PROTOCOL_CATEGORY_INDEX", "2"))
+        
+        # ✅ 协议号关键词列表（用于检测协议号类商品）
+        keywords_str = os.getenv("AGENT_PROTOCOL_CATEGORY_KEYWORDS", "协议,协议号,年老号,老号")
+        self.AGENT_PROTOCOL_CATEGORY_KEYWORDS = [kw.strip() for kw in keywords_str.split(",") if kw.strip()]
+        
+        # ✅ 默认代理加价（新商品自动同步时的默认加价）
+        self.AGENT_DEFAULT_MARKUP = float(os.getenv("AGENT_DEFAULT_MARKUP", "0.2"))
 
         try:
             self.client = MongoClient(self.MONGODB_URI)
@@ -227,6 +241,45 @@ class AgentBotCore:
         if leixing is None or leixing in self.config.AGENT_PROTOCOL_CATEGORY_ALIASES:
             return self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED
         return leixing
+    
+    def _is_protocol_like_product(self, name: str, leixing: Any) -> bool:
+        """
+        检测商品是否为协议号类商品（HQ克隆模式使用）
+        
+        检测规则：
+        1. leixing 为 None/空/在别名列表中/等于统一分类名 -> True
+        2. projectname 包含关键词（协议、协议号、年老号、老号等）-> True
+        3. projectname 包含年份范围模式（如 [1-8] 或 [3-8 年]）-> True
+        
+        Args:
+            name: 商品名称 (projectname)
+            leixing: 商品分类 (leixing)
+        
+        Returns:
+            True 如果商品应归入协议号分类，否则 False
+        """
+        # 规则1: leixing 为 None/空/别名/统一分类
+        if leixing is None or leixing == '' or leixing in self.config.AGENT_PROTOCOL_CATEGORY_ALIASES:
+            return True
+        if leixing == self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
+            return True
+        
+        # 如果没有商品名称，无法进一步检测
+        if not name:
+            return False
+        
+        # 规则2: 检查商品名称是否包含协议号关键词
+        for keyword in self.config.AGENT_PROTOCOL_CATEGORY_KEYWORDS:
+            if keyword and keyword in name:
+                return True
+        
+        # 规则3: 检查年份范围模式，例如 "[1-8]" 或 "[3-8 年]"
+        # 模式: 方括号内包含 数字-数字 的形式
+        year_range_pattern = r'\[\s*\d+\s*-\s*\d+\s*(?:年)?\s*\]'
+        if re.search(year_range_pattern, name):
+            return True
+        
+        return False
 
     # ---------- UI 辅助 ----------
     def _h(self, s: Any) -> str:
@@ -324,17 +377,26 @@ class AgentBotCore:
                 # ✅ 安全获取总部价格（处理异常情况）
                 original_price = self._safe_price(p.get('money'))
                 
-                # ✅ 保留原始分类：只对协议号别名做统一，其它分类保持原样
+                # ✅ 分类检测：使用智能协议号检测（HQ克隆模式）或传统别名统一
                 leixing = p.get('leixing')
-                # 只统一协议号别名，其它分类直接使用原值
-                if leixing is None or leixing in self.config.AGENT_PROTOCOL_CATEGORY_ALIASES:
-                    category = self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED
+                projectname = p.get('projectname', '')
+                
+                if self.config.AGENT_CLONE_HEADQUARTERS_CATEGORIES:
+                    # HQ克隆模式：使用智能协议号检测
+                    if self._is_protocol_like_product(projectname, leixing):
+                        category = self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED
+                    else:
+                        category = leixing  # 保持原始分类名
                 else:
-                    category = leixing  # 保持原始分类名
+                    # 传统模式：只统一协议号别名，其它分类保持原样
+                    if leixing is None or leixing in self.config.AGENT_PROTOCOL_CATEGORY_ALIASES:
+                        category = self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED
+                    else:
+                        category = leixing  # 保持原始分类名
                 
                 if not exists:
-                    # ✅ 新商品：创建代理价格记录
-                    agent_markup = 0.0  # 初始无加价，后续管理员手动设置
+                    # ✅ 新商品：创建代理价格记录，使用默认加价
+                    agent_markup = self.config.AGENT_DEFAULT_MARKUP
                     agent_price = round(original_price + agent_markup, 2)
                     
                     # ✅ 即使总部价为0也创建记录，但标记为未激活
@@ -348,7 +410,7 @@ class AgentBotCore:
                         'agent_price': agent_price,
                         'original_price_snapshot': original_price,
                         'product_name': p.get('projectname', ''),
-                        'category': category,  # ✅ 使用统一后的分类
+                        'category': category,  # ✅ 使用检测后的分类
                         'is_active': is_active,
                         'needs_price_set': needs_price_set,
                         'auto_created': True,
@@ -436,28 +498,164 @@ class AgentBotCore:
             return 0
 
     def get_product_categories(self) -> List[Dict]:
-        """获取商品分类列表（一级分类）- 联合聚合 + 容错回退"""
+        """获取商品分类列表（一级分类）- HQ克隆模式 + 容错回退"""
         try:
             # ✅ 每次获取分类时自动同步新商品
             self.auto_sync_new_products()
             
-            # ========== 步骤1：读取总部 fenlei 表的一级分类名称 ==========
+            # ========== HQ克隆模式：严格按照总部fenlei顺序显示 ==========
+            if self.config.AGENT_CLONE_HEADQUARTERS_CATEGORIES:
+                try:
+                    logger.info("🔄 使用HQ克隆模式构建分类列表...")
+                    
+                    # 步骤1：从总部 fenlei 表读取分类（保持顺序）
+                    fenlei_docs = list(self.config.fenlei.find({}).sort('_id', 1))
+                    fenlei_categories = [doc.get('projectname') for doc in fenlei_docs if doc.get('projectname')]
+                    
+                    if not fenlei_categories:
+                        logger.warning("⚠️ HQ fenlei表为空，回退到传统模式")
+                        raise Exception("HQ fenlei empty, fallback")
+                    
+                    # 步骤2：读取所有HQ商品的leixing和projectname，用于智能分类
+                    all_hq_products = list(self.config.ejfl.find({}, {'nowuid': 1, 'leixing': 1, 'projectname': 1}))
+                    hq_product_map = {p['nowuid']: p for p in all_hq_products if p.get('nowuid')}
+                    
+                    # 步骤3：读取代理端已激活的商品
+                    agent_products = list(self.config.agent_product_prices.find({
+                        'agent_bot_id': self.config.AGENT_BOT_ID,
+                        'is_active': True
+                    }, {'original_nowuid': 1}))
+                    
+                    active_nowuids = [p['original_nowuid'] for p in agent_products if p.get('original_nowuid')]
+                    
+                    # 步骤4：根据智能检测，将每个商品归入对应分类
+                    category_products = {}  # {category_name: set(nowuids)}
+                    
+                    # 初始化所有fenlei分类
+                    for cat in fenlei_categories:
+                        category_products[cat] = set()
+                    
+                    # 初始化统一协议号分类
+                    category_products[self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED] = set()
+                    
+                    # 将激活的商品按智能检测规则归入分类
+                    for nowuid in active_nowuids:
+                        hq_prod = hq_product_map.get(nowuid)
+                        if not hq_prod:
+                            continue
+                        
+                        leixing = hq_prod.get('leixing')
+                        projectname = hq_prod.get('projectname', '')
+                        
+                        # 使用智能检测判断是否为协议号类商品
+                        if self._is_protocol_like_product(projectname, leixing):
+                            category_products[self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED].add(nowuid)
+                        elif leixing and leixing in category_products:
+                            # 如果leixing在fenlei中，归入对应分类
+                            category_products[leixing].add(nowuid)
+                        elif leixing:
+                            # 如果leixing不在fenlei中，创建动态分类
+                            if leixing not in category_products:
+                                category_products[leixing] = set()
+                            category_products[leixing].add(nowuid)
+                        else:
+                            # 如果leixing为空，归入协议号分类（兜底）
+                            category_products[self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED].add(nowuid)
+                    
+                    # 步骤5：统计每个分类的库存
+                    category_stock = {}
+                    for cat_name, nowuid_set in category_products.items():
+                        if nowuid_set:
+                            stock = self.config.hb.count_documents({
+                                'nowuid': {'$in': list(nowuid_set)},
+                                'state': 0
+                            })
+                            category_stock[cat_name] = stock
+                        else:
+                            category_stock[cat_name] = 0
+                    
+                    # 步骤6：按照HQ fenlei顺序构建结果，并在指定位置插入协议号分类
+                    result = []
+                    protocol_inserted = False
+                    insert_index = self.config.HQ_PROTOCOL_CATEGORY_INDEX - 1  # 转为0-based索引
+                    
+                    for i, cat in enumerate(fenlei_categories):
+                        # 在指定位置插入协议号分类
+                        if i == insert_index and not protocol_inserted:
+                            protocol_cat = self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED
+                            stock = category_stock.get(protocol_cat, 0)
+                            count = len(category_products.get(protocol_cat, set()))
+                            if stock > 0 or self.config.AGENT_SHOW_EMPTY_CATEGORIES:
+                                result.append({
+                                    '_id': protocol_cat,
+                                    'stock': stock,
+                                    'count': count
+                                })
+                            protocol_inserted = True
+                        
+                        # 添加当前fenlei分类（跳过协议号分类本身，避免重复）
+                        if cat != self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
+                            stock = category_stock.get(cat, 0)
+                            count = len(category_products.get(cat, set()))
+                            if stock > 0 or self.config.AGENT_SHOW_EMPTY_CATEGORIES:
+                                result.append({
+                                    '_id': cat,
+                                    'stock': stock,
+                                    'count': count
+                                })
+                    
+                    # 如果索引超出范围，在末尾追加协议号分类
+                    if not protocol_inserted:
+                        protocol_cat = self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED
+                        stock = category_stock.get(protocol_cat, 0)
+                        count = len(category_products.get(protocol_cat, set()))
+                        if stock > 0 or self.config.AGENT_SHOW_EMPTY_CATEGORIES:
+                            result.append({
+                                '_id': protocol_cat,
+                                'stock': stock,
+                                'count': count
+                            })
+                    
+                    # 添加动态分类（不在fenlei中的分类，排在后面）
+                    for cat_name in category_products.keys():
+                        if cat_name not in fenlei_categories and cat_name != self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
+                            stock = category_stock.get(cat_name, 0)
+                            count = len(category_products.get(cat_name, set()))
+                            if stock > 0 or self.config.AGENT_SHOW_EMPTY_CATEGORIES:
+                                result.append({
+                                    '_id': cat_name,
+                                    'stock': stock,
+                                    'count': count
+                                })
+                    
+                    logger.info(f"✅ HQ克隆模式：共 {len(result)} 个分类，协议号分类包含 {len(category_products.get(self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED, set()))} 个商品")
+                    return result
+                    
+                except Exception as hq_clone_err:
+                    logger.error(f"❌ HQ克隆模式失败，回退到传统模式: {hq_clone_err}")
+                    import traceback
+                    traceback.print_exc()
+                    # 继续执行传统模式
+            
+            # ========== 传统模式：基于agent_product_prices聚合 ==========
+            logger.info("🔄 使用传统模式构建分类列表...")
+            
+            # 步骤1：读取总部 fenlei 表的一级分类名称
             fenlei_categories = []
             try:
-                # 从总部 fenlei 表读取所有 projectname（一级分类名称）
                 fenlei_docs = list(self.config.fenlei.find({}, {'projectname': 1}))
                 fenlei_categories = [doc.get('projectname') for doc in fenlei_docs if doc.get('projectname')]
                 logger.info(f"✅ 从总部 fenlei 表读取到 {len(fenlei_categories)} 个分类")
             except Exception as fenlei_err:
                 logger.warning(f"⚠️ 读取总部 fenlei 表失败（将回退到 agent_product_prices 聚合）: {fenlei_err}")
             
-            # ========== 步骤2：读取代理端已激活商品及其分类 ==========
+            # 步骤2：读取代理端已激活商品及其分类
             agent_products = list(self.config.agent_product_prices.find({
                 'agent_bot_id': self.config.AGENT_BOT_ID,
                 'is_active': True
             }, {'original_nowuid': 1, 'category': 1}))
             
-            # ========== 步骤3：构建分类名集合及其 nowuid 映射 ==========
+            # 步骤3：构建分类名集合及其 nowuid 映射
             categories_map = {}  # {category_name: {'nowuids': set(), 'stock': int}}
             
             # 3.1 先从 fenlei 分类初始化（保持原始名称，不做统一映射）
@@ -488,7 +686,7 @@ class AgentBotCore:
                         categories_map[raw_category] = {'nowuids': set(), 'stock': 0}
                     categories_map[raw_category]['nowuids'].add(nowuid)
             
-            # ========== 步骤4：统计每个分类的库存 ==========
+            # 步骤4：统计每个分类的库存
             for cat_name, cat_data in categories_map.items():
                 nowuid_set = cat_data['nowuids']
                 if nowuid_set:
@@ -501,7 +699,7 @@ class AgentBotCore:
                 else:
                     cat_data['stock'] = 0
             
-            # ========== 步骤5：根据配置决定是否显示零库存分类 ==========
+            # 步骤5：根据配置决定是否显示零库存分类
             result = []
             for cat_name, cat_data in categories_map.items():
                 stock = cat_data['stock']
@@ -515,15 +713,15 @@ class AgentBotCore:
                         'count': nowuid_count
                     })
             
-            # ========== 步骤6：按库存降序排序（零库存的在后面） ==========
+            # 步骤6：按库存降序排序（零库存的在后面）
             result.sort(key=lambda x: -x['stock'])
             
-            # ========== 步骤7：容错检查 ==========
+            # 步骤7：容错检查
             if not result:
                 logger.warning("⚠️ 未获取到任何分类，可能 fenlei 为空且无已激活商品")
                 return []
             
-            logger.info(f"✅ 获取商品分类成功（联合聚合）: 共 {len(result)} 个分类，其中统一协议号分类包含 {len(categories_map.get(self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED, {}).get('nowuids', set()))} 个商品")
+            logger.info(f"✅ 获取商品分类成功（传统模式）: 共 {len(result)} 个分类，其中统一协议号分类包含 {len(categories_map.get(self.config.AGENT_PROTOCOL_CATEGORY_UNIFIED, {}).get('nowuids', set()))} 个商品")
             return result
             
         except Exception as e:
@@ -1897,14 +2095,140 @@ class AgentBotHandlers:
             self.safe_edit_message(query, "❌ 加载失败，请重试", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
             
     def show_category_products(self, query, category: str, page: int = 1):
-        """显示分类下的商品（二级分类）- 支持统一协议号分类"""
+        """显示分类下的商品（二级分类）- 支持HQ克隆模式 + 统一协议号分类"""
         try:
             # ✅ 先自动同步新商品，确保最新商品能显示
             self.core.auto_sync_new_products()
             
             skip = (page - 1) * 10
             
-            # ========== 判断是否为统一协议号分类 ==========
+            # ========== HQ克隆模式：直接查询ejfl并使用智能协议号检测 ==========
+            if self.core.config.AGENT_CLONE_HEADQUARTERS_CATEGORIES:
+                try:
+                    # 查询ejfl中的所有商品（将根据leixing和projectname智能分类）
+                    if category == self.core.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
+                        # 协议号分类：需要智能检测
+                        # 先获取所有商品，然后在内存中过滤
+                        all_hq_products = list(self.core.config.ejfl.find({}, {
+                            'nowuid': 1, 'projectname': 1, 'leixing': 1, 'money': 1
+                        }))
+                        
+                        # 过滤出协议号类商品
+                        protocol_nowuids = []
+                        for p in all_hq_products:
+                            leixing = p.get('leixing')
+                            projectname = p.get('projectname', '')
+                            if self.core._is_protocol_like_product(projectname, leixing):
+                                protocol_nowuids.append(p['nowuid'])
+                        
+                        # 查询这些商品的详细信息
+                        ejfl_match = {'nowuid': {'$in': protocol_nowuids}}
+                    else:
+                        # 非协议号分类：精确匹配leixing（但排除协议号类商品）
+                        # 先查询该分类的所有商品
+                        candidate_products = list(self.core.config.ejfl.find({'leixing': category}, {
+                            'nowuid': 1, 'projectname': 1, 'leixing': 1
+                        }))
+                        
+                        # 过滤掉协议号类商品（它们应该在协议号分类中）
+                        non_protocol_nowuids = []
+                        for p in candidate_products:
+                            leixing = p.get('leixing')
+                            projectname = p.get('projectname', '')
+                            if not self.core._is_protocol_like_product(projectname, leixing):
+                                non_protocol_nowuids.append(p['nowuid'])
+                        
+                        ejfl_match = {'nowuid': {'$in': non_protocol_nowuids}}
+                    
+                    # 联合查询：ejfl + agent_product_prices + hb
+                    pipeline = [
+                        {'$match': ejfl_match},
+                        {'$lookup': {
+                            'from': 'agent_product_prices',
+                            'localField': 'nowuid',
+                            'foreignField': 'original_nowuid',
+                            'as': 'agent_price'
+                        }},
+                        {'$match': {
+                            'agent_price.agent_bot_id': self.core.config.AGENT_BOT_ID,
+                            'agent_price.is_active': True
+                        }},
+                        {'$skip': skip},
+                        {'$limit': 10}
+                    ]
+                    
+                    products = list(self.core.config.ejfl.aggregate(pipeline))
+                    
+                    # 提取商品信息并计算库存和价格
+                    products_with_stock = []
+                    for p in products:
+                        nowuid = p.get('nowuid')
+                        if not nowuid:
+                            continue
+                        
+                        # 获取库存
+                        stock = self.core.get_product_stock(nowuid)
+                        if stock <= 0:
+                            continue
+                        
+                        # 获取价格
+                        price = self.core.get_product_price(nowuid)
+                        if price is None or price <= 0:
+                            continue
+                        
+                        p['stock'] = stock
+                        p['price'] = price
+                        products_with_stock.append(p)
+                    
+                    # 按库存降序排列
+                    products_with_stock.sort(key=lambda x: -x['stock'])
+                    
+                    logger.info(f"✅ HQ克隆模式：分类 '{category}' 获取到 {len(products_with_stock)} 个有库存商品")
+                    
+                except Exception as hq_err:
+                    logger.error(f"❌ HQ克隆模式失败，回退到传统模式: {hq_err}")
+                    import traceback
+                    traceback.print_exc()
+                    # 回退到传统模式（下面的代码）
+                    products_with_stock = None
+                
+                # 如果HQ克隆模式成功，直接渲染
+                if products_with_stock is not None:
+                    text = (
+                        "<b>🛒 这是商品列表  选择你需要的分类：</b>\n\n"
+                        "❗️没使用过的本店商品的，请先少量购买测试，以免造成不必要的争执！谢谢合作！。\n\n"
+                        "❗有密码的账户售后时间1小时内，二级未知的账户售后30分钟内！\n\n"
+                        "❗购买后请第一时间检查账户，提供证明处理售后 超时损失自付！"
+                    )
+                    
+                    kb = []
+                    for p in products_with_stock:
+                        name = p.get('projectname')
+                        nowuid = p.get('nowuid')
+                        price = p['price']
+                        stock = p['stock']
+                        
+                        # ✅ 按钮格式
+                        button_text = f"{name} {price}U   [{stock}个]"
+                        kb.append([InlineKeyboardButton(button_text, callback_data=f"product_{nowuid}")])
+                    
+                    # 如果没有有库存的商品
+                    if not kb:
+                        kb.append([InlineKeyboardButton("暂无商品耐心等待", callback_data="no_action")])
+                    
+                    # ✅ 返回按钮
+                    kb.append([
+                        InlineKeyboardButton("🔙 返回", callback_data="back_products"),
+                        InlineKeyboardButton("❌ 关闭", callback_data=f"close {query.from_user.id}")
+                    ])
+                    
+                    self.safe_edit_message(query, text, kb, parse_mode='HTML')
+                    return
+            
+            # ========== 传统模式：基于agent_product_prices分类 ==========
+            logger.info(f"🔄 使用传统模式显示分类商品: {category}")
+            
+            # 判断是否为统一协议号分类
             if category == self.core.config.AGENT_PROTOCOL_CATEGORY_UNIFIED:
                 # ✅ 统一协议号分类：匹配所有别名 + 统一分类名
                 category_filter = {
