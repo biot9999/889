@@ -923,7 +923,7 @@ def get_agent_stats(agent_bot_id, period='all'):
         if order_count == 0:
             try:
                 agent_gmjlu = get_agent_bot_gmjlu_collection(agent_bot_id)
-                if agent_gmjlu:
+                if agent_gmjlu is not None:
                     match_filter = {'leixing': 'purchase'}
                     if period != 'all':
                         period_days = {'7d': 7, '17d': 17, '30d': 30, '90d': 90}
