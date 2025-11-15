@@ -818,6 +818,10 @@ def get_agent_stats(agent_bot_id, period='all'):
         total_commission = 0.0
         data_source = "agent_orders"
         
+        orders_sales = 0.0
+        orders_count = 0
+        orders_commission = 0.0
+        
         try:
             # 构建时间过滤管道（兼容 datetime 和 string 格式）
             pipeline = []
@@ -878,27 +882,25 @@ def get_agent_stats(agent_bot_id, period='all'):
             
             if result and result[0]['order_count'] > 0:
                 stats = result[0]
-                total_sales = float(stats.get('total_sales', 0))
-                order_count = stats.get('order_count', 0)
-                total_commission = float(stats.get('total_commission', 0))
+                orders_sales = float(stats.get('total_sales', 0))
+                orders_count = stats.get('order_count', 0)
+                orders_commission = float(stats.get('total_commission', 0))
                 
                 # 如果 commission 字段缺失，回退计算
-                if total_commission == 0 and total_sales > 0:
-                    total_commission = total_sales * commission_rate
-                    logging.info(f"📊 Commission calculated from commission_rate (fallback)")
+                if orders_commission == 0 and orders_sales > 0:
+                    orders_commission = orders_sales * commission_rate
                 
-                logging.info(f"📊 Data source: agent_orders - Sales: {total_sales:.2f}, Commission: {total_commission:.2f}, Orders: {order_count}")
-            else:
-                # agent_orders 无数据，回退到 agent_gmjlu_{id_suffix}
-                logging.warning(f"⚠️ No data in agent_orders, falling back to agent_gmjlu_{id_suffix}")
-                data_source = f"agent_gmjlu_{id_suffix}"
-                raise Exception("Fallback to gmjlu")
-                
+                logging.info(f"📊 agent_orders data - Sales: {orders_sales:.2f}, Commission: {orders_commission:.2f}, Orders: {orders_count}")
         except Exception as e:
-            # ========== 回退统计源：agent_gmjlu_{id_suffix} 集合 ==========
-            logging.info(f"⚠️ Falling back to gmjlu collection: {str(e)}")
-            data_source = f"agent_gmjlu_{id_suffix}"
-            
+            logging.warning(f"⚠️ Error querying agent_orders: {str(e)}")
+            orders_count = 0
+        
+        # ========== 同时检查 agent_gmjlu 集合 ==========
+        gmjlu_sales = 0.0
+        gmjlu_count = 0
+        gmjlu_commission = 0.0
+        
+        try:
             agent_gmjlu = get_agent_bot_gmjlu_collection(agent_bot_id)
             
             # 构建时间过滤
@@ -922,15 +924,38 @@ def get_agent_stats(agent_bot_id, period='all'):
             
             if result:
                 stats = result[0]
-                total_sales = float(stats.get('total_sales', 0))
-                order_count = stats.get('order_count', 0)
-                total_commission = total_sales * commission_rate
-                logging.info(f"📊 Data source: {data_source} (fallback) - Sales: {total_sales:.2f}, Commission: {total_commission:.2f}, Orders: {order_count}")
-            else:
-                total_sales = 0.0
-                order_count = 0
-                total_commission = 0.0
-                logging.info(f"📊 Data source: {data_source} (fallback) - No data found")
+                gmjlu_sales = float(stats.get('total_sales', 0))
+                gmjlu_count = stats.get('order_count', 0)
+                gmjlu_commission = gmjlu_sales * commission_rate
+                logging.info(f"📊 agent_gmjlu data - Sales: {gmjlu_sales:.2f}, Commission: {gmjlu_commission:.2f}, Orders: {gmjlu_count}")
+        except Exception as e:
+            logging.warning(f"⚠️ Error querying agent_gmjlu: {str(e)}")
+            gmjlu_count = 0
+        
+        # ========== 选择数据更多的源 ==========
+        if gmjlu_count > orders_count:
+            # gmjlu 有更多数据，使用它
+            total_sales = gmjlu_sales
+            order_count = gmjlu_count
+            total_commission = gmjlu_commission
+            data_source = f"agent_gmjlu_{id_suffix}"
+            logging.info(f"✅ Using gmjlu (has more data: {gmjlu_count} vs {orders_count} orders)")
+        elif orders_count > 0:
+            # agent_orders 有数据且更多，使用它
+            total_sales = orders_sales
+            order_count = orders_count
+            total_commission = orders_commission
+            data_source = "agent_orders"
+            logging.info(f"✅ Using agent_orders (has more data: {orders_count} vs {gmjlu_count} orders)")
+        else:
+            # 两边都没数据
+            total_sales = 0.0
+            order_count = 0
+            total_commission = 0.0
+            data_source = "none"
+            logging.warning(f"⚠️ No data in either agent_orders or agent_gmjlu")
+        
+        logging.info(f"📊 Final data source: {data_source} - Sales: {total_sales:.2f}, Commission: {total_commission:.2f}, Orders: {order_count}")
         
         # ========== 计算已提现金额（全部时间，从 agent_withdrawals） ==========
         withdrawal_pipeline = [
@@ -954,8 +979,14 @@ def get_agent_stats(agent_bot_id, period='all'):
         # ========== 计算可用余额（全部时间累计佣金 - 已提现金额） ==========
         # 如果当前周期不是"全部"，需要重新计算全部时间的佣金
         if period != 'all':
+            # 同时查询 agent_orders 和 agent_gmjlu 的全部时间数据
+            all_orders_commission = 0.0
+            all_orders_count = 0
+            all_gmjlu_commission = 0.0
+            all_gmjlu_count = 0
+            
             try:
-                # 先尝试从 agent_orders 获取全部时间佣金
+                # 从 agent_orders 获取全部时间数据
                 all_time_pipeline = [
                     {'$match': {'agent_bot_id': agent_bot_id}},
                     {
@@ -971,36 +1002,51 @@ def get_agent_stats(agent_bot_id, period='all'):
                             },
                             'total_commission': {
                                 '$sum': {'$ifNull': ['$commission', 0]}
-                            }
+                            },
+                            'order_count': {'$sum': 1}
                         }
                     }
                 ]
                 
                 all_result = list(agent_orders.aggregate(all_time_pipeline))
                 
-                if all_result and all_result[0].get('total_sales', 0) > 0:
-                    all_total_commission = float(all_result[0].get('total_commission', 0))
-                    if all_total_commission == 0:
+                if all_result and all_result[0].get('order_count', 0) > 0:
+                    all_orders_count = all_result[0].get('order_count', 0)
+                    all_orders_commission = float(all_result[0].get('total_commission', 0))
+                    if all_orders_commission == 0:
                         all_total_sales = float(all_result[0].get('total_sales', 0))
-                        all_total_commission = all_total_sales * commission_rate
-                else:
-                    raise Exception("Fallback to gmjlu for all-time commission")
-                    
-            except Exception:
-                # 回退到 agent_{id}_gmjlu
+                        all_orders_commission = all_total_sales * commission_rate
+            except Exception as e:
+                logging.warning(f"⚠️ Error getting all-time agent_orders data: {e}")
+            
+            try:
+                # 从 agent_gmjlu 获取全部时间数据
                 agent_gmjlu = get_agent_bot_gmjlu_collection(agent_bot_id)
                 all_sales_pipeline = [
                     {'$match': {'leixing': 'purchase'}},
                     {
                         '$group': {
                             '_id': None,
-                            'total_sales': {'$sum': '$ts'}
+                            'total_sales': {'$sum': '$ts'},
+                            'order_count': {'$sum': 1}
                         }
                     }
                 ]
                 all_sales_result = list(agent_gmjlu.aggregate(all_sales_pipeline))
-                all_total_sales = float(all_sales_result[0].get('total_sales', 0)) if all_sales_result else 0.0
-                all_total_commission = all_total_sales * commission_rate
+                if all_sales_result and all_sales_result[0].get('order_count', 0) > 0:
+                    all_gmjlu_count = all_sales_result[0].get('order_count', 0)
+                    all_total_sales = float(all_sales_result[0].get('total_sales', 0))
+                    all_gmjlu_commission = all_total_sales * commission_rate
+            except Exception as e:
+                logging.warning(f"⚠️ Error getting all-time agent_gmjlu data: {e}")
+            
+            # 使用数据更多的源计算余额
+            if all_gmjlu_count > all_orders_count:
+                all_total_commission = all_gmjlu_commission
+                logging.info(f"💰 All-time commission from gmjlu: {all_total_commission:.2f} ({all_gmjlu_count} orders)")
+            else:
+                all_total_commission = all_orders_commission
+                logging.info(f"💰 All-time commission from agent_orders: {all_total_commission:.2f} ({all_orders_count} orders)")
             
             available_balance = all_total_commission - withdrawn_amount
         else:
