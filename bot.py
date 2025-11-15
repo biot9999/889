@@ -10810,12 +10810,6 @@ def handle_all_callbacks(update: Update, context: CallbackContext):
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
 
-    # ========== 其他按钮的回调 ==========
-    elif query.data.startswith(("create_agent_bot_guide", "agent_user_management", 
-                                "agent_balance_management", "check_agent_token", 
-                                "show_agent_info", "back_admin")):
-        query.answer("此功能已移除")
-
     # ========== 关闭按钮 ==========
     elif query.data.startswith("close "):
         user_id_to_close = query.data.split(" ")[1]
@@ -14185,59 +14179,7 @@ def update_agent_bot_user_balance(agent_bot_id, user_id, amount_change):
         import traceback
         traceback.print_exc()
         return False
-def get_agent_bot_user_collection(agent_bot_id):
-    """获取代理机器人的用户集合"""
-    try:
-        print(f"🔍 收到的agent_bot_id: {agent_bot_id}")
-        
-        # 🔧 统一处理ID格式，确保使用正确的集合名
-        clean_agent_bot_id = agent_bot_id
-        
-        # 移除 agent_ 前缀（如果有）
-        if agent_bot_id.startswith('agent_'):
-            clean_agent_bot_id = agent_bot_id.replace('agent_', '', 1)
-            print(f"🔍 清理后的agent_bot_id: {clean_agent_bot_id}")
-        
-        # 🎯 华南代理特殊处理
-        if clean_agent_bot_id == "62448807124351dfe5cc48d4":
-            print(f"🎯 处理华南代理用户集合")
-            
-            # 华南代理的实际集合名称（基于之前的日志确认）
-            collection_name = f"agent_users_{clean_agent_bot_id}"
-            print(f"🔍 尝试集合: {collection_name}")
-            
-            try:
-                all_collections = bot_db.list_collection_names()
-                print(f"🔍 数据库中总集合数: {len(all_collections)}")
-                
-                if collection_name in all_collections:
-                    collection = bot_db[collection_name]
-                    count = collection.count_documents({})
-                    print(f"✅ 找到用户集合: {collection_name} ({count} 个用户)")
-                    return collection
-                else:
-                    print(f"❌ 集合不存在: {collection_name}")
-                    return None
-                    
-            except Exception as db_error:
-                print(f"❌ 数据库操作失败: {db_error}")
-                return None
-        
-        # 其他代理使用标准格式
-        collection_name = f"agent_users_{clean_agent_bot_id}"
-        try:
-            if collection_name in bot_db.list_collection_names():
-                return bot_db[collection_name]
-        except:
-            pass
-        
-        print(f"❌ 未找到集合: {collection_name}")
-        return None
-        
-    except Exception as e:
-        print(f"❌ 获取代理用户集合失败: {e}")
-        return None
-        
+
 def shouyishuoming_callback(update: Update, context: CallbackContext):
     query = update.callback_query
     try:
@@ -14485,27 +14427,29 @@ def main():
     # 这样底部按钮（商品列表、个人中心等）才能正常响应
     dispatcher.add_handler(MessageHandler(Filters.chat_type.private & Filters.reply, huifu), )
     
-    # 🔧 代理机器人创建向导文本处理器 - 必须在textkeyboard之前注册
-    # 这样向导激活时能优先处理文本输入，不被textkeyboard拦截
-    dispatcher.add_handler(MessageHandler(Filters.private & Filters.text & ~Filters.command, handle_agent_create_text, run_async=True))
-    
-    # ✅ 主要的消息处理器 - 处理底部按钮和所有用户交互（最高优先级）
+    # ✅ 主要的消息处理器 - 处理底部按钮和所有用户交互（组0 - 最高优先级）
+    # 这个必须首先注册，确保底部菜单按钮（🛒商品列表等）能正常工作
     dispatcher.add_handler(MessageHandler(
         (Filters.text | Filters.photo | Filters.animation | Filters.video | Filters.document) & ~(Filters.command),
-        textkeyboard, run_async=True))
+        textkeyboard, run_async=True), group=0)
     
-    # 🆕 用户提现TXID提交处理器（在textkeyboard之后，但由于textkeyboard的run_async，可能并行执行）
-    # 这个处理器在textkeyboard没有处理消息时才会触发
-    # 注意：这个处理器的early return（line 10676）确保只在用户处于等待TXID状态时才处理
+    # 🔧 代理机器人创建向导文本处理器（组1）
+    # 在组1中注册，这样textkeyboard处理后才会检查这个处理器
+    # 内部会检查向导状态，只在向导激活时处理消息
+    dispatcher.add_handler(MessageHandler(Filters.private & Filters.text & ~Filters.command, handle_agent_create_text, run_async=True), group=1)
+    
+    # 🆕 用户提现TXID提交处理器（组1）
+    # 这个处理器在textkeyboard处理后触发
+    # 注意：这个处理器的early return确保只在用户处于等待TXID状态时才处理
     dispatcher.add_handler(MessageHandler(
         Filters.text & ~Filters.command & Filters.private,
         handle_user_withdrawal_txid,
         run_async=True
-    ))
+    ), group=1)
     
-    # handle_admin_txhash_message 放在最后，用于处理管理员输入交易哈希
+    # handle_admin_txhash_message 放在组1，用于处理管理员输入交易哈希
     # ✅ 添加 Filters.private 使 filter 更精确，只处理私聊消息  
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command & Filters.private, handle_admin_txhash_message, run_async=True))
+    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command & Filters.private, handle_admin_txhash_message, run_async=True), group=1)
     updater.job_queue.run_repeating(suoyouchengxu, 1, 1, name='suoyouchengxu')
     updater.job_queue.run_repeating(jiexi, 3, 1, name='chongzhi')
     updater.start_polling(timeout=BOT_TIMEOUT)
