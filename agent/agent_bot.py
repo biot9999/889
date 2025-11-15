@@ -154,7 +154,9 @@ class AgentBotConfig:
         self.RESTOCK_KEYWORDS = [k.strip() for k in os.getenv("RESTOCK_KEYWORDS", default_keywords).split(",") if k.strip()]
         
         # ✅ 补货通知按钮重写开关（默认关闭，提高安全性）
-        self.RESTOCK_REWRITE_BUTTONS = os.getenv("RESTOCK_REWRITE_BUTTONS", "0") in ("1", "true", "True")
+        # 支持两个环境变量名：HQ_RESTOCK_REWRITE_BUTTONS（新）和 RESTOCK_REWRITE_BUTTONS（旧，兼容性）
+        button_rewrite_flag = os.getenv("HQ_RESTOCK_REWRITE_BUTTONS") or os.getenv("RESTOCK_REWRITE_BUTTONS", "0")
+        self.HQ_RESTOCK_REWRITE_BUTTONS = button_rewrite_flag in ("1", "true", "True")
 
         # 取消订单后是否删除原消息 (默认删除)
         self.RECHARGE_DELETE_ON_CANCEL = os.getenv("RECHARGE_DELETE_ON_CANCEL", "1") in ("1", "true", "True")
@@ -3486,70 +3488,127 @@ class AgentBotHandlers:
             
             logger.info(f"🔔 检测到补货通知（关键词: {matched_keyword}）: {message_text[:50]}...")
             
-            # 尝试使用 copy_message 转发消息
             target_chat_id = self.core.config.AGENT_RESTOCK_NOTIFY_CHAT_ID
             
-            try:
-                # 优先使用 copy_message（保留原始格式）
-                result = context.bot.copy_message(
-                    chat_id=target_chat_id,
-                    from_chat_id=chat_id,
-                    message_id=message.message_id
-                )
-                
-                logger.info(f"✅ 补货通知已镜像到 {target_chat_id} (message_id: {result.message_id})")
-                
-                # 如果启用按钮重写，在原消息下方发送带有新按钮的消息
-                if self.core.config.RESTOCK_REWRITE_BUTTONS and message.reply_markup:
-                    self._send_rewritten_buttons(context, target_chat_id, result.message_id)
-                
-                return
-                
-            except Exception as copy_err:
-                logger.warning(f"⚠️ copy_message 失败（可能是权限问题）: {copy_err}")
-                logger.info("🔄 尝试使用 send_message 回退方案...")
+            # ✅ 决定是否重写按钮
+            enable_button_rewrite = self.core.config.HQ_RESTOCK_REWRITE_BUTTONS
             
-            # 回退方案：使用 send_message
-            try:
-                # 根据消息类型选择不同的发送方法
-                if message.photo:
-                    # 带图片的消息
-                    photo = message.photo[-1]  # 取最大尺寸
-                    context.bot.send_photo(
-                        chat_id=target_chat_id,
-                        photo=photo.file_id,
-                        caption=message_text or None,
-                        parse_mode=ParseMode.HTML if message_text else None
-                    )
-                elif message.video:
-                    # 带视频的消息
-                    context.bot.send_video(
-                        chat_id=target_chat_id,
-                        video=message.video.file_id,
-                        caption=message_text or None,
-                        parse_mode=ParseMode.HTML if message_text else None
-                    )
-                elif message.document:
-                    # 带文档的消息
-                    context.bot.send_document(
-                        chat_id=target_chat_id,
-                        document=message.document.file_id,
-                        caption=message_text or None,
-                        parse_mode=ParseMode.HTML if message_text else None
-                    )
-                else:
-                    # 纯文本消息
-                    if message_text:
-                        context.bot.send_message(
+            if enable_button_rewrite:
+                logger.info("🔄 按钮重写已启用，将发送带重写按钮的新消息")
+                # 当启用按钮重写时，发送新消息而不是使用 copy_message
+                try:
+                    # 获取机器人用户名用于构建按钮URL
+                    bot_info = context.bot.get_me()
+                    bot_username = bot_info.username
+                    
+                    # 构建重写后的按钮
+                    keyboard = [[
+                        InlineKeyboardButton("🛒 购买商品", url=f"https://t.me/{bot_username}")
+                    ]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    # 根据消息类型发送带有重写按钮的新消息
+                    if message.photo:
+                        photo = message.photo[-1]  # 取最大尺寸
+                        result = context.bot.send_photo(
                             chat_id=target_chat_id,
-                            text=message_text,
-                            parse_mode=ParseMode.HTML
+                            photo=photo.file_id,
+                            caption=message_text or None,
+                            parse_mode=ParseMode.HTML if message_text else None,
+                            reply_markup=reply_markup
                         )
+                        logger.info(f"✅ 补货通知(图片+重写按钮)已发送到 {target_chat_id} (message_id: {result.message_id})")
+                    elif message.video:
+                        result = context.bot.send_video(
+                            chat_id=target_chat_id,
+                            video=message.video.file_id,
+                            caption=message_text or None,
+                            parse_mode=ParseMode.HTML if message_text else None,
+                            reply_markup=reply_markup
+                        )
+                        logger.info(f"✅ 补货通知(视频+重写按钮)已发送到 {target_chat_id} (message_id: {result.message_id})")
+                    elif message.document:
+                        result = context.bot.send_document(
+                            chat_id=target_chat_id,
+                            document=message.document.file_id,
+                            caption=message_text or None,
+                            parse_mode=ParseMode.HTML if message_text else None,
+                            reply_markup=reply_markup
+                        )
+                        logger.info(f"✅ 补货通知(文档+重写按钮)已发送到 {target_chat_id} (message_id: {result.message_id})")
+                    else:
+                        # 纯文本消息
+                        if message_text:
+                            result = context.bot.send_message(
+                                chat_id=target_chat_id,
+                                text=message_text,
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=reply_markup
+                            )
+                            logger.info(f"✅ 补货通知(文本+重写按钮)已发送到 {target_chat_id} (message_id: {result.message_id})")
+                        else:
+                            logger.warning("⚠️ 消息无文本内容，跳过发送")
+                    
+                    return
+                    
+                except Exception as rewrite_err:
+                    logger.error(f"❌ 发送带重写按钮的消息失败: {rewrite_err}")
+                    traceback.print_exc()
+                    return
+            
+            else:
+                logger.info("📋 按钮重写未启用，使用 copy_message 转发原始消息")
+                # 当未启用按钮重写时，使用 copy_message 保留原样
+                try:
+                    result = context.bot.copy_message(
+                        chat_id=target_chat_id,
+                        from_chat_id=chat_id,
+                        message_id=message.message_id
+                    )
+                    
+                    logger.info(f"✅ 补货通知已原样镜像到 {target_chat_id} (message_id: {result.message_id})")
+                    return
+                    
+                except Exception as copy_err:
+                    logger.warning(f"⚠️ copy_message 失败（可能是权限问题）: {copy_err}")
+                    logger.info("🔄 尝试使用 send_message 回退方案...")
                 
-                logger.info(f"✅ 补货通知已通过回退方案发送到 {target_chat_id}")
-                
-            except Exception as send_err:
-                logger.error(f"❌ 回退方案也失败: {send_err}")
+                # 回退方案：使用 send_message（无按钮重写）
+                try:
+                    if message.photo:
+                        photo = message.photo[-1]  # 取最大尺寸
+                        context.bot.send_photo(
+                            chat_id=target_chat_id,
+                            photo=photo.file_id,
+                            caption=message_text or None,
+                            parse_mode=ParseMode.HTML if message_text else None
+                        )
+                    elif message.video:
+                        context.bot.send_video(
+                            chat_id=target_chat_id,
+                            video=message.video.file_id,
+                            caption=message_text or None,
+                            parse_mode=ParseMode.HTML if message_text else None
+                        )
+                    elif message.document:
+                        context.bot.send_document(
+                            chat_id=target_chat_id,
+                            document=message.document.file_id,
+                            caption=message_text or None,
+                            parse_mode=ParseMode.HTML if message_text else None
+                        )
+                    else:
+                        if message_text:
+                            context.bot.send_message(
+                                chat_id=target_chat_id,
+                                text=message_text,
+                                parse_mode=ParseMode.HTML
+                            )
+                    
+                    logger.info(f"✅ 补货通知已通过回退方案发送到 {target_chat_id}")
+                    
+                except Exception as send_err:
+                    logger.error(f"❌ 回退方案也失败: {send_err}")
         
         except Exception as e:
             logger.error(f"❌ 处理总部消息异常: {e}")
