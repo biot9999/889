@@ -65,7 +65,7 @@ class MultiBotDistributionSystem:
         print(f"🔍 权限检查: 用户ID {user_id}, 管理员IDs: {self.master_admin_ids}")
         return user_id == 5991190607
     
-    def create_agent_bot(self, agent_name, agent_token, agent_username, creator_id, commission_rate=15):
+    def create_agent_bot(self, agent_name, agent_token, agent_username, creator_id, commission_rate=0.3):
         """创建代理机器人"""
         try:
             # 验证Token格式（基本检查）
@@ -100,11 +100,11 @@ class MultiBotDistributionSystem:
             if not success:
                 return False, "数据库创建失败"
             
-            # 为代理克隆所有商品价格设置
-            cloned_count = self.clone_products_for_agent(agent_bot_id)
+            # 为代理克隆所有商品价格设置，传入利润加价
+            cloned_count = self.clone_products_for_agent(agent_bot_id, profit_margin=commission_rate)
             
             print(f"✅ 代理机器人创建成功: {agent_name} (@{agent_username}) - ID: {agent_bot_id}")
-            print(f"✅ 已克隆 {cloned_count} 个商品价格设置")
+            print(f"✅ 已克隆 {cloned_count} 个商品价格设置，利润加价: +{commission_rate}")
             
             return True, {
                 'agent_bot_id': agent_bot_id,
@@ -117,7 +117,7 @@ class MultiBotDistributionSystem:
             print(f"❌ 创建代理机器人异常: {e}")
             return False, f"创建失败: {str(e)}"
     
-    def clone_products_for_agent(self, agent_bot_id):
+    def clone_products_for_agent(self, agent_bot_id, profit_margin=0.3):
         """为代理克隆所有商品价格设置"""
         try:
             cloned_count = 0
@@ -125,7 +125,8 @@ class MultiBotDistributionSystem:
             # 获取所有总部商品
             for product in ejfl.find():
                 original_price = float(product.get('money', 0))
-                suggested_price = round(original_price * 1.2, 2)  # 默认加价20%
+                # 使用固定利润加价而不是百分比
+                suggested_price = round(original_price + profit_margin, 2)
                 
                 success = create_agent_product_price_data(
                     agent_bot_id=agent_bot_id,
@@ -11267,7 +11268,7 @@ def agent_bot_management(update: Update, context: CallbackContext):
     """.strip()
     
     keyboard = [
-        [InlineKeyboardButton("➕ 创建代理机器人", callback_data='create_agent_bot'),
+        [InlineKeyboardButton("➕ 创建代理机器人", callback_data='agent_create_start'),
          InlineKeyboardButton("👥 代理机器人列表", callback_data='agent_bot_list')],
         [InlineKeyboardButton("💸 提现管理", callback_data='agent_withdrawal_manage'),
          InlineKeyboardButton("📊 系统报表", callback_data='agent_system_report')],
@@ -11345,6 +11346,474 @@ def create_agent_bot_guide(update: Update, context: CallbackContext):
         parse_mode='HTML',
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
+# ================================ 代理机器人创建向导 ================================
+
+# Wizard state constants
+WIZARD_STATE_KEY = 'agent_wizard_state'
+WIZARD_DATA_KEY = 'agent_wizard_data'
+
+# Wizard steps
+WIZARD_STEP_TOKEN = 'token'
+WIZARD_STEP_USERNAME = 'username'
+WIZARD_STEP_NAME = 'name'
+WIZARD_STEP_COMMISSION = 'commission'
+WIZARD_STEP_CONFIRM = 'confirm'
+
+def get_cancel_keyboard(user_id):
+    """获取取消按钮键盘"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ 取消创建", callback_data='agent_create_cancel')]
+    ])
+
+def get_commission_keyboard(user_id):
+    """获取利润加价键盘"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("+0.1", callback_data='agent_create_commission:0.1'),
+         InlineKeyboardButton("+0.2", callback_data='agent_create_commission:0.2')],
+        [InlineKeyboardButton("+0.3 (推荐)", callback_data='agent_create_commission:0.3'),
+         InlineKeyboardButton("+0.5", callback_data='agent_create_commission:0.5')],
+        [InlineKeyboardButton("+1.0", callback_data='agent_create_commission:1.0'),
+         InlineKeyboardButton("自定义", callback_data='agent_create_commission:custom')],
+        [InlineKeyboardButton("❌ 取消创建", callback_data='agent_create_cancel')]
+    ])
+
+def get_confirm_keyboard(user_id):
+    """获取确认键盘"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ 确认创建", callback_data='agent_create_confirm')],
+        [InlineKeyboardButton("❌ 取消创建", callback_data='agent_create_cancel')]
+    ])
+
+def start_agent_create_callback(update: Update, context: CallbackContext):
+    """开始创建代理机器人向导"""
+    query = update.callback_query
+    query.answer()
+    user_id = query.from_user.id
+    
+    # 检查权限
+    if not multi_bot_system.is_master_admin(user_id):
+        query.edit_message_text("❌ 您没有权限访问此功能")
+        return
+    
+    # 初始化向导状态
+    context.user_data[WIZARD_STATE_KEY] = WIZARD_STEP_TOKEN
+    context.user_data[WIZARD_DATA_KEY] = {}
+    
+    text = """
+➕ <b>创建代理机器人 - 步骤 1/4</b>
+
+📋 <b>请输入机器人Token</b>
+
+从 @BotFather 获取的完整Token
+格式示例：<code>123456789:ABC-DEFghijklmnop_qrstuvwxyz</code>
+
+⚠️ <b>注意事项：</b>
+• Token格式必须正确（包含冒号）
+• Token长度至少40个字符
+• Token不能与现有代理重复
+
+请直接回复Token内容（文本消息）
+    """.strip()
+    
+    query.edit_message_text(
+        text=text,
+        parse_mode='HTML',
+        reply_markup=get_cancel_keyboard(user_id)
+    )
+
+def handle_agent_create_text(update: Update, context: CallbackContext):
+    """处理向导中的文本输入"""
+    # 只在私聊且向导激活时处理
+    if update.message.chat.type != 'private':
+        return
+    
+    # 检查向导是否激活
+    if WIZARD_STATE_KEY not in context.user_data:
+        return
+    
+    user_id = update.effective_user.id
+    
+    # 检查权限
+    if not multi_bot_system.is_master_admin(user_id):
+        return
+    
+    current_step = context.user_data[WIZARD_STATE_KEY]
+    wizard_data = context.user_data[WIZARD_DATA_KEY]
+    text = update.message.text.strip()
+    
+    if current_step == WIZARD_STEP_TOKEN:
+        # 处理Token输入
+        token_valid, token_msg = multi_bot_system.validate_bot_token(text)
+        if not token_valid:
+            update.message.reply_text(
+                f"❌ Token验证失败：{token_msg}\n\n请重新输入有效的Token：",
+                reply_markup=get_cancel_keyboard(user_id)
+            )
+            return
+        
+        # Token验证通过
+        wizard_data['token'] = text
+        context.user_data[WIZARD_STATE_KEY] = WIZARD_STEP_USERNAME
+        
+        update.message.reply_text(
+            """
+➕ <b>创建代理机器人 - 步骤 2/4</b>
+
+📋 <b>请输入机器人用户名</b>
+
+用户名示例：<code>my_agent_bot</code> 或 <code>@my_agent_bot</code>
+
+⚠️ <b>注意事项：</b>
+• 不需要包含 @ 符号（会自动添加）
+• 用户名必须唯一
+• 只能包含字母、数字和下划线
+
+请直接回复用户名（文本消息）
+            """.strip(),
+            parse_mode='HTML',
+            reply_markup=get_cancel_keyboard(user_id)
+        )
+    
+    elif current_step == WIZARD_STEP_USERNAME:
+        # 处理用户名输入
+        # 标准化用户名（移除@）
+        username = text.lstrip('@')
+        
+        # 基本验证
+        if not username or len(username) < 3:
+            update.message.reply_text(
+                "❌ 用户名太短，至少需要3个字符\n\n请重新输入：",
+                reply_markup=get_cancel_keyboard(user_id)
+            )
+            return
+        
+        if not re.match(r'^[a-zA-Z0-9_]+$', username):
+            update.message.reply_text(
+                "❌ 用户名只能包含字母、数字和下划线\n\n请重新输入：",
+                reply_markup=get_cancel_keyboard(user_id)
+            )
+            return
+        
+        # 检查用户名是否已存在
+        existing_username = agent_bots.find_one({'agent_username': username})
+        if existing_username:
+            update.message.reply_text(
+                f"❌ 用户名 @{username} 已被使用\n\n请输入其他用户名：",
+                reply_markup=get_cancel_keyboard(user_id)
+            )
+            return
+        
+        # 用户名验证通过
+        wizard_data['username'] = username
+        context.user_data[WIZARD_STATE_KEY] = WIZARD_STEP_NAME
+        
+        update.message.reply_text(
+            """
+➕ <b>创建代理机器人 - 步骤 3/4</b>
+
+📋 <b>请输入代理显示名称</b>
+
+显示名称示例：<code>华南代理</code>、<code>北京分销商</code>
+
+⚠️ <b>注意事项：</b>
+• 最多30个字符
+• 用于识别代理商身份
+• 可以包含中文、字母、数字
+
+请直接回复显示名称（文本消息）
+            """.strip(),
+            parse_mode='HTML',
+            reply_markup=get_cancel_keyboard(user_id)
+        )
+    
+    elif current_step == WIZARD_STEP_NAME:
+        # 处理名称输入
+        if len(text) > 30:
+            update.message.reply_text(
+                "❌ 显示名称不能超过30个字符\n\n请重新输入：",
+                reply_markup=get_cancel_keyboard(user_id)
+            )
+            return
+        
+        if len(text) < 2:
+            update.message.reply_text(
+                "❌ 显示名称至少需要2个字符\n\n请重新输入：",
+                reply_markup=get_cancel_keyboard(user_id)
+            )
+            return
+        
+        # 名称验证通过
+        wizard_data['name'] = text
+        context.user_data[WIZARD_STATE_KEY] = WIZARD_STEP_COMMISSION
+        
+        update.message.reply_text(
+            """
+➕ <b>创建代理机器人 - 步骤 4/4</b>
+
+📋 <b>请选择利润加价</b>
+
+代理商品价格 = 总部价格 + 利润加价
+
+例如：
+• 选择 +0.2：所有商品比总部价格多 0.2
+• 选择 +0.5：所有商品比总部价格多 0.5
+
+💡 <b>推荐：</b>+0.3 - 平衡收益与竞争力
+            """.strip(),
+            parse_mode='HTML',
+            reply_markup=get_commission_keyboard(user_id)
+        )
+    
+    elif current_step == 'commission_custom':
+        # 处理自定义利润加价输入
+        try:
+            commission = float(text)
+            if commission < 0 or commission > 100:
+                update.message.reply_text(
+                    "❌ 利润加价必须在0-100之间\n\n请重新输入：",
+                    reply_markup=get_cancel_keyboard(user_id)
+                )
+                return
+            
+            wizard_data['commission'] = commission
+            context.user_data[WIZARD_STATE_KEY] = WIZARD_STEP_CONFIRM
+            
+            # 显示确认信息
+            confirm_text = f"""
+✅ <b>请确认代理机器人信息</b>
+
+📋 <b>代理信息：</b>
+├─ 机器人Token：<code>{wizard_data['token'][:20]}...{wizard_data['token'][-10:]}</code>
+├─ 机器人用户名：@{wizard_data['username']}
+├─ 显示名称：<code>{wizard_data['name']}</code>
+└─ 利润加价：<code>+{wizard_data['commission']}</code>
+
+🛍️ <b>初始化设置：</b>
+├─ 将自动克隆所有商品
+├─ 代理价格 = 总部价格 + {wizard_data['commission']}
+└─ 状态：自动启用
+
+请确认以上信息是否正确
+            """.strip()
+            
+            update.message.reply_text(
+                confirm_text,
+                parse_mode='HTML',
+                reply_markup=get_confirm_keyboard(user_id)
+            )
+        except ValueError:
+            update.message.reply_text(
+                "❌ 请输入有效的数字\n\n请重新输入利润加价：",
+                reply_markup=get_cancel_keyboard(user_id)
+            )
+
+def set_commission_callback(update: Update, context: CallbackContext):
+    """处理佣金选择回调"""
+    query = update.callback_query
+    query.answer()
+    user_id = query.from_user.id
+    
+    # 检查权限
+    if not multi_bot_system.is_master_admin(user_id):
+        query.edit_message_text("❌ 权限错误")
+        return
+    
+    # 检查向导是否激活
+    if WIZARD_STATE_KEY not in context.user_data:
+        query.edit_message_text("❌ 向导已过期，请重新开始")
+        return
+    
+    # 提取佣金值
+    commission_value = query.data.split(':')[1]
+    wizard_data = context.user_data[WIZARD_DATA_KEY]
+    
+    if commission_value == 'custom':
+        # 切换到自定义输入模式
+        context.user_data[WIZARD_STATE_KEY] = 'commission_custom'
+        query.edit_message_text(
+            """
+➕ <b>创建代理机器人 - 自定义利润加价</b>
+
+📋 <b>请输入自定义利润加价</b>
+
+输入0-100之间的数字
+例如：<code>0.8</code> 表示所有商品比总部价格多 0.8
+
+请直接回复数字（文本消息）
+            """.strip(),
+            parse_mode='HTML',
+            reply_markup=get_cancel_keyboard(user_id)
+        )
+    else:
+        # 使用预设利润加价
+        commission = float(commission_value)
+        wizard_data['commission'] = commission
+        context.user_data[WIZARD_STATE_KEY] = WIZARD_STEP_CONFIRM
+        
+        # 显示确认信息
+        confirm_text = f"""
+✅ <b>请确认代理机器人信息</b>
+
+📋 <b>代理信息：</b>
+├─ 机器人Token：<code>{wizard_data['token'][:20]}...{wizard_data['token'][-10:]}</code>
+├─ 机器人用户名：@{wizard_data['username']}
+├─ 显示名称：<code>{wizard_data['name']}</code>
+└─ 利润加价：<code>+{wizard_data['commission']}</code>
+
+🛍️ <b>初始化设置：</b>
+├─ 将自动克隆所有商品
+├─ 代理价格 = 总部价格 + {wizard_data['commission']}
+└─ 状态：自动启用
+
+请确认以上信息是否正确
+        """.strip()
+        
+        query.edit_message_text(
+            confirm_text,
+            parse_mode='HTML',
+            reply_markup=get_confirm_keyboard(user_id)
+        )
+
+def confirm_agent_create_callback(update: Update, context: CallbackContext):
+    """确认创建代理机器人"""
+    query = update.callback_query
+    query.answer()
+    user_id = query.from_user.id
+    
+    # 检查权限
+    if not multi_bot_system.is_master_admin(user_id):
+        query.edit_message_text("❌ 权限错误")
+        return
+    
+    # 检查向导是否激活
+    if WIZARD_STATE_KEY not in context.user_data:
+        query.edit_message_text("❌ 向导已过期，请重新开始")
+        return
+    
+    wizard_data = context.user_data[WIZARD_DATA_KEY]
+    
+    # 显示处理中消息
+    query.edit_message_text("🔄 正在创建代理机器人，请稍候...")
+    
+    try:
+        # 创建代理机器人
+        success, result = multi_bot_system.create_agent_bot(
+            agent_name=wizard_data['name'],
+            agent_token=wizard_data['token'],
+            agent_username=wizard_data['username'],
+            creator_id=user_id,
+            commission_rate=wizard_data['commission']
+        )
+        
+        if success:
+            # 创建成功
+            agent_bot_id = result['agent_bot_id']
+            cloned_products = result['cloned_products']
+            
+            # 发送成功通知给AGENT_NOTIFY_CHAT_ID
+            if AGENT_NOTIFY_CHAT_ID:
+                try:
+                    notify_text = f"""
+✅ <b>新代理创建成功</b>
+
+📋 <b>代理信息：</b>
+├─ 名称：{wizard_data['name']}
+├─ 用户名：@{wizard_data['username']}
+├─ ID：<code>{agent_bot_id}</code>
+└─ 利润加价：+{wizard_data['commission']}
+
+⏰ 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                    """.strip()
+                    
+                    context.bot.send_message(
+                        chat_id=AGENT_NOTIFY_CHAT_ID,
+                        text=notify_text,
+                        parse_mode='HTML'
+                    )
+                except Exception as e:
+                    print(f"❌ 发送通知失败: {e}")
+            
+            success_text = f"""
+✅ <b>代理机器人创建成功！</b>
+
+📋 <b>代理信息：</b>
+├─ 代理名称：<code>{wizard_data['name']}</code>
+├─ 机器人ID：<code>{agent_bot_id}</code>
+├─ 机器人用户名：@{wizard_data['username']}
+├─ 利润加价：<code>+{wizard_data['commission']}</code>
+└─ 创建时间：<code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
+
+🛍️ <b>商品配置：</b>
+├─ 已克隆商品：<code>{cloned_products}</code> 个
+├─ 代理价格：<code>总部价格 + {wizard_data['commission']}</code>
+├─ 状态：<code>✅ 已启用</code>
+└─ 库存：<code>🔄 实时同步</code>
+
+🚀 <b>下一步：</b>
+• 代理机器人已自动配置完成
+• 所有商品已设置默认价格
+• 代理可以独立调整商品价格
+• 客户可以开始使用代理机器人
+
+💡 <b>代理机器人Token：</b>
+<code>{wizard_data['token']}</code>
+
+⚠️ 请妥善保管Token，代理需要用此Token运行机器人
+            """.strip()
+            
+            keyboard = [[
+                InlineKeyboardButton("👥 查看代理列表", callback_data='agent_bot_list'),
+                InlineKeyboardButton("🔙 返回管理", callback_data='agent_bot_management')
+            ]]
+            
+            query.edit_message_text(
+                success_text,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        else:
+            # 创建失败
+            query.edit_message_text(
+                f"❌ 创建失败：{result}\n\n请检查参数后重试",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 返回管理", callback_data='agent_bot_management')
+                ]])
+            )
+    
+    except Exception as e:
+        print(f"❌ 创建代理机器人异常: {e}")
+        query.edit_message_text(
+            f"❌ 创建失败：{str(e)}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 返回管理", callback_data='agent_bot_management')
+            ]])
+        )
+    
+    finally:
+        # 清理向导状态
+        context.user_data.pop(WIZARD_STATE_KEY, None)
+        context.user_data.pop(WIZARD_DATA_KEY, None)
+
+def cancel_agent_create_callback(update: Update, context: CallbackContext):
+    """取消创建代理机器人向导"""
+    query = update.callback_query
+    query.answer()
+    user_id = query.from_user.id
+    
+    # 清理向导状态
+    context.user_data.pop(WIZARD_STATE_KEY, None)
+    context.user_data.pop(WIZARD_DATA_KEY, None)
+    
+    query.edit_message_text(
+        "❌ 已取消创建代理机器人",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 返回管理", callback_data='agent_bot_management')
+        ]])
+    )
+
+# ================================ 结束向导部分 ================================
 
 def handle_create_agent_bot_command(update: Update, context: CallbackContext):
     """处理创建代理机器人命令"""
@@ -13291,6 +13760,13 @@ def main():
     dispatcher.add_handler(CallbackQueryHandler(agent_bot_management, pattern='^agent_bot_management$'))
     dispatcher.add_handler(CallbackQueryHandler(create_agent_bot_guide, pattern='^create_agent_bot$'))
     dispatcher.add_handler(CallbackQueryHandler(agent_bot_list, pattern='^agent_bot_list$'))
+    
+    # 代理机器人创建向导处理器
+    dispatcher.add_handler(CallbackQueryHandler(start_agent_create_callback, pattern=r'^agent_create_start$'))
+    dispatcher.add_handler(CallbackQueryHandler(set_commission_callback, pattern=r'^agent_create_commission:(.+)$'))
+    dispatcher.add_handler(CallbackQueryHandler(confirm_agent_create_callback, pattern=r'^agent_create_confirm$'))
+    dispatcher.add_handler(CallbackQueryHandler(cancel_agent_create_callback, pattern=r'^agent_create_cancel$'))
+    
     # 在dispatcher.add_handler部分添加：
     dispatcher.add_handler(CommandHandler("check_tokens", check_agent_token))
     # dispatcher.add_error_handler(error_callback)
@@ -13444,6 +13920,9 @@ def main():
         handle_user_withdrawal_txid,
         run_async=True
     ))
+    
+    # 代理机器人创建向导文本处理器 - 必须在一般文本处理器之前
+    dispatcher.add_handler(MessageHandler(Filters.private & Filters.text & ~Filters.command, handle_agent_create_text, run_async=True))
     
     # handle_admin_txhash_message 放在最后，用于处理管理员输入交易哈希
     # ✅ 添加 Filters.private 使 filter 更精确，只处理私聊消息  
