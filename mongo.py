@@ -655,6 +655,20 @@ def create_agent_withdrawal_data(withdrawal_id, agent_bot_id, amount, payment_me
 
 # ================================ 代理机器人独立用户系统函数 ================================
 
+def normalize_agent_bot_id(agent_bot_id):
+    """
+    规范化agent_bot_id，确保始终保留"agent_"前缀
+    例如: 
+    - "62448807124351dfe5cc48d4" -> "agent_62448807124351dfe5cc48d4"
+    - "agent_62448807124351dfe5cc48d4" -> "agent_62448807124351dfe5cc48d4"
+    """
+    if not agent_bot_id:
+        return agent_bot_id
+    agent_bot_id = str(agent_bot_id).strip()
+    if agent_bot_id.startswith('agent_'):
+        return agent_bot_id
+    return f"agent_{agent_bot_id}"
+
 def _get_agent_id_suffix(agent_bot_id):
     """
     从完整的agent_bot_id中提取ID后缀
@@ -665,10 +679,20 @@ def _get_agent_id_suffix(agent_bot_id):
         return agent_bot_id[6:]  # 去掉 'agent_' 前缀
     return agent_bot_id
 
+def agent_users_collection_name(agent_bot_id):
+    """
+    获取代理用户集合的标准名称
+    统一格式: agent_users_{id_without_prefix}
+    """
+    id_suffix = _get_agent_id_suffix(agent_bot_id)
+    return f"agent_users_{id_suffix}"
+
 def get_agent_bot_user_collection(agent_bot_id):
     """获取代理机器人的独立用户集合"""
+    agent_bot_id = normalize_agent_bot_id(agent_bot_id)
     id_suffix = _get_agent_id_suffix(agent_bot_id)
     collection_name = f"agent_users_{id_suffix}"
+    logging.info(f"🔍 获取用户集合: agent_bot_id={agent_bot_id}, collection={collection_name}")
     return db_manager.bot_db[collection_name]
 
 def get_agent_bot_topup_collection(agent_bot_id):
@@ -686,6 +710,7 @@ def get_agent_bot_gmjlu_collection(agent_bot_id):
 def create_agent_user_data(agent_bot_id, user_id, username, fullname, creation_time):
     """在代理机器人中创建独立用户"""
     try:
+        agent_bot_id = normalize_agent_bot_id(agent_bot_id)
         agent_users = get_agent_bot_user_collection(agent_bot_id)
         
         # 获取该代理机器人的最大count_id
@@ -717,15 +742,58 @@ def create_agent_user_data(agent_bot_id, user_id, username, fullname, creation_t
 def get_agent_bot_user(agent_bot_id, user_id):
     """获取代理机器人用户信息"""
     try:
+        agent_bot_id = normalize_agent_bot_id(agent_bot_id)
         agent_users = get_agent_bot_user_collection(agent_bot_id)
         return agent_users.find_one({'user_id': user_id})
     except Exception as e:
         logging.error(f"❌ 获取代理用户失败：{e}")
         return None
 
+def ensure_agent_user_exists(agent_bot_id, user_id, username=None, fullname=None):
+    """
+    确保代理用户存在，如果不存在则自动创建
+    这是一个兜底函数，用于防止用户不存在导致的错误
+    """
+    try:
+        agent_bot_id = normalize_agent_bot_id(agent_bot_id)
+        agent_user = get_agent_bot_user(agent_bot_id, user_id)
+        
+        if agent_user:
+            return True, agent_user
+        
+        # 用户不存在，创建新用户
+        creation_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        success, count_id = create_agent_user_data(
+            agent_bot_id=agent_bot_id,
+            user_id=user_id,
+            username=username or 'unknown',
+            fullname=fullname or 'Unknown User',
+            creation_time=creation_time
+        )
+        
+        if success:
+            agent_user = get_agent_bot_user(agent_bot_id, user_id)
+            logging.info(f"✅ 自动创建代理用户：agent_bot_id={agent_bot_id}, user_id={user_id}")
+            return True, agent_user
+        else:
+            logging.error(f"❌ 自动创建代理用户失败：agent_bot_id={agent_bot_id}, user_id={user_id}")
+            return False, None
+            
+    except Exception as e:
+        logging.error(f"❌ 确保代理用户存在失败：{e}")
+        return False, None
+
 def update_agent_bot_user_balance(agent_bot_id, user_id, amount, balance_type='USDT'):
     """更新代理机器人用户余额（独立系统）"""
     try:
+        agent_bot_id = normalize_agent_bot_id(agent_bot_id)
+        
+        # 确保用户存在
+        exists, agent_user = ensure_agent_user_exists(agent_bot_id, user_id)
+        if not exists or not agent_user:
+            logging.error(f"❌ 用户不存在且创建失败：agent_bot_id={agent_bot_id}, user_id={user_id}")
+            return False
+        
         agent_users = get_agent_bot_user_collection(agent_bot_id)
         result = agent_users.update_one(
             {'user_id': user_id},

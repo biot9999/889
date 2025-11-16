@@ -46,7 +46,8 @@ from mongo import (
     create_agent_withdrawal_data, create_agent_user_data, get_agent_bot_info,
     get_agent_bot_user_collection, get_agent_bot_user, update_agent_bot_user_balance,
     get_agent_product_price, get_real_time_stock, generate_agent_bot_id, get_agent_stats,
-    get_agent_bot_topup_collection, get_agent_bot_gmjlu_collection
+    get_agent_bot_topup_collection, get_agent_bot_gmjlu_collection,
+    normalize_agent_bot_id, ensure_agent_user_exists
 )
 # ✅ 先定义变量（在文件顶部）
 NOTIFY_CHANNEL_ID = os.getenv("NOTIFY_CHANNEL_ID")
@@ -12682,16 +12683,15 @@ def manage_specific_agent_users(update: Update, context: CallbackContext):
                 text += f"   ├─ 消费：<code>{consumption:.2f}</code> USDT\n"
                 text += f"   └─ 注册：<code>{creation_time[:10] if creation_time != '未知' else '未知'}</code>\n\n"
                 
-                # 🔧 清理回调数据，确保正确的格式
-                clean_agent_id = agent_bot_id.replace('agent_', '') if agent_bot_id.startswith('agent_') else agent_bot_id
-                callback_data = f"manage_user_{clean_agent_id}_{user['user_id']}"
+                # ✅ 不要清理agent_bot_id，保持完整格式（含agent_前缀）
+                callback_data = f"manage_user_{agent_bot_id}_{user['user_id']}"
                 
                 print(f"🔍 生成用户管理回调: {callback_data}")
                 
 
             keyboard.extend([
-                [InlineKeyboardButton("🔍 搜索特定用户", callback_data=f'search_in_agent_{clean_agent_id}')],
-                [InlineKeyboardButton("📊 用户统计", callback_data=f'agent_user_stats_{clean_agent_id}')],
+                [InlineKeyboardButton("🔍 搜索特定用户", callback_data=f'search_in_agent_{agent_bot_id}')],
+                [InlineKeyboardButton("📊 用户统计", callback_data=f'agent_user_stats_{agent_bot_id}')],
                 [InlineKeyboardButton("🔙 返回", callback_data='agent_user_management')]
             ])
             
@@ -12807,6 +12807,8 @@ def manage_individual_user(update: Update, context: CallbackContext):
             target_user_id = int(parts[-1])
             agent_bot_id = '_'.join(parts[:-1])
         
+        # ✅ 规范化agent_bot_id
+        agent_bot_id = normalize_agent_bot_id(agent_bot_id)
         print(f"🔍 解析结果: agent_bot_id={agent_bot_id}, target_user_id={target_user_id}")
         
         # 获取代理信息
@@ -12823,7 +12825,7 @@ def manage_individual_user(update: Update, context: CallbackContext):
         
         # 获取用户购买记录统计
         try:
-            agent_gmjlu_collection = bot_db[f"agent_gmjlu_{agent_bot_id}"]
+            agent_gmjlu_collection = get_agent_bot_gmjlu_collection(agent_bot_id)
             total_orders = agent_gmjlu_collection.count_documents({'user_id': target_user_id})
         except:
             total_orders = 0
@@ -12919,6 +12921,8 @@ def show_balance_adjustment_options(update: Update, context: CallbackContext):
             target_user_id = int(parts[-1])
             agent_bot_id = '_'.join(parts[:-1])
         
+        # ✅ 规范化agent_bot_id
+        agent_bot_id = normalize_agent_bot_id(agent_bot_id)
         print(f"🔍 余额调整解析结果: agent_bot_id={agent_bot_id}, target_user_id={target_user_id}")
         
         # 获取用户当前余额
@@ -13020,6 +13024,8 @@ def process_balance_adjustment(update: Update, context: CallbackContext):
             target_user_id = int(parts[-1])
             agent_bot_id = '_'.join(parts[:-1])
         
+        # ✅ 规范化agent_bot_id
+        agent_bot_id = normalize_agent_bot_id(agent_bot_id)
         print(f"🔍 处理余额调整解析结果: operation={operation}, agent_bot_id={agent_bot_id}, target_user_id={target_user_id}")
         
         # 显示金额输入界面
@@ -13097,6 +13103,8 @@ def handle_adjust_balance_command(update: Update, context: CallbackContext):
         amount = float(context.args[3])
         reason = ' '.join(context.args[4:])
         
+        # ✅ 规范化agent_bot_id
+        agent_bot_id = normalize_agent_bot_id(agent_bot_id)
         print(f"🔍 命令参数解析: agent_bot_id={agent_bot_id}, target_user_id={target_user_id}, operation={operation}, amount={amount}, reason={reason}")
         
         # 验证操作类型
@@ -13539,13 +13547,11 @@ def balance_manage_specific_agent(update: Update, context: CallbackContext):
                 balance = user.get('USDT', 0)
                 text += f"{i}. {username_display}: <code>{balance:.2f}</code> USDT\n"
         
-        # 🔧 清理代理ID
-        clean_agent_id = agent_bot_id.replace('agent_', '') if agent_bot_id.startswith('agent_') else agent_bot_id
-        
+        # ✅ 保持agent_bot_id完整（含agent_前缀）
         keyboard = [
-            [InlineKeyboardButton("👥 管理所有用户", callback_data=f'manage_agent_users_{clean_agent_id}')],
-            [InlineKeyboardButton("🔍 搜索用户", callback_data=f'search_user_balance_{clean_agent_id}'),
-             InlineKeyboardButton("📊 详细统计", callback_data=f'detailed_balance_stats_{clean_agent_id}')],
+            [InlineKeyboardButton("👥 管理所有用户", callback_data=f'manage_agent_users_{agent_bot_id}')],
+            [InlineKeyboardButton("🔍 搜索用户", callback_data=f'search_user_balance_{agent_bot_id}'),
+             InlineKeyboardButton("📊 详细统计", callback_data=f'detailed_balance_stats_{agent_bot_id}')],
             [InlineKeyboardButton("🔙 返回", callback_data='agent_balance_management')]
         ]
         
@@ -13721,8 +13727,9 @@ def get_agent_bot_token(agent_bot_id):
     格式: agent_bot_token_完整ID
     """
     try:
-        # 移除ID中可能存在的"agent_"前缀
-        clean_id = agent_bot_id.replace('agent_', '')
+        # ✅ 规范化agent_bot_id后再提取ID部分用于环境变量查找
+        agent_bot_id = normalize_agent_bot_id(agent_bot_id)
+        clean_id = _get_agent_id_suffix(agent_bot_id)
         token = os.getenv(f"agent_bot_token_{clean_id}")
         print(f"尝试获取token配置: agent_bot_token_{clean_id}")  # 调试日志
         if not token:
@@ -14136,49 +14143,6 @@ agent_bot_token_62448808=6666:BBB...</code>
         update.message.reply_text("❌ 获取代理信息失败")
 
 
-def update_agent_bot_user_balance(agent_bot_id, user_id, amount_change):
-    """更新代理机器人用户余额"""
-    try:
-        print(f"🔍 开始更新用户余额: agent_bot_id={agent_bot_id}, user_id={user_id}, amount_change={amount_change}")
-        
-        agent_users_collection = get_agent_bot_user_collection(agent_bot_id)
-        if agent_users_collection is None:  # 修复：使用 is None 而不是直接判断
-            print("❌ 无法获取用户集合")
-            return False
-        
-        print(f"🔍 获取到用户集合: {agent_users_collection.name}")
-        
-        # 首先检查用户是否存在
-        existing_user = agent_users_collection.find_one({'user_id': user_id})
-        if not existing_user:
-            print(f"❌ 用户不存在: user_id={user_id}")
-            return False
-        
-        print(f"🔍 找到用户，当前余额: {existing_user.get('USDT', 0)}")
-        
-        # 更新用户余额
-        result = agent_users_collection.update_one(
-            {'user_id': user_id},
-            {'$inc': {'USDT': amount_change}}
-        )
-        
-        print(f"🔍 更新结果: matched={result.matched_count}, modified={result.modified_count}")
-        
-        if result.modified_count > 0:
-            # 验证更新后的余额
-            updated_user = agent_users_collection.find_one({'user_id': user_id})
-            new_balance = updated_user.get('USDT', 0)
-            print(f"✅ 用户余额更新成功: {existing_user.get('USDT', 0)} → {new_balance}")
-            return True
-        else:
-            print("❌ 用户余额未能更新")
-            return False
-        
-    except Exception as e:
-        print(f"❌ 更新用户余额失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
 
 def shouyishuoming_callback(update: Update, context: CallbackContext):
     query = update.callback_query
