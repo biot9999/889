@@ -13547,13 +13547,11 @@ def balance_manage_specific_agent(update: Update, context: CallbackContext):
                 balance = user.get('USDT', 0)
                 text += f"{i}. {username_display}: <code>{balance:.2f}</code> USDT\n"
         
-        # 🔧 清理代理ID
-        clean_agent_id = agent_bot_id.replace('agent_', '') if agent_bot_id.startswith('agent_') else agent_bot_id
-        
+        # ✅ 保持agent_bot_id完整（含agent_前缀）
         keyboard = [
-            [InlineKeyboardButton("👥 管理所有用户", callback_data=f'manage_agent_users_{clean_agent_id}')],
-            [InlineKeyboardButton("🔍 搜索用户", callback_data=f'search_user_balance_{clean_agent_id}'),
-             InlineKeyboardButton("📊 详细统计", callback_data=f'detailed_balance_stats_{clean_agent_id}')],
+            [InlineKeyboardButton("👥 管理所有用户", callback_data=f'manage_agent_users_{agent_bot_id}')],
+            [InlineKeyboardButton("🔍 搜索用户", callback_data=f'search_user_balance_{agent_bot_id}'),
+             InlineKeyboardButton("📊 详细统计", callback_data=f'detailed_balance_stats_{agent_bot_id}')],
             [InlineKeyboardButton("🔙 返回", callback_data='agent_balance_management')]
         ]
         
@@ -13729,8 +13727,9 @@ def get_agent_bot_token(agent_bot_id):
     格式: agent_bot_token_完整ID
     """
     try:
-        # 移除ID中可能存在的"agent_"前缀
-        clean_id = agent_bot_id.replace('agent_', '')
+        # ✅ 规范化agent_bot_id后再提取ID部分用于环境变量查找
+        agent_bot_id = normalize_agent_bot_id(agent_bot_id)
+        clean_id = _get_agent_id_suffix(agent_bot_id)
         token = os.getenv(f"agent_bot_token_{clean_id}")
         print(f"尝试获取token配置: agent_bot_token_{clean_id}")  # 调试日志
         if not token:
