@@ -134,7 +134,8 @@ class MultiBotDistributionSystem:
                     agent_bot_id=agent_bot_id,
                     original_nowuid=product['nowuid'],
                     agent_price=suggested_price,
-                    is_active=True
+                    is_active=True,
+                    agent_markup=profit_margin  # ✅ 传递利润加价参数
                 )
                 
                 if success:
@@ -10810,6 +10811,247 @@ def handle_all_callbacks(update: Update, context: CallbackContext):
                     parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
+
+    # ========== 搜索代理用户 ==========
+    elif query.data.startswith("search_in_agent_"):
+        agent_bot_id = query.data.replace("search_in_agent_", "")
+        query.answer()
+        
+        if not multi_bot_system.is_master_admin(user_id):
+            query.edit_message_text("❌ 权限错误")
+            return
+        
+        # 提示用户输入要搜索的用户ID
+        text = f"""🔍 <b>搜索代理用户</b>
+        
+请在聊天框中输入要搜索的用户ID或用户名
+
+💡 <b>使用说明：</b>
+• 输入完整的用户ID（数字）
+• 或输入用户名（不含@符号）
+
+📋 <b>代理信息：</b>
+• 代理ID：<code>{agent_bot_id}</code>"""
+
+        keyboard = [[InlineKeyboardButton("🔙 返回", callback_data=f'manage_agent_users_{agent_bot_id}')]]
+        
+        query.edit_message_text(
+            text=text,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    # ========== 代理用户统计 ==========
+    elif query.data.startswith("agent_user_stats_"):
+        agent_bot_id = query.data.replace("agent_user_stats_", "")
+        query.answer()
+        
+        if not multi_bot_system.is_master_admin(user_id):
+            query.edit_message_text("❌ 权限错误")
+            return
+        
+        try:
+            # 获取代理信息
+            agent_info = get_agent_bot_info(agent_bot_id)
+            if not agent_info:
+                query.edit_message_text("❌ 代理机器人不存在")
+                return
+            
+            # 获取代理用户统计
+            agent_users_collection = get_agent_bot_user_collection(agent_bot_id)
+            if agent_users_collection is None:
+                query.edit_message_text("❌ 无法获取用户集合")
+                return
+            
+            total_users = agent_users_collection.count_documents({})
+            total_balance = 0
+            total_consumption = 0
+            
+            for user_doc in agent_users_collection.find():
+                total_balance += user_doc.get('USDT', 0)
+                total_consumption += user_doc.get('zgje', 0)
+            
+            # 获取今日新增用户
+            from datetime import datetime, timedelta
+            today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            today_users = agent_users_collection.count_documents({
+                'creation_time': {'$gte': today_start.strftime('%Y-%m-%d %H:%M:%S')}
+            })
+            
+            text = f"""📊 <b>{agent_info['agent_name']} - 用户统计</b>
+
+📈 <b>用户数据：</b>
+• 总用户数：<code>{total_users}</code> 人
+• 今日新增：<code>{today_users}</code> 人
+
+💰 <b>财务数据：</b>
+• 总余额：<code>{total_balance:.2f}</code> USDT
+• 总消费：<code>{total_consumption:.2f}</code> USDT
+• 平均余额：<code>{total_balance/total_users if total_users > 0 else 0:.2f}</code> USDT/人
+• 平均消费：<code>{total_consumption/total_users if total_users > 0 else 0:.2f}</code> USDT/人
+
+📅 <b>统计时间：</b>
+{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""
+
+            keyboard = [[InlineKeyboardButton("🔙 返回", callback_data=f'manage_agent_users_{agent_bot_id}')]]
+            
+            query.edit_message_text(
+                text=text,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        except Exception as e:
+            print(f"❌ 获取用户统计失败: {e}")
+            import traceback
+            traceback.print_exc()
+            query.edit_message_text("❌ 获取统计数据失败")
+    
+    # ========== 管理单个用户 ==========
+    elif query.data.startswith("manage_user_"):
+        # 格式: manage_user_{agent_bot_id}_{user_id}
+        parts = query.data.replace("manage_user_", "").split("_", 1)
+        if len(parts) < 2:
+            query.answer("参数错误")
+            return
+        
+        # 提取agent_bot_id和user_id
+        # agent_bot_id可能包含下划线，所以需要找到最后一个下划线
+        data = query.data.replace("manage_user_", "")
+        last_underscore = data.rfind("_")
+        if last_underscore == -1:
+            query.answer("参数错误")
+            return
+            
+        agent_bot_id = data[:last_underscore]
+        user_id_str = data[last_underscore+1:]
+        
+        try:
+            target_user_id = int(user_id_str)
+        except ValueError:
+            query.answer("用户ID格式错误")
+            return
+        
+        query.answer()
+        
+        if not multi_bot_system.is_master_admin(user_id):
+            query.edit_message_text("❌ 权限错误")
+            return
+        
+        try:
+            # 获取用户信息
+            user_info = get_agent_bot_user(agent_bot_id, target_user_id)
+            if not user_info:
+                query.edit_message_text("❌ 用户不存在")
+                return
+            
+            username = user_info.get('username', '')
+            first_name = user_info.get('first_name', user_info.get('fullname', ''))
+            balance = user_info.get('USDT', 0)
+            consumption = user_info.get('zgje', 0)
+            creation_time = user_info.get('creation_time', '未知')
+            count_id = user_info.get('count_id', 'N/A')
+            
+            display_name = f"@{username}" if username else (first_name if first_name else f"用户{target_user_id}")
+            
+            text = f"""👤 <b>用户管理</b>
+
+📋 <b>基本信息：</b>
+• 昵称：{display_name}
+• 用户ID：<code>{target_user_id}</code>
+• 内部ID：<code>{count_id}</code>
+
+💰 <b>财务信息：</b>
+• 当前余额：<code>{balance:.2f}</code> USDT
+• 累计消费：<code>{consumption:.2f}</code> USDT
+
+📅 <b>注册时间：</b>
+{creation_time[:19] if creation_time != '未知' else '未知'}"""
+
+            keyboard = [
+                [InlineKeyboardButton("💵 调整余额", callback_data=f'adjust_balance_{agent_bot_id}_{target_user_id}')],
+                [InlineKeyboardButton("🔙 返回用户列表", callback_data=f'manage_agent_users_{agent_bot_id}')]
+            ]
+            
+            query.edit_message_text(
+                text=text,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        except Exception as e:
+            print(f"❌ 获取用户信息失败: {e}")
+            import traceback
+            traceback.print_exc()
+            query.edit_message_text("❌ 获取用户信息失败")
+    
+    # ========== 调整用户余额 ==========
+    elif query.data.startswith("adjust_balance_"):
+        # 格式: adjust_balance_{agent_bot_id}_{user_id}
+        data = query.data.replace("adjust_balance_", "")
+        last_underscore = data.rfind("_")
+        if last_underscore == -1:
+            query.answer("参数错误")
+            return
+            
+        agent_bot_id = data[:last_underscore]
+        user_id_str = data[last_underscore+1:]
+        
+        try:
+            target_user_id = int(user_id_str)
+        except ValueError:
+            query.answer("用户ID格式错误")
+            return
+        
+        query.answer()
+        
+        if not multi_bot_system.is_master_admin(user_id):
+            query.edit_message_text("❌ 权限错误")
+            return
+        
+        try:
+            # 获取用户当前余额
+            user_info = get_agent_bot_user(agent_bot_id, target_user_id)
+            if not user_info:
+                query.edit_message_text("❌ 用户不存在")
+                return
+            
+            current_balance = user_info.get('USDT', 0)
+            username = user_info.get('username', '')
+            first_name = user_info.get('first_name', user_info.get('fullname', ''))
+            display_name = f"@{username}" if username else (first_name if first_name else f"用户{target_user_id}")
+            
+            text = f"""💵 <b>调整用户余额</b>
+
+👤 <b>用户：</b>{display_name}
+💰 <b>当前余额：</b><code>{current_balance:.2f}</code> USDT
+
+⚠️ <b>注意：</b>
+此功能暂时需要直接操作数据库完成
+您可以使用数据库管理工具调整余额
+
+💡 <b>调整方式：</b>
+• 增加余额：使用 update_agent_bot_user_balance 函数
+• 减少余额：传入负数金额
+
+📋 <b>命令参考：</b>
+<code>update_agent_bot_user_balance('{agent_bot_id}', {target_user_id}, 金额)</code>"""
+
+            keyboard = [
+                [InlineKeyboardButton("🔙 返回", callback_data=f'manage_user_{agent_bot_id}_{target_user_id}')]
+            ]
+            
+            query.edit_message_text(
+                text=text,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        except Exception as e:
+            print(f"❌ 调整余额失败: {e}")
+            import traceback
+            traceback.print_exc()
+            query.edit_message_text("❌ 操作失败")
 
     # ========== 关闭按钮 ==========
     elif query.data.startswith("close "):
