@@ -47,7 +47,7 @@ from mongo import (
     get_agent_bot_user_collection, get_agent_bot_user, update_agent_bot_user_balance,
     get_agent_product_price, get_real_time_stock, generate_agent_bot_id, get_agent_stats,
     get_agent_bot_topup_collection, get_agent_bot_gmjlu_collection,
-    normalize_agent_bot_id, ensure_agent_user_exists
+    normalize_agent_bot_id, ensure_agent_user_exists, _get_agent_id_suffix
 )
 # ✅ 先定义变量（在文件顶部）
 NOTIFY_CHANNEL_ID = os.getenv("NOTIFY_CHANNEL_ID")
@@ -13662,6 +13662,163 @@ def balance_manage_specific_agent(update: Update, context: CallbackContext):
         import traceback
         traceback.print_exc()
         query.edit_message_text("❌ 获取代理余额信息失败")
+
+def search_user_balance(update: Update, context: CallbackContext):
+    """搜索特定用户余额"""
+    query = update.callback_query
+    query.answer()
+    user_id = query.from_user.id
+    
+    if not multi_bot_system.is_master_admin(user_id):
+        query.edit_message_text("❌ 权限错误")
+        return
+    
+    agent_bot_id = query.data.replace('search_user_balance_', '')
+    
+    try:
+        # 获取代理信息
+        agent_info = get_agent_bot_info(agent_bot_id)
+        if not agent_info:
+            query.edit_message_text("❌ 代理机器人不存在")
+            return
+        
+        text = f"🔍 <b>{agent_info['agent_name']} - 搜索用户</b>\n\n"
+        text += "请使用以下命令搜索用户：\n\n"
+        text += f"<code>/uset 用户ID +金额</code> - 给用户增加余额\n"
+        text += f"<code>/uset 用户ID -金额</code> - 给用户减少余额\n\n"
+        text += "💡 <b>提示：</b>\n"
+        text += "• 如果用户在多个代理下有账户，系统会让您选择\n"
+        text += "• 所有余额变动都会记录操作日志\n"
+        text += "• 用户会收到余额变动通知"
+        
+        keyboard = [
+            [InlineKeyboardButton("🔙 返回", callback_data=f'balance_manage_{agent_bot_id}')]
+        ]
+        
+        query.edit_message_text(
+            text=text,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+    except Exception as e:
+        print(f"❌ 搜索用户余额失败: {e}")
+        query.edit_message_text("❌ 操作失败")
+
+def detailed_balance_stats(update: Update, context: CallbackContext):
+    """详细余额统计"""
+    query = update.callback_query
+    query.answer()
+    user_id = query.from_user.id
+    
+    if not multi_bot_system.is_master_admin(user_id):
+        query.edit_message_text("❌ 权限错误")
+        return
+    
+    agent_bot_id = query.data.replace('detailed_balance_stats_', '')
+    
+    try:
+        query.edit_message_text("📊 正在生成详细统计，请稍候...")
+        
+        # 获取代理信息
+        agent_info = get_agent_bot_info(agent_bot_id)
+        if not agent_info:
+            query.edit_message_text("❌ 代理机器人不存在")
+            return
+        
+        # 获取用户数据
+        agent_users_collection = get_agent_bot_user_collection(agent_bot_id)
+        if agent_users_collection is None:
+            query.edit_message_text("❌ 无法获取用户数据")
+            return
+        
+        # 统计数据
+        total_users = agent_users_collection.count_documents({})
+        
+        # 余额分布统计
+        balance_ranges = [
+            {"name": "0 USDT", "min": 0, "max": 0},
+            {"name": "0-10 USDT", "min": 0.01, "max": 10},
+            {"name": "10-50 USDT", "min": 10, "max": 50},
+            {"name": "50-100 USDT", "min": 50, "max": 100},
+            {"name": "100-500 USDT", "min": 100, "max": 500},
+            {"name": "500+ USDT", "min": 500, "max": float('inf')}
+        ]
+        
+        text = f"📊 <b>{agent_info['agent_name']} - 详细统计</b>\n\n"
+        text += f"📅 生成时间：<code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>\n\n"
+        
+        # 基础统计
+        pipeline = [
+            {
+                "$group": {
+                    "_id": None,
+                    "total_balance": {"$sum": {"$ifNull": ["$USDT", 0]}},
+                    "total_consumption": {"$sum": {"$ifNull": ["$zgje", 0]}},
+                    "avg_balance": {"$avg": {"$ifNull": ["$USDT", 0]}},
+                    "max_balance": {"$max": {"$ifNull": ["$USDT", 0]}},
+                    "min_balance": {"$min": {"$ifNull": ["$USDT", 0]}}
+                }
+            }
+        ]
+        
+        stats = list(agent_users_collection.aggregate(pipeline))
+        stat = stats[0] if stats else {
+            'total_balance': 0,
+            'total_consumption': 0,
+            'avg_balance': 0,
+            'max_balance': 0,
+            'min_balance': 0
+        }
+        
+        text += f"👥 <b>用户统计：</b>\n"
+        text += f"├─ 总用户数：<code>{total_users}</code> 个\n"
+        text += f"├─ 总余额：<code>{stat.get('total_balance', 0):.2f}</code> USDT\n"
+        text += f"├─ 总消费：<code>{stat.get('total_consumption', 0):.2f}</code> USDT\n"
+        text += f"├─ 平均余额：<code>{stat.get('avg_balance', 0):.2f}</code> USDT\n"
+        text += f"├─ 最高余额：<code>{stat.get('max_balance', 0):.2f}</code> USDT\n"
+        text += f"└─ 最低余额：<code>{stat.get('min_balance', 0):.2f}</code> USDT\n\n"
+        
+        # 余额分布
+        text += f"💰 <b>余额分布：</b>\n"
+        for range_info in balance_ranges:
+            if range_info['max'] == 0:
+                count = agent_users_collection.count_documents({"USDT": 0})
+            elif range_info['max'] == float('inf'):
+                count = agent_users_collection.count_documents({"USDT": {"$gte": range_info['min']}})
+            else:
+                count = agent_users_collection.count_documents({
+                    "USDT": {"$gte": range_info['min'], "$lt": range_info['max']}
+                })
+            
+            percentage = (count / total_users * 100) if total_users > 0 else 0
+            text += f"├─ {range_info['name']}: <code>{count}</code> 个 ({percentage:.1f}%)\n"
+        
+        # 活跃度统计
+        active_users = agent_users_collection.count_documents({"USDT": {"$gt": 0}})
+        inactive_users = total_users - active_users
+        active_percentage = (active_users / total_users * 100) if total_users > 0 else 0
+        
+        text += f"\n📈 <b>活跃度：</b>\n"
+        text += f"├─ 有余额用户：<code>{active_users}</code> 个 ({active_percentage:.1f}%)\n"
+        text += f"└─ 零余额用户：<code>{inactive_users}</code> 个 ({100-active_percentage:.1f}%)"
+        
+        keyboard = [
+            [InlineKeyboardButton("🔙 返回", callback_data=f'balance_manage_{agent_bot_id}')]
+        ]
+        
+        query.edit_message_text(
+            text=text,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+    except Exception as e:
+        print(f"❌ 生成详细统计失败: {e}")
+        import traceback
+        traceback.print_exc()
+        query.edit_message_text("❌ 生成统计失败")
+
 def balance_statistics(update: Update, context: CallbackContext):
     """余额统计报表"""
     query = update.callback_query
@@ -14333,6 +14490,8 @@ def main():
     dispatcher.add_handler(CallbackQueryHandler(show_balance_adjustment_options, pattern='^adjust_balance_'))
     dispatcher.add_handler(CallbackQueryHandler(process_balance_adjustment, pattern='^add_balance_|^subtract_balance_|^set_balance_|^quick_refund_'))
     dispatcher.add_handler(CallbackQueryHandler(balance_manage_specific_agent, pattern='^balance_manage_'))
+    dispatcher.add_handler(CallbackQueryHandler(search_user_balance, pattern='^search_user_balance_'))
+    dispatcher.add_handler(CallbackQueryHandler(detailed_balance_stats, pattern='^detailed_balance_stats_'))
     dispatcher.add_handler(CallbackQueryHandler(balance_statistics, pattern='^balance_statistics$'))
     dispatcher.add_handler(CallbackQueryHandler(balance_operation_logs, pattern='^balance_operation_logs$'))
 
