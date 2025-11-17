@@ -7534,6 +7534,11 @@ def textkeyboard(update: Update, context: CallbackContext):
             print(f"🔍 textkeyboard: Wizard active, skipping for user {chat.id}")
             return
         
+        # ✅ 如果正在等待代理用户搜索输入，不处理该消息
+        if context.user_data.get('AGENT_AWAIT_USER_SEARCH'):
+            print(f"🔍 textkeyboard: Agent user search active, skipping for user {chat.id}")
+            return
+        
         user_id = chat.id
         username = chat.username
         firstname = chat.first_name
@@ -10519,9 +10524,11 @@ def handle_all_callbacks(update: Update, context: CallbackContext):
                 }
             )
             
-            # ✅ 发送到通知群（替代原来的个人通知）
-            try:
-                notification_text = f"""✅ <b>【提现成功】</b>
+            # ✅ 发送到正确的代理通知群
+            agent_bot_id = withdrawal.get('agent_bot_id')
+            if agent_bot_id:
+                try:
+                    notification_text = f"""✅ <b>【提现成功】</b>
 
 <b>👤 用户ID:</b> <code>{withdrawal['user_id']}</code>
 <b>💰 提现金额:</b> <code>{withdrawal['amount']:.2f} USDT</code>
@@ -10531,14 +10538,33 @@ def handle_all_callbacks(update: Update, context: CallbackContext):
 <b>📊 验证状态:</b> ✅ 已验证
 🎉 感谢您的使用！"""
 
-                context.bot.send_message(
-                    chat_id=AGENT_NOTIFY_CHAT_ID,
-                    text=notification_text,
-                    parse_mode='HTML'
-                )
-                logging.info(f"✅ 提现成功通知已发送到群")
-            except Exception as e:
-                logging.error(f"❌ 发送提现成功通知到群失败: {e}")
+                    # 优先使用快照中的通知配置
+                    snapshot_chat_id = withdrawal.get('agent_notify_chat_id')
+                    snapshot_token = withdrawal.get('agent_bot_token')
+                    
+                    if snapshot_chat_id and snapshot_token:
+                        # 使用快照配置直接发送
+                        print(f"[WITHDRAW_NOTIFY] Using snapshot: agent_bot_id={agent_bot_id} chat={snapshot_chat_id}")
+                        Bot(token=snapshot_token).send_message(
+                            chat_id=snapshot_chat_id,
+                            text=notification_text,
+                            parse_mode='HTML'
+                        )
+                        logging.info(f"✅ 提现成功通知已发送到代理 {agent_bot_id} 的通知群")
+                    else:
+                        # 回退到动态查找
+                        success = send_agent_notification(agent_bot_id, notification_text)
+                        if success:
+                            logging.info(f"✅ 提现成功通知已发送到代理 {agent_bot_id} 的通知群")
+                        else:
+                            logging.warning(f"⚠️ 代理 {agent_bot_id} 未配置通知群")
+                            
+                except Exception as e:
+                    logging.error(f"❌ 发送提现成功通知到代理群失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                logging.warning(f"⚠️ 提现记录缺少 agent_bot_id，无法发送通知")
             
             # 显示确认消息给管理员
             text = f"""✅ <b>提现已完成</b>
@@ -10837,6 +10863,8 @@ def handle_all_callbacks(update: Update, context: CallbackContext):
         # ✅ 设置等待用户搜索的标志
         context.user_data['AGENT_AWAIT_USER_SEARCH'] = True
         context.user_data['AGENT_AWAIT_AGENT_ID'] = normalize_agent_bot_id(agent_bot_id)
+        
+        print(f"[USER_SEARCH_INIT] user_id={user_id} agent_bot_id={normalize_agent_bot_id(agent_bot_id)}")
         
         # 提示用户输入要搜索的用户ID
         text = f"""🔍 <b>搜索代理用户</b>
@@ -13743,12 +13771,16 @@ def handle_agent_balance_user_search_text(update: Update, context: CallbackConte
     if not context.user_data.get('AGENT_AWAIT_USER_SEARCH'):
         return  # 不是用户搜索状态，不处理
     
+    print(f"[USER_SEARCH_INPUT] user_id={user_id} received input")
+    
     # 检查管理员权限
     if not multi_bot_system.is_master_admin(user_id):
+        print(f"[USER_SEARCH_INPUT] user_id={user_id} not admin, ignoring")
         return
     
     agent_bot_id = context.user_data.get('AGENT_AWAIT_AGENT_ID')
     if not agent_bot_id:
+        print(f"[USER_SEARCH_INPUT] No agent_bot_id in context")
         update.message.reply_text("❌ 错误：未找到代理信息")
         context.user_data.pop('AGENT_AWAIT_USER_SEARCH', None)
         context.user_data.pop('AGENT_AWAIT_AGENT_ID', None)
@@ -13759,6 +13791,7 @@ def handle_agent_balance_user_search_text(update: Update, context: CallbackConte
     context.user_data.pop('AGENT_AWAIT_AGENT_ID', None)
     
     search_text = update.message.text.strip()
+    print(f"[USER_SEARCH_INPUT] agent_bot_id={agent_bot_id} search_text={search_text}")
     
     try:
         # 获取代理信息
@@ -13774,10 +13807,12 @@ def handle_agent_balance_user_search_text(update: Update, context: CallbackConte
         if search_text.isdigit():
             target_user_id = int(search_text)
             found_user = agent_users.find_one({'user_id': target_user_id})
+            print(f"[USER_SEARCH_DONE] search by user_id={target_user_id} found={found_user is not None}")
         else:
             # 按用户名搜索（去掉@符号）
             username = search_text.lstrip('@')
             found_user = agent_users.find_one({'username': username})
+            print(f"[USER_SEARCH_DONE] search by username={username} found={found_user is not None}")
         
         if not found_user:
             text = f"❌ 未找到用户\n\n"
@@ -13796,6 +13831,7 @@ def handle_agent_balance_user_search_text(update: Update, context: CallbackConte
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
+            print(f"[USER_SEARCH_DONE] sent not found message")
             return
         
         # 显示用户信息卡片
@@ -14143,6 +14179,73 @@ def get_agent_bot_token(agent_bot_id):
         import traceback
         traceback.print_exc()
         return None
+
+def get_agent_notify_info(agent_bot_id):
+    """
+    获取代理的通知配置信息（notify_chat_id和bot_token）
+    返回: (notify_chat_id, bot_token) 或 (None, None)
+    """
+    try:
+        agent_bot_id = normalize_agent_bot_id(agent_bot_id)
+        
+        # 尝试从agent_bots集合获取
+        agent_info = get_agent_bot_info(agent_bot_id)
+        if agent_info:
+            # 优先使用数据库中的配置
+            notify_chat = agent_info.get('agent_notify_chat_id')
+            token = agent_info.get('agent_token')
+            
+            if notify_chat and token:
+                print(f"[AGENT_INFO] agent_bot_id={agent_bot_id} found notify_chat={notify_chat[:20]}... from DB")
+                return (notify_chat, token)
+        
+        # 回退到环境变量
+        clean_id = _get_agent_id_suffix(agent_bot_id)
+        notify_chat = os.getenv(f"agent_notify_chat_id_{clean_id}")
+        token = get_agent_bot_token(agent_bot_id)
+        
+        if notify_chat and token:
+            print(f"[AGENT_INFO] agent_bot_id={agent_bot_id} found notify_chat={notify_chat[:20]}... from ENV")
+            return (notify_chat, token)
+        
+        print(f"[AGENT_INFO] agent_bot_id={agent_bot_id} no notify config found")
+        return (None, None)
+        
+    except Exception as e:
+        print(f"❌ 获取代理通知信息失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return (None, None)
+
+def send_agent_notification(agent_bot_id, text, reply_markup=None, parse_mode='HTML'):
+    """
+    向指定代理的通知群发送消息
+    """
+    try:
+        notify_chat_id, bot_token = get_agent_notify_info(agent_bot_id)
+        
+        if not notify_chat_id or not bot_token:
+            print(f"[WITHDRAW_NOTIFY] agent_bot_id={agent_bot_id} missing notify config, skipping")
+            return False
+        
+        print(f"[WITHDRAW_NOTIFY] agent_bot_id={agent_bot_id} target_chat={notify_chat_id} token_used={bot_token[:10]}...")
+        
+        bot = Bot(token=bot_token)
+        bot.send_message(
+            chat_id=notify_chat_id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup
+        )
+        
+        print(f"[WITHDRAW_NOTIFY] Successfully sent notification to agent {agent_bot_id}")
+        return True
+        
+    except Exception as e:
+        print(f"[WITHDRAW_NOTIFY] Failed to send notification to agent {agent_bot_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 def handle_user_balance_set(update: Update, context: CallbackContext):
     """

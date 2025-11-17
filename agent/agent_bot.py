@@ -1255,14 +1255,17 @@ class AgentBotCore:
                 'updated_time': now,
                 'apply_role': 'agent',
                 'type': 'agent_profit_withdrawal',
-                'profit_snapshot': summary['available_profit']
+                'profit_snapshot': summary['available_profit'],
+                # ✅ 添加代理通知配置快照
+                'agent_notify_chat_id': self.config.AGENT_NOTIFY_CHAT_ID,
+                'agent_bot_token': self.config.BOT_TOKEN
             }
             self.config.withdrawal_requests.insert_one(doc)
 
             if self.config.AGENT_NOTIFY_CHAT_ID:  # ✅ 正确
                 try:
                     Bot(self.config.BOT_TOKEN).send_message(
-                        chat_id=AGENT_NOTIFY_CHAT_ID,
+                        chat_id=self.config.AGENT_NOTIFY_CHAT_ID,  # ✅ 修复：使用实例配置
                         text=(f"📢 <b>代理提现申请</b>\n\n"
                               f"🏢 代理ID：<code>{self._h(self.config.AGENT_BOT_ID)}</code>\n"
                               f"👤 用户：{self._link_user(user_id)}\n"
