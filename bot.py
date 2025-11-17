@@ -134,7 +134,8 @@ class MultiBotDistributionSystem:
                     agent_bot_id=agent_bot_id,
                     original_nowuid=product['nowuid'],
                     agent_price=suggested_price,
-                    is_active=True
+                    is_active=True,
+                    agent_markup=profit_margin  # ✅ 传递利润加价参数
                 )
                 
                 if success:
@@ -10811,6 +10812,101 @@ def handle_all_callbacks(update: Update, context: CallbackContext):
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
 
+    # ========== 搜索代理用户 ==========
+    elif query.data.startswith("search_in_agent_"):
+        agent_bot_id = query.data.replace("search_in_agent_", "")
+        query.answer()
+        
+        if not multi_bot_system.is_master_admin(user_id):
+            query.edit_message_text("❌ 权限错误")
+            return
+        
+        # 提示用户输入要搜索的用户ID
+        text = f"""🔍 <b>搜索代理用户</b>
+        
+请在聊天框中输入要搜索的用户ID或用户名
+
+💡 <b>使用说明：</b>
+• 输入完整的用户ID（数字）
+• 或输入用户名（不含@符号）
+
+📋 <b>代理信息：</b>
+• 代理ID：<code>{agent_bot_id}</code>"""
+
+        keyboard = [[InlineKeyboardButton("🔙 返回", callback_data=f'manage_agent_users_{agent_bot_id}')]]
+        
+        query.edit_message_text(
+            text=text,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    # ========== 代理用户统计 ==========
+    elif query.data.startswith("agent_user_stats_"):
+        agent_bot_id = query.data.replace("agent_user_stats_", "")
+        query.answer()
+        
+        if not multi_bot_system.is_master_admin(user_id):
+            query.edit_message_text("❌ 权限错误")
+            return
+        
+        try:
+            # 获取代理信息
+            agent_info = get_agent_bot_info(agent_bot_id)
+            if not agent_info:
+                query.edit_message_text("❌ 代理机器人不存在")
+                return
+            
+            # 获取代理用户统计
+            agent_users_collection = get_agent_bot_user_collection(agent_bot_id)
+            if agent_users_collection is None:
+                query.edit_message_text("❌ 无法获取用户集合")
+                return
+            
+            total_users = agent_users_collection.count_documents({})
+            total_balance = 0
+            total_consumption = 0
+            
+            for user_doc in agent_users_collection.find():
+                total_balance += user_doc.get('USDT', 0)
+                total_consumption += user_doc.get('zgje', 0)
+            
+            # 获取今日新增用户
+            from datetime import datetime, timedelta
+            today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            today_users = agent_users_collection.count_documents({
+                'creation_time': {'$gte': today_start.strftime('%Y-%m-%d %H:%M:%S')}
+            })
+            
+            text = f"""📊 <b>{agent_info['agent_name']} - 用户统计</b>
+
+📈 <b>用户数据：</b>
+• 总用户数：<code>{total_users}</code> 人
+• 今日新增：<code>{today_users}</code> 人
+
+💰 <b>财务数据：</b>
+• 总余额：<code>{total_balance:.2f}</code> USDT
+• 总消费：<code>{total_consumption:.2f}</code> USDT
+• 平均余额：<code>{total_balance/total_users if total_users > 0 else 0:.2f}</code> USDT/人
+• 平均消费：<code>{total_consumption/total_users if total_users > 0 else 0:.2f}</code> USDT/人
+
+📅 <b>统计时间：</b>
+{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""
+
+            keyboard = [[InlineKeyboardButton("🔙 返回", callback_data=f'manage_agent_users_{agent_bot_id}')]]
+            
+            query.edit_message_text(
+                text=text,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        except Exception as e:
+            print(f"❌ 获取用户统计失败: {e}")
+            import traceback
+            traceback.print_exc()
+            query.edit_message_text("❌ 获取统计数据失败")
+    
     # ========== 关闭按钮 ==========
     elif query.data.startswith("close "):
         user_id_to_close = query.data.split(" ")[1]

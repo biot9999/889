@@ -588,20 +588,21 @@ def create_agent_bot_data(agent_bot_id, agent_name, agent_token, agent_username,
         logging.error(f"❌ 创建代理机器人失败：{agent_name} - {e}")
         return False
 
-def create_agent_product_price_data(agent_bot_id, original_nowuid, agent_price, is_active):
+def create_agent_product_price_data(agent_bot_id, original_nowuid, agent_price, is_active, agent_markup=0.0):
     """创建代理商品价格"""
     try:
         agent_product_prices.insert_one({
             'agent_bot_id': agent_bot_id,           # 代理机器人ID
             'original_nowuid': original_nowuid,     # 总部商品nowuid
             'agent_price': agent_price,             # 代理设置的价格
+            'agent_markup': agent_markup,           # 代理利润加价
             'is_active': is_active,                 # 是否启用销售
             'sales_count': 0,                       # 销售数量
             'total_revenue': 0.0,                   # 总收入
             'last_sale_time': '',                   # 最后销售时间
             'update_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         })
-        logging.info(f"✅ 创建代理商品价格：agent_bot_id={agent_bot_id}, nowuid={original_nowuid}")
+        logging.info(f"✅ 创建代理商品价格：agent_bot_id={agent_bot_id}, nowuid={original_nowuid}, agent_markup={agent_markup}")
         return True
     except Exception as e:
         logging.error(f"❌ 创建代理商品价格失败：{e}")
