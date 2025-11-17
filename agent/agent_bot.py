@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-华南代理机器人（统一通知 + 纯二维码 + 北京时间显示 + 10分钟有效 + 取消订单修复版）
+代理机器人（统一通知 + 纯二维码 + 北京时间显示 + 10分钟有效 + 取消订单修复版）
 特性:
 - 固定地址 + 4 位识别金额自动到账（唯一识别码写入金额小数部分）
 - 商品/价格管理、利润提现、统计报表
@@ -217,18 +217,20 @@ class AgentBotConfig:
             logger.error(f"❌ 数据库连接失败: {e}")
             raise
 
-    def get_agent_user_collection(self):
-        return self.db[f'agent_users_{self.AGENT_BOT_ID}']
+	def get_agent_user_collection(self):
+		suffix = self.AGENT_BOT_ID[6:] if self.AGENT_BOT_ID.startswith('agent_') else self.AGENT_BOT_ID
+		return self.db[f'agent_users_{suffix}']
 
-    def get_agent_gmjlu_collection(self):
-        return self.db[f'agent_gmjlu_{self.AGENT_BOT_ID}']
+	def get_agent_gmjlu_collection(self):
+		suffix = self.AGENT_BOT_ID[6:] if self.AGENT_BOT_ID.startswith('agent_') else self.AGENT_BOT_ID
+		return self.db[f'agent_gmjlu_{suffix}']
 
-    def _next_tron_api_key(self) -> Optional[str]:
-        if not self.TRON_API_KEYS:
-            return None
-        key = self.TRON_API_KEYS[self._tron_key_index % len(self.TRON_API_KEYS)]
-        self._tron_key_index = (self._tron_key_index + 1) % max(len(self.TRON_API_KEYS), 1)
-        return key
+	def _next_tron_api_key(self) -> Optional[str]:
+		if not self.TRON_API_KEYS:
+			return None
+		key = self.TRON_API_KEYS[self._tron_key_index % len(self.TRON_API_KEYS)]
+		self._tron_key_index = (self._tron_key_index + 1) % max(len(self.TRON_API_KEYS), 1)
+		return key
 
 
 class AgentBotCore:
@@ -2888,7 +2890,14 @@ class AgentBotHandlers:
     def show_user_profile(self, query):
         """显示用户个人中心"""
         uid = query.from_user.id
+        # 🔍 调试：打印查询的集合名和配置
+        coll_name = f"agent_users_{self.core.config.AGENT_BOT_ID}"
+        logger.info(f"🔍 DEBUG show_user_profile: uid={uid}, AGENT_BOT_ID={self.core.config.AGENT_BOT_ID}, collection={coll_name}")
+    
         info = self.core.get_user_info(uid)
+    
+        # 🔍 调试：打印查询结果
+        logger.info(f"🔍 DEBUG: query result for user {uid} = {info}")
         if not info:
             self.safe_edit_message(query, "❌ 用户信息不存在", [[InlineKeyboardButton("🏠 主菜单", callback_data="back_main")]], parse_mode=None)
             return
