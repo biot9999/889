@@ -14320,7 +14320,7 @@ def handle_uset_callback(update: Update, context: CallbackContext):
             
             # 尝试使用代理机器人通知用户
             try:
-                agent_token = os.getenv(f"agent_bot_token_{agent_bot_id}")
+                agent_token = get_agent_bot_token(agent_bot_id)
                 if agent_token:
                     notify_text = f"""💰 余额变动通知
 
