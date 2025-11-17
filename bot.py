@@ -9258,7 +9258,7 @@ def textkeyboard(update: Update, context: CallbackContext):
                 if lang == 'zh':
                     fstext = (
                         "<b>🛒 商品分类 - 请选择所需：</b>\n\n"
-                        "<b>❗快速查找商品库存发送区号！如（+94）</b>\n\n"
+                        "<b>❗快速查找商品：发送带+号的区号！如 +94、+86、+34</b>\n\n"
                         "<b>❗️首次购买请先少量测试，避免纠纷</b>！\n\n"
                         "<b>❗️长期未使用账户可能会出现问题，联系客服处理</b>。"
                     )
@@ -9266,7 +9266,8 @@ def textkeyboard(update: Update, context: CallbackContext):
                     keyboard.append([InlineKeyboardButton("❌关闭", callback_data=f"close {user_id}")])
                 else:
                     fstext = (
-                        "<b>🛒 Product Categories - Please choose:</b>\n"
+                        "<b>🛒 Product Categories - Please choose:</b>\n\n"
+                        "<b>❗ Quick search: Send country code with + (e.g., +94, +86, +34)</b>\n\n"
                         "❗️If you are new, please start with a small test purchase to avoid issues.\n"
                         "❗️Inactive accounts may encounter problems, please contact support."
                     )
@@ -9289,6 +9290,13 @@ def textkeyboard(update: Update, context: CallbackContext):
                 
                 # ✅ 如果管理员正在等待输入交易哈希，不处理该消息，让后续的 handle_admin_txhash_message 处理
                 if user_id in WAITING_TXHASH:
+                    return
+                
+                # ✅ 商品搜索触发规则：只有包含"+"号的文本才触发商品搜索
+                # 例如：+54, +86, +34 等国家区号格式
+                # 不包含"+"的文本不会触发商品搜索，避免干扰其他功能（如代理用户搜索）
+                if '+' not in text:
+                    # 不触发商品搜索，直接返回
                     return
                 
                 # 删除用户的查询消息
