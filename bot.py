@@ -10834,6 +10834,10 @@ def handle_all_callbacks(update: Update, context: CallbackContext):
             query.edit_message_text("❌ 权限错误")
             return
         
+        # ✅ 设置等待用户搜索的标志
+        context.user_data['AGENT_AWAIT_USER_SEARCH'] = True
+        context.user_data['AGENT_AWAIT_AGENT_ID'] = normalize_agent_bot_id(agent_bot_id)
+        
         # 提示用户输入要搜索的用户ID
         text = f"""🔍 <b>搜索代理用户</b>
         
@@ -12744,6 +12748,10 @@ def manage_specific_agent_users(update: Update, context: CallbackContext):
     
     agent_bot_id = query.data.replace('manage_agent_users_', '')
     
+    # ✅ 清除搜索用户状态标志（用户返回列表时）
+    context.user_data.pop('AGENT_AWAIT_USER_SEARCH', None)
+    context.user_data.pop('AGENT_AWAIT_AGENT_ID', None)
+    
     try:
         # 获取代理信息
         agent_info = get_agent_bot_info(agent_bot_id)
@@ -13582,6 +13590,10 @@ def balance_manage_specific_agent(update: Update, context: CallbackContext):
         return
     
     agent_bot_id = query.data.replace('balance_manage_', '')
+    
+    # ✅ 清除搜索用户状态标志（用户返回余额管理时）
+    context.user_data.pop('AGENT_AWAIT_USER_SEARCH', None)
+    context.user_data.pop('AGENT_AWAIT_AGENT_ID', None)
     
     # ✅ 设置活动代理ID到用户上下文，使得后续的/uset命令默认使用此代理
     context.user_data['active_agent_id'] = normalize_agent_bot_id(agent_bot_id)
