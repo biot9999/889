@@ -1752,7 +1752,13 @@ class AgentBotCore:
             coll_users = self.config.get_agent_user_collection()
             user = coll_users.find_one({'user_id': user_id})
             if not user:
-                return False, "用户不存在"
+                # ✅ 自动创建用户（auto-provision）
+                logger.info(f"🔧 用户 {user_id} 不存在，自动创建")
+                if not self.register_user(user_id, "", ""):
+                    return False, "用户创建失败"
+                user = coll_users.find_one({'user_id': user_id})
+                if not user:
+                    return False, "用户不存在"
 
             # ✅ 获取商品原始信息
             product = self.config.ejfl.find_one({'nowuid': product_nowuid})
@@ -3251,6 +3257,11 @@ class AgentBotHandlers:
         d = q.data
         try:
             logger.info(f"[DEBUG] callback data: {d}")
+            
+            # ✅ 自动注册用户（确保用户存在于数据库中）
+            user = update.effective_user
+            if user:
+                self.core.register_user(user.id, user.username or "", user.first_name or "")
 
             # 基础导航
             if d == "products":
@@ -3470,6 +3481,12 @@ class AgentBotHandlers:
     def handle_text_message(self, update: Update, context: CallbackContext):
         """处理文本消息"""
         uid = update.effective_user.id
+        
+        # ✅ 自动注册用户（确保用户存在于数据库中）
+        user = update.effective_user
+        if user:
+            self.core.register_user(user.id, user.username or "", user.first_name or "")
+        
         if uid not in self.user_states:
             return
         

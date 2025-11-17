@@ -10826,6 +10826,10 @@ def handle_all_callbacks(update: Update, context: CallbackContext):
             query.edit_message_text("❌ 权限错误")
             return
         
+        # ✅ 设置等待用户搜索的标志（防止被产品搜索拦截）
+        context.user_data['AGENT_AWAIT_USER_SEARCH'] = True
+        context.user_data['AGENT_AWAIT_AGENT_ID'] = normalize_agent_bot_id(agent_bot_id)
+        
         # 提示用户输入要搜索的用户ID
         text = f"""🔍 <b>搜索代理用户</b>
         
@@ -12733,6 +12737,10 @@ def manage_specific_agent_users(update: Update, context: CallbackContext):
     if not multi_bot_system.is_master_admin(user_id):
         query.edit_message_text("❌ 权限错误")
         return
+    
+    # ✅ 清除用户搜索状态（如果从搜索界面返回）
+    context.user_data.pop('AGENT_AWAIT_USER_SEARCH', None)
+    context.user_data.pop('AGENT_AWAIT_AGENT_ID', None)
     
     agent_bot_id = query.data.replace('manage_agent_users_', '')
     
