@@ -1631,7 +1631,7 @@ class AgentBotCore:
                         f"🔗 TX：<code>{self._h(tx_short)}</code>"
                     )
                     Bot(self.config.BOT_TOKEN).send_message(
-                        chat_id=AGENT_NOTIFY_CHAT_ID,
+                        chat_id=self.config.AGENT_NOTIFY_CHAT_ID,  # ✅ 修复：使用实例配置
                         text=text,
                         parse_mode=ParseMode.HTML,
                         reply_markup=self._kb_tx_addr_user(tx_id, self.config.AGENT_USDT_ADDRESS, order['user_id'])
@@ -1854,7 +1854,7 @@ class AgentBotCore:
                         f"⏰ 时间：{self._h(sale_time)}"
                     )
                     Bot(self.config.BOT_TOKEN).send_message(
-                        chat_id=AGENT_NOTIFY_CHAT_ID,
+                        chat_id=self.config.AGENT_NOTIFY_CHAT_ID,  # ✅ 修复：使用实例配置
                         text=text,
                         parse_mode=ParseMode.HTML,
                         reply_markup=self._kb_product_actions(nowuid, user_id)
