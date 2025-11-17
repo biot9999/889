@@ -217,20 +217,20 @@ class AgentBotConfig:
             logger.error(f"❌ 数据库连接失败: {e}")
             raise
 
-	def get_agent_user_collection(self):
-		suffix = self.AGENT_BOT_ID[6:] if self.AGENT_BOT_ID.startswith('agent_') else self.AGENT_BOT_ID
-		return self.db[f'agent_users_{suffix}']
+    def get_agent_user_collection(self):
+        suffix = self.AGENT_BOT_ID[6:] if self.AGENT_BOT_ID.startswith('agent_') else self.AGENT_BOT_ID
+        return self.db[f'agent_users_{suffix}']
 
-	def get_agent_gmjlu_collection(self):
-		suffix = self.AGENT_BOT_ID[6:] if self.AGENT_BOT_ID.startswith('agent_') else self.AGENT_BOT_ID
-		return self.db[f'agent_gmjlu_{suffix}']
+    def get_agent_gmjlu_collection(self):
+        suffix = self.AGENT_BOT_ID[6:] if self.AGENT_BOT_ID.startswith('agent_') else self.AGENT_BOT_ID
+        return self.db[f'agent_gmjlu_{suffix}']
 
-	def _next_tron_api_key(self) -> Optional[str]:
-		if not self.TRON_API_KEYS:
-			return None
-		key = self.TRON_API_KEYS[self._tron_key_index % len(self.TRON_API_KEYS)]
-		self._tron_key_index = (self._tron_key_index + 1) % max(len(self.TRON_API_KEYS), 1)
-		return key
+    def _next_tron_api_key(self) -> Optional[str]:
+        if not self.TRON_API_KEYS:
+            return None
+        key = self.TRON_API_KEYS[self._tron_key_index % len(self.TRON_API_KEYS)]
+        self._tron_key_index = (self._tron_key_index + 1) % max(len(self.TRON_API_KEYS), 1)
+        return key
 
 
 class AgentBotCore:
