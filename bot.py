@@ -9282,6 +9282,11 @@ def textkeyboard(update: Update, context: CallbackContext):
 
             # ✅ 关键词查询功能 - 用户发送关键词自动查询商品
             else:
+                # ✅ 防御性检查：如果处于等待用户搜索状态，不要处理为商品搜索
+                if context.user_data.get('AGENT_AWAIT_USER_SEARCH'):
+                    # 这条消息会被 handle_agent_balance_user_search_text 处理
+                    return
+                
                 # ✅ 如果管理员正在等待输入交易哈希，不处理该消息，让后续的 handle_admin_txhash_message 处理
                 if user_id in WAITING_TXHASH:
                     return
@@ -13570,6 +13575,9 @@ def balance_manage_specific_agent(update: Update, context: CallbackContext):
     
     agent_bot_id = query.data.replace('balance_manage_', '')
     
+    # ✅ 设置活动代理ID到用户上下文，使得后续的/uset命令默认使用此代理
+    context.user_data['active_agent_id'] = normalize_agent_bot_id(agent_bot_id)
+    
     try:
         # 获取代理信息
         agent_info = get_agent_bot_info(agent_bot_id)
@@ -13682,17 +13690,19 @@ def search_user_balance(update: Update, context: CallbackContext):
             query.edit_message_text("❌ 代理机器人不存在")
             return
         
+        # ✅ 设置等待用户搜索的标志
+        context.user_data['AGENT_AWAIT_USER_SEARCH'] = True
+        context.user_data['AGENT_AWAIT_AGENT_ID'] = normalize_agent_bot_id(agent_bot_id)
+        
         text = f"🔍 <b>{agent_info['agent_name']} - 搜索用户</b>\n\n"
-        text += "请使用以下命令搜索用户：\n\n"
-        text += f"<code>/uset 用户ID +金额</code> - 给用户增加余额\n"
-        text += f"<code>/uset 用户ID -金额</code> - 给用户减少余额\n\n"
-        text += "💡 <b>提示：</b>\n"
-        text += "• 如果用户在多个代理下有账户，系统会让您选择\n"
-        text += "• 所有余额变动都会记录操作日志\n"
-        text += "• 用户会收到余额变动通知"
+        text += "请直接发送用户ID或用户名进行搜索：\n\n"
+        text += "示例：\n"
+        text += "• 发送用户ID：<code>5611529170</code>\n"
+        text += "• 发送用户名：<code>@username</code> 或 <code>username</code>\n\n"
+        text += "💡 搜索后将显示用户的余额信息和操作选项"
         
         keyboard = [
-            [InlineKeyboardButton("🔙 返回", callback_data=f'balance_manage_{agent_bot_id}')]
+            [InlineKeyboardButton("❌ 取消搜索", callback_data=f'balance_manage_{agent_bot_id}')]
         ]
         
         query.edit_message_text(
@@ -13704,6 +13714,108 @@ def search_user_balance(update: Update, context: CallbackContext):
     except Exception as e:
         print(f"❌ 搜索用户余额失败: {e}")
         query.edit_message_text("❌ 操作失败")
+
+def handle_agent_balance_user_search_text(update: Update, context: CallbackContext):
+    """处理代理余额管理中的用户搜索文本输入"""
+    user_id = update.effective_user.id
+    
+    # 检查是否在等待用户搜索状态
+    if not context.user_data.get('AGENT_AWAIT_USER_SEARCH'):
+        return  # 不是用户搜索状态，不处理
+    
+    # 检查管理员权限
+    if not multi_bot_system.is_master_admin(user_id):
+        return
+    
+    agent_bot_id = context.user_data.get('AGENT_AWAIT_AGENT_ID')
+    if not agent_bot_id:
+        update.message.reply_text("❌ 错误：未找到代理信息")
+        context.user_data.pop('AGENT_AWAIT_USER_SEARCH', None)
+        context.user_data.pop('AGENT_AWAIT_AGENT_ID', None)
+        return
+    
+    # 清除等待标志
+    context.user_data.pop('AGENT_AWAIT_USER_SEARCH', None)
+    context.user_data.pop('AGENT_AWAIT_AGENT_ID', None)
+    
+    search_text = update.message.text.strip()
+    
+    try:
+        # 获取代理信息
+        agent_info = get_agent_bot_info(agent_bot_id)
+        if not agent_info:
+            update.message.reply_text("❌ 代理机器人不存在")
+            return
+        
+        agent_users = get_agent_bot_user_collection(agent_bot_id)
+        
+        # 尝试按用户ID搜索（数字）
+        found_user = None
+        if search_text.isdigit():
+            target_user_id = int(search_text)
+            found_user = agent_users.find_one({'user_id': target_user_id})
+        else:
+            # 按用户名搜索（去掉@符号）
+            username = search_text.lstrip('@')
+            found_user = agent_users.find_one({'username': username})
+        
+        if not found_user:
+            text = f"❌ 未找到用户\n\n"
+            text += f"搜索条件：<code>{search_text}</code>\n"
+            text += f"代理：{agent_info['agent_name']}\n\n"
+            text += "💡 提示：\n"
+            text += "• 用户可能不存在于此代理下\n"
+            text += "• 您可以使用 /uset 命令为新用户自动创建账户并充值"
+            
+            keyboard = [
+                [InlineKeyboardButton("🔙 返回余额管理", callback_data=f'balance_manage_{agent_bot_id}')]
+            ]
+            
+            update.message.reply_text(
+                text,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        # 显示用户信息卡片
+        user_id_found = found_user.get('user_id')
+        username = found_user.get('username', '')
+        fullname = found_user.get('fullname', '未知')
+        balance = found_user.get('USDT', 0)
+        zgje = found_user.get('zgje', 0)
+        zgsl = found_user.get('zgsl', 0)
+        creation_time = found_user.get('creation_time', '未知')
+        
+        text = f"👤 <b>用户信息</b>\n\n"
+        text += f"用户ID：<code>{user_id_found}</code>\n"
+        if username:
+            text += f"用户名：@{username}\n"
+        text += f"姓名：{fullname}\n"
+        text += f"💰 余额：<code>{balance:.2f}</code> USDT\n"
+        text += f"📊 总消费：<code>{zgje:.2f}</code> USDT\n"
+        text += f"🛒 购买次数：<code>{zgsl}</code> 次\n"
+        text += f"⏰ 注册时间：{creation_time}\n"
+        text += f"🏢 所属代理：{agent_info['agent_name']}\n\n"
+        text += "💡 使用 /uset 命令可以调整此用户余额"
+        
+        keyboard = [
+            [InlineKeyboardButton(f"➕ 增加余额", callback_data=f'add_balance_{agent_bot_id}_{user_id_found}'),
+             InlineKeyboardButton(f"➖ 减少余额", callback_data=f'subtract_balance_{agent_bot_id}_{user_id_found}')],
+            [InlineKeyboardButton("🔙 返回余额管理", callback_data=f'balance_manage_{agent_bot_id}')]
+        ]
+        
+        update.message.reply_text(
+            text,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+    except Exception as e:
+        print(f"❌ 用户搜索失败: {e}")
+        import traceback
+        traceback.print_exc()
+        update.message.reply_text("❌ 搜索失败，请重试")
 
 def detailed_balance_stats(update: Update, context: CallbackContext):
     """详细余额统计"""
@@ -13977,25 +14089,45 @@ def balance_operation_logs(update: Update, context: CallbackContext):
 def get_agent_bot_token(agent_bot_id):
     """
     根据代理机器人ID获取对应的token
-    格式: agent_bot_token_完整ID
+    优先从multi_bot_system.get_agent_bot_list()获取，如果不存在则从环境变量获取
+    格式: agent_bot_token_<ID后缀>
     """
     try:
-        # ✅ 规范化agent_bot_id后再提取ID部分用于环境变量查找
+        # ✅ 规范化agent_bot_id
         agent_bot_id = normalize_agent_bot_id(agent_bot_id)
+        
+        # ✅ 第一步：尝试从multi_bot_system.get_agent_bot_list()获取token
+        try:
+            agent_bots = multi_bot_system.get_agent_bot_list()
+            for bot in agent_bots:
+                if bot.get('agent_bot_id') == agent_bot_id:
+                    token = bot.get('agent_token')
+                    if token:
+                        print(f"✅ 从agent_bot_list获取token: agent_bot_id={agent_bot_id}")
+                        return token
+        except Exception as e:
+            print(f"⚠️ 从agent_bot_list获取token失败: {e}")
+        
+        # ✅ 第二步：回退到环境变量
         clean_id = _get_agent_id_suffix(agent_bot_id)
         token = os.getenv(f"agent_bot_token_{clean_id}")
-        print(f"尝试获取token配置: agent_bot_token_{clean_id}")  # 调试日志
-        if not token:
-            print(f"❌ 未找到token配置，请在环境变量中设置: agent_bot_token_{clean_id}")
-        return token
+        if token:
+            print(f"✅ 从环境变量获取token: agent_bot_token_{clean_id}")
+            return token
+        else:
+            print(f"❌ 未找到token配置: agent_bot_id={agent_bot_id}, env_var=agent_bot_token_{clean_id}")
+            return None
+            
     except Exception as e:
-        print(f"获取代理token失败: {e}")
+        print(f"❌ 获取代理token失败: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def handle_user_balance_set(update: Update, context: CallbackContext):
     """
     总部管理员操作用户余额的命令
-    格式: /uset <用户ID> <+/-金额>
+    格式: /uset <用户ID> <+/-金额> [agent_bot_id]
     """
     user_id = update.effective_user.id
     
@@ -14006,13 +14138,14 @@ def handle_user_balance_set(update: Update, context: CallbackContext):
         
     try:
         args = context.args
-        if len(args) != 2:
+        if len(args) < 2 or len(args) > 3:
             update.message.reply_text(
                 "❌ 格式错误\n"
-                "正确格式: /uset <用户ID> <+/-金额>\n"
+                "正确格式: /uset <用户ID> <+/-金额> [agent_bot_id]\n"
                 "例如:\n"
-                "/uset 123456 +100  - 给用户增加100 USDT\n"
-                "/uset 123456 -50   - 给用户减少50 USDT"
+                "/uset 123456 +100  - 给用户增加100 USDT（使用当前查看的代理或搜索所有代理）\n"
+                "/uset 123456 -50   - 给用户减少50 USDT\n"
+                "/uset 123456 +100 agent_62448807  - 给指定代理下的用户增加100 USDT"
             )
             return
             
@@ -14024,6 +14157,9 @@ def handle_user_balance_set(update: Update, context: CallbackContext):
             amount = float(amount_str)
             is_add = amount > 0
             abs_amount = abs(amount)
+            
+            # 检查是否指定了agent_bot_id
+            specified_agent_id = args[2] if len(args) == 3 else None
         except ValueError:
             update.message.reply_text("❌ 格式错误\n用户ID必须为数字\n金额必须以+或-开头")
             return
@@ -14031,8 +14167,114 @@ def handle_user_balance_set(update: Update, context: CallbackContext):
         if abs_amount <= 0:
             update.message.reply_text("❌ 金额必须大于0")
             return
+        
+        # 确定目标代理
+        target_agent_id = None
+        if specified_agent_id:
+            # 使用指定的agent_bot_id
+            target_agent_id = normalize_agent_bot_id(specified_agent_id)
+            agent_info = get_agent_bot_info(target_agent_id)
+            if not agent_info:
+                update.message.reply_text(f"❌ 未找到代理: {specified_agent_id}")
+                return
+        elif context.user_data.get('active_agent_id'):
+            # 使用当前活动的agent_id（从余额管理界面设置）
+            target_agent_id = context.user_data.get('active_agent_id')
+            agent_info = get_agent_bot_info(target_agent_id)
+            if not agent_info:
+                # 清除无效的active_agent_id
+                context.user_data.pop('active_agent_id', None)
+                target_agent_id = None
+        
+        if target_agent_id:
+            # 已确定目标代理，直接操作
+            agent_info = get_agent_bot_info(target_agent_id)
+            agent_users = get_agent_bot_user_collection(target_agent_id)
+            user = agent_users.find_one({'user_id': target_user_id})
             
-        # 获取代理机器人列表
+            if not user:
+                # ✅ 自动创建用户（auto-provision）
+                print(f"🔧 用户 {target_user_id} 不存在于代理 {target_agent_id}，自动创建")
+                creation_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                success, count_id = create_agent_user_data(
+                    agent_bot_id=target_agent_id,
+                    user_id=target_user_id,
+                    username='unknown',
+                    fullname=f'用户{target_user_id}',
+                    creation_time=creation_time
+                )
+                if not success:
+                    update.message.reply_text("❌ 创建用户失败")
+                    return
+                # 重新获取用户信息
+                user = agent_users.find_one({'user_id': target_user_id})
+            
+            current_balance = user.get('USDT', 0)
+            
+            # 检查余额是否足够(仅减币时)
+            if not is_add and current_balance < abs_amount:
+                update.message.reply_text(f"❌ 用户余额不足\n当前余额: {current_balance:.2f} USDT")
+                return
+            
+            # 更新余额
+            success = update_agent_bot_user_balance(
+                target_agent_id, 
+                target_user_id,
+                amount
+            )
+            
+            if success:
+                new_balance = current_balance + amount
+                
+                # 记录操作日志
+                admin_logs = bot_db.get_collection('admin_operation_logs')
+                admin_logs.insert_one({
+                    'agent_bot_id': target_agent_id,
+                    'target_user_id': target_user_id,
+                    'admin_user_id': user_id,
+                    'operation_type': 'add' if is_add else 'subtract',
+                    'amount_changed': amount,
+                    'before_balance': current_balance,
+                    'after_balance': new_balance,
+                    'operation_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'reason': 'manual_adjustment'
+                })
+                
+                # 发送成功消息给管理员
+                result_text = f"""✅ 操作成功
+
+👤 用户ID: {target_user_id}
+💰 变动: {amount_str} USDT
+💹 原始余额: {current_balance:.2f} USDT
+💎 当前余额: {new_balance:.2f} USDT
+🏢 所属代理: {agent_info['agent_name']}"""
+                
+                update.message.reply_text(result_text)
+                
+                # 尝试使用代理机器人通知用户
+                try:
+                    agent_token = get_agent_bot_token(target_agent_id)
+                    if agent_token:
+                        notify_text = f"""💰 余额变动通知
+
+{'➕ 增加' if is_add else '➖ 减少'}: {abs_amount:.2f} USDT
+💎 当前余额: {new_balance:.2f} USDT
+⏰ 操作时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+如有疑问请联系客服"""
+                        
+                        agent_bot = telegram.Bot(token=agent_token)
+                        agent_bot.send_message(
+                            chat_id=target_user_id,
+                            text=notify_text
+                        )
+                except Exception as e:
+                    print(f"通知用户失败: {e}")
+            else:
+                update.message.reply_text("❌ 余额更新失败")
+            return
+            
+        # 没有指定代理也没有活动代理，扫描所有代理查找用户
         agent_bots = multi_bot_system.get_agent_bot_list()
         found_accounts = []
         
@@ -14049,7 +14291,7 @@ def handle_user_balance_set(update: Update, context: CallbackContext):
                 })
                 
         if not found_accounts:
-            update.message.reply_text("❌ 未找到该用户")
+            update.message.reply_text("❌ 未找到该用户\n\n💡 提示：如果要为新用户创建账户，请使用命令：\n/uset <用户ID> <金额> <agent_bot_id>")
             return
             
         if len(found_accounts) > 1:
@@ -14106,7 +14348,8 @@ def handle_user_balance_set(update: Update, context: CallbackContext):
                 'amount_changed': amount,
                 'before_balance': current_balance,
                 'after_balance': new_balance,
-                'operation_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                'operation_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'reason': 'manual_adjustment'
             })
             
             # 发送成功消息给管理员
@@ -14151,7 +14394,7 @@ def handle_user_balance_set(update: Update, context: CallbackContext):
         update.message.reply_text(f"❌ 操作失败: {str(e)}")
 
 def handle_uset_callback(update: Update, context: CallbackContext):
-    """处理余额操作的回调查询"""
+    """处理余额操作的回调查询（支持auto-provision）"""
     query = update.callback_query
     user_id = query.from_user.id
     
@@ -14165,19 +14408,40 @@ def handle_uset_callback(update: Update, context: CallbackContext):
             return
             
         # 解析callback_data
-        _, target_user_id, amount_str, agent_bot_id = query.data.split('_')
+        _, target_user_id, amount_str, agent_bot_id = query.data.split('_', 3)
         target_user_id = int(target_user_id)
         amount = float(amount_str)
+        
+        # 规范化agent_bot_id
+        agent_bot_id = normalize_agent_bot_id(agent_bot_id)
+        
+        # 获取代理信息
+        agent_info = get_agent_bot_info(agent_bot_id)
+        if not agent_info:
+            query.edit_message_text("❌ 代理机器人不存在")
+            return
         
         # 获取用户信息
         agent_users = get_agent_bot_user_collection(agent_bot_id)
         user = agent_users.find_one({'user_id': target_user_id})
-        bot = multi_bot_system.get_agent_bot_info(agent_bot_id)
         
-        if not user or not bot:
-            query.edit_message_text("❌ 用户或代理信息不存在")
-            return
-            
+        if not user:
+            # ✅ 自动创建用户（auto-provision）
+            print(f"🔧 用户 {target_user_id} 不存在于代理 {agent_bot_id}，自动创建")
+            creation_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            success, count_id = create_agent_user_data(
+                agent_bot_id=agent_bot_id,
+                user_id=target_user_id,
+                username='unknown',
+                fullname=f'用户{target_user_id}',
+                creation_time=creation_time
+            )
+            if not success:
+                query.edit_message_text("❌ 创建用户失败")
+                return
+            # 重新获取用户信息
+            user = agent_users.find_one({'user_id': target_user_id})
+        
         current_balance = user.get('USDT', 0)
         
         # 检查余额是否足够(仅减币时)
@@ -14205,7 +14469,8 @@ def handle_uset_callback(update: Update, context: CallbackContext):
                 'amount_changed': amount,
                 'before_balance': current_balance,
                 'after_balance': new_balance,
-                'operation_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                'operation_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'reason': 'manual_adjustment'
             })
             
             # 更新消息
@@ -14215,106 +14480,7 @@ def handle_uset_callback(update: Update, context: CallbackContext):
 💰 变动: {amount_str} USDT
 💹 原始余额: {current_balance:.2f} USDT
 💎 当前余额: {new_balance:.2f} USDT
-🏢 所属代理: {bot['agent_name']}"""
-            
-            query.edit_message_text(result_text)
-            
-            # 尝试使用代理机器人通知用户
-            try:
-                # 使用新的get_agent_bot_token函数获取token
-                agent_token = get_agent_bot_token(agent_bot_id)
-                if agent_token:
-                    notify_text = f"""💰 余额变动通知
-
-{'➕ 增加' if amount > 0 else '➖ 减少'}: {abs(amount):.2f} USDT
-💎 当前余额: {new_balance:.2f} USDT
-⏰ 操作时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-如有疑问请联系客服"""
-                    
-                    agent_bot = telegram.Bot(token=agent_token)
-                    agent_bot.send_message(
-                        chat_id=target_user_id,
-                        text=notify_text
-                    )
-                else:
-                    print(f"❌ 未找到代理机器人token: {agent_bot_id}")
-            except Exception as e:
-                print(f"通知用户失败: {e}")
-                
-        else:
-            query.edit_message_text("❌ 余额更新失败")
-            
-    except Exception as e:
-        print(f"处理回调失败: {e}")
-        query.edit_message_text("❌ 操作失败")
-        
-def handle_uset_callback(update: Update, context: CallbackContext):
-    """处理余额操作的回调查询"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    
-    if not multi_bot_system.is_master_admin(user_id):
-        query.answer("❌ 权限不足")
-        return
-        
-    try:
-        if query.data == "cancel":
-            query.edit_message_text("❌ 已取消操作")
-            return
-            
-        # 解析callback_data
-        _, target_user_id, amount_str, agent_bot_id = query.data.split('_')
-        target_user_id = int(target_user_id)
-        amount = float(amount_str)
-        
-        # 获取用户信息
-        agent_users = get_agent_bot_user_collection(agent_bot_id)
-        user = agent_users.find_one({'user_id': target_user_id})
-        bot = multi_bot_system.get_agent_bot_info(agent_bot_id)
-        
-        if not user or not bot:
-            query.edit_message_text("❌ 用户或代理信息不存在")
-            return
-            
-        current_balance = user.get('USDT', 0)
-        
-        # 检查余额是否足够(仅减币时)
-        if amount < 0 and current_balance < abs(amount):
-            query.edit_message_text(f"❌ 用户余额不足\n当前余额: {current_balance:.2f} USDT")
-            return
-            
-        # 更新余额
-        success = update_agent_bot_user_balance(
-            agent_bot_id,
-            target_user_id,
-            amount
-        )
-        
-        if success:
-            new_balance = current_balance + amount
-            
-            # 记录操作日志
-            admin_logs = bot_db.get_collection('admin_operation_logs')
-            admin_logs.insert_one({
-                'agent_bot_id': agent_bot_id,
-                'target_user_id': target_user_id,
-                'admin_user_id': user_id,
-                'operation_type': 'add' if amount > 0 else 'subtract',
-                'amount_changed': amount,
-                'before_balance': current_balance,
-                'after_balance': new_balance,
-                'operation_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            })
-            
-            # 更新消息
-            result_text = f"""✅ 操作成功
-
-👤 用户ID: {target_user_id}
-💰 变动: {amount_str} USDT
-💹 原始余额: {current_balance:.2f} USDT
-💎 当前余额: {new_balance:.2f} USDT
-🏢 所属代理: {bot['agent_name']}"""
+🏢 所属代理: {agent_info['agent_name']}"""
             
             query.edit_message_text(result_text)
             
@@ -14343,6 +14509,8 @@ def handle_uset_callback(update: Update, context: CallbackContext):
             
     except Exception as e:
         print(f"处理回调失败: {e}")
+        import traceback
+        traceback.print_exc()
         query.edit_message_text("❌ 操作失败")
         
         
@@ -14656,6 +14824,11 @@ def main():
     # 在组1中注册，这样textkeyboard处理后才会检查这个处理器
     # 内部会检查向导状态，只在向导激活时处理消息
     dispatcher.add_handler(MessageHandler(Filters.private & Filters.text & ~Filters.command, handle_agent_create_text, run_async=True), group=1)
+    
+    # 🔧 代理余额用户搜索文本处理器（组1）
+    # 在组1中注册，用于处理"搜索特定用户"功能的文本输入
+    # 必须在textkeyboard之后处理，避免被产品搜索拦截
+    dispatcher.add_handler(MessageHandler(Filters.private & Filters.text & ~Filters.command, handle_agent_balance_user_search_text, run_async=True), group=1)
     
     # 🆕 用户提现TXID提交处理器（组1）
     # 这个处理器在textkeyboard处理后触发
