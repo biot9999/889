@@ -906,12 +906,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'accounts_add_session':
         logger.info(f"User {user_id} selecting session upload option")
         await show_upload_type_menu(query)
-    elif data == 'upload_session_file':
-        logger.info(f"User {user_id} choosing to upload session file")
-        return await request_session_upload(update, context)
-    elif data == 'upload_tdata_file':
-        logger.info(f"User {user_id} choosing to upload tdata file")
-        return await request_tdata_upload(update, context)
+    # Note: upload_session_file and upload_tdata_file are handled by ConversationHandler
     elif data.startswith('account_check_'):
         account_id = int(data.split('_')[2])
         logger.info(f"User {user_id} checking account {account_id}")
@@ -1487,9 +1482,8 @@ def main():
     
     logger.info("Registering command handlers...")
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button_handler))
     
-    # File upload conversation handler
+    # File upload conversation handler (registered BEFORE button_handler to catch specific callbacks first)
     logger.info("Registering file upload conversation handler...")
     upload_conv = ConversationHandler(
         entry_points=[
@@ -1519,6 +1513,10 @@ def main():
     )
     
     application.add_handler(task_conv)
+    
+    # General button handler (registered AFTER conversation handlers)
+    logger.info("Registering general button handler...")
+    application.add_handler(CallbackQueryHandler(button_handler))
     
     logger.info("=" * 80)
     logger.info("Bot started successfully! Listening for updates...")
