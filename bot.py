@@ -172,6 +172,14 @@ class MediaType(enum.Enum):
     FORWARD = "forward"
 
 
+class SendMethod(enum.Enum):
+    """Send method"""
+    DIRECT = "direct"  # 直接发送
+    POSTBOT = "postbot"  # post代码（使用@postbot配置）
+    CHANNEL_FORWARD = "channel_forward"  # 频道转发
+    CHANNEL_FORWARD_HIDDEN = "channel_forward_hidden"  # 隐藏转发来源
+
+
 # ============================================================================
 # 数据库模型
 # ============================================================================
@@ -207,6 +215,9 @@ class Task(Base):
     message_format = Column(SQLEnum(MessageFormat), default=MessageFormat.PLAIN)
     media_type = Column(SQLEnum(MediaType), default=MediaType.TEXT)
     media_path = Column(String(500), nullable=True)
+    send_method = Column(SQLEnum(SendMethod), default=SendMethod.DIRECT)
+    postbot_code = Column(Text, nullable=True)  # post代码内容
+    channel_link = Column(String(500), nullable=True)  # 频道链接
     min_interval = Column(Integer, default=30)
     max_interval = Column(Integer, default=120)
     account_id = Column(Integer, ForeignKey('accounts.id'), nullable=True)
@@ -534,7 +545,8 @@ class TaskManager:
         self.stop_flags = {}
     
     def create_task(self, name, message_text, message_format, media_type=MediaType.TEXT,
-                   media_path=None, min_interval=30, max_interval=120):
+                   media_path=None, send_method=SendMethod.DIRECT, postbot_code=None, 
+                   channel_link=None, min_interval=30, max_interval=120):
         """Create new task"""
         task = Task(
             name=name,
@@ -542,6 +554,9 @@ class TaskManager:
             message_format=message_format,
             media_type=media_type,
             media_path=media_path,
+            send_method=send_method,
+            postbot_code=postbot_code,
+            channel_link=channel_link,
             min_interval=min_interval,
             max_interval=max_interval,
             status=TaskStatus.PENDING
@@ -823,8 +838,9 @@ class TaskManager:
 
 # Conversation states
 (PHONE_INPUT, CODE_INPUT, PASSWORD_INPUT, 
- MESSAGE_INPUT, FORMAT_SELECT, MEDIA_SELECT, MEDIA_UPLOAD,
- TARGET_INPUT, TASK_NAME_INPUT, SESSION_UPLOAD, TDATA_UPLOAD) = range(11)
+ MESSAGE_INPUT, FORMAT_SELECT, SEND_METHOD_SELECT, MEDIA_SELECT, MEDIA_UPLOAD,
+ TARGET_INPUT, TASK_NAME_INPUT, SESSION_UPLOAD, TDATA_UPLOAD, POSTBOT_CODE_INPUT,
+ CHANNEL_LINK_INPUT, PREVIEW_CONFIG) = range(15)
 
 # Global managers
 account_manager = None
@@ -939,7 +955,38 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         format_name = data.split('_')[1]
         context.user_data['message_format'] = MessageFormat[format_name.upper()]
         logger.info(f"User {user_id} selected format: {format_name}")
-        return await select_media_type(query)
+        return await select_send_method(query)
+    
+    # Send method selection
+    elif data.startswith('sendmethod_'):
+        if data == 'sendmethod_preview':
+            return await show_preview(query, context)
+        elif data == 'sendmethod_direct':
+            context.user_data['send_method'] = SendMethod.DIRECT
+            logger.info(f"User {user_id} selected send method: direct")
+            return await select_media_type(query)
+        elif data == 'sendmethod_postbot':
+            context.user_data['send_method'] = SendMethod.POSTBOT
+            logger.info(f"User {user_id} selected send method: postbot")
+            return await request_postbot_code(query)
+        elif data == 'sendmethod_channel_forward':
+            context.user_data['send_method'] = SendMethod.CHANNEL_FORWARD
+            logger.info(f"User {user_id} selected send method: channel_forward")
+            return await request_channel_link(query)
+        elif data == 'sendmethod_channel_forward_hidden':
+            context.user_data['send_method'] = SendMethod.CHANNEL_FORWARD_HIDDEN
+            logger.info(f"User {user_id} selected send method: channel_forward_hidden")
+            return await request_channel_link(query)
+    
+    # Preview continue
+    elif data == 'preview_continue':
+        send_method = context.user_data.get('send_method', SendMethod.DIRECT)
+        if send_method == SendMethod.DIRECT:
+            return await select_media_type(query)
+        elif send_method == SendMethod.POSTBOT:
+            return await request_postbot_code(query)
+        elif send_method in [SendMethod.CHANNEL_FORWARD, SendMethod.CHANNEL_FORWARD_HIDDEN]:
+            return await request_channel_link(query)
     
     # Media selection
     elif data.startswith('media_'):
@@ -1267,6 +1314,29 @@ async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYP
     return FORMAT_SELECT
 
 
+async def select_send_method(query):
+    """Select send method"""
+    keyboard = [
+        [InlineKeyboardButton("📤 直接发送", callback_data='sendmethod_direct')],
+        [InlineKeyboardButton("🤖 Post代码", callback_data='sendmethod_postbot')],
+        [InlineKeyboardButton("📢 频道转发", callback_data='sendmethod_channel_forward')],
+        [InlineKeyboardButton("🔒 隐藏转发来源", callback_data='sendmethod_channel_forward_hidden')],
+        [InlineKeyboardButton("👁️ 查看预览", callback_data='sendmethod_preview')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.message.reply_text(
+        "📮 <b>发送方式配置</b>\n\n"
+        "请选择发送方式：\n"
+        "📤 直接发送 - 直接发送纯文本消息\n"
+        "🤖 Post代码 - 使用 @postbot 配置的图文按钮\n"
+        "📢 频道转发 - 转发频道帖子\n"
+        "🔒 隐藏转发来源 - 转发频道帖子但隐藏来源",
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+    return SEND_METHOD_SELECT
+
+
 async def select_media_type(query):
     """Select media type"""
     keyboard = [
@@ -1284,6 +1354,116 @@ async def request_media_upload(query):
     """Request media upload"""
     await query.message.reply_text("请上传媒体文件：")
     return MEDIA_UPLOAD
+
+
+async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle media file upload"""
+    user_id = update.effective_user.id
+    logger.info(f"User {user_id} uploading media file")
+    
+    try:
+        if not update.message.document and not update.message.photo and not update.message.video:
+            await update.message.reply_text("❌ 请上传有效的媒体文件")
+            return MEDIA_UPLOAD
+        
+        # Save the file
+        if update.message.document:
+            file = await update.message.document.get_file()
+            file_ext = os.path.splitext(update.message.document.file_name)[1]
+        elif update.message.photo:
+            file = await update.message.photo[-1].get_file()
+            file_ext = '.jpg'
+        elif update.message.video:
+            file = await update.message.video.get_file()
+            file_ext = '.mp4'
+        else:
+            await update.message.reply_text("❌ 不支持的媒体类型")
+            return MEDIA_UPLOAD
+        
+        # Save to media directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"media_{user_id}_{timestamp}{file_ext}"
+        media_path = os.path.join(Config.MEDIA_DIR, filename)
+        await file.download_to_drive(media_path)
+        
+        context.user_data['media_path'] = media_path
+        logger.info(f"User {user_id} uploaded media to {media_path}")
+        
+        await update.message.reply_text("✅ 媒体文件已保存")
+        return await request_target_list_from_update(update)
+        
+    except Exception as e:
+        logger.error(f"Error handling media upload for user {user_id}: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ 上传失败：{str(e)}")
+        return MEDIA_UPLOAD
+
+
+async def request_postbot_code(query):
+    """Request postbot code input"""
+    await query.message.reply_text(
+        "🤖 <b>Post代码输入</b>\n\n"
+        "请输入从 @postbot 获取的代码：\n\n"
+        "💡 提示：使用 @postbot 创建图文按钮后，复制生成的代码粘贴到这里",
+        parse_mode='HTML'
+    )
+    return POSTBOT_CODE_INPUT
+
+
+async def handle_postbot_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle postbot code input"""
+    context.user_data['postbot_code'] = update.message.text
+    await update.message.reply_text("✅ Post代码已保存")
+    return await request_target_list_from_update(update)
+
+
+async def request_channel_link(query):
+    """Request channel link input"""
+    await query.message.reply_text(
+        "📢 <b>频道链接输入</b>\n\n"
+        "请输入频道帖子链接：\n\n"
+        "💡 格式：https://t.me/channel_name/message_id",
+        parse_mode='HTML'
+    )
+    return CHANNEL_LINK_INPUT
+
+
+async def handle_channel_link_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle channel link input"""
+    context.user_data['channel_link'] = update.message.text
+    await update.message.reply_text("✅ 频道链接已保存")
+    return await request_target_list_from_update(update)
+
+
+async def show_preview(query, context):
+    """Show preview of configured message"""
+    message_text = context.user_data.get('message_text', '')
+    message_format = context.user_data.get('message_format', MessageFormat.PLAIN)
+    send_method = context.user_data.get('send_method', SendMethod.DIRECT)
+    
+    preview_text = (
+        "👁️ <b>消息预览</b>\n\n"
+        f"📝 格式：{message_format.value}\n"
+        f"📮 发送方式：{send_method.value}\n\n"
+        f"<b>内容：</b>\n{message_text[:200]}{'...' if len(message_text) > 200 else ''}"
+    )
+    
+    keyboard = [[InlineKeyboardButton("✅ 继续配置", callback_data='preview_continue')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.reply_text(preview_text, parse_mode='HTML', reply_markup=reply_markup)
+    return PREVIEW_CONFIG
+
+
+async def request_target_list_from_update(update: Update):
+    """Request target list from update (helper for text input handlers)"""
+    await update.message.reply_text(
+        "✅ 配置完成\n\n"
+        "请发送目标列表：\n"
+        "1️⃣ 直接发送（每行一个）\n"
+        "2️⃣ 上传 .txt 文件\n\n"
+        "格式：@username 或 用户ID"
+    )
+    return TARGET_INPUT
 
 
 async def request_target_list(query):
@@ -1332,6 +1512,9 @@ async def handle_target_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             message_format=context.user_data['message_format'],
             media_type=context.user_data.get('media_type', MediaType.TEXT),
             media_path=context.user_data.get('media_path'),
+            send_method=context.user_data.get('send_method', SendMethod.DIRECT),
+            postbot_code=context.user_data.get('postbot_code'),
+            channel_link=context.user_data.get('channel_link'),
             min_interval=Config.DEFAULT_MIN_INTERVAL,
             max_interval=Config.DEFAULT_MAX_INTERVAL
         )
@@ -1425,9 +1608,28 @@ async def export_results(query, task_id):
             status = "成功" if log.success else "失败"
             f.write(f"[{log.sent_at}] {status}: {log.error_message or 'OK'}\n")
     
-    await query.message.reply_document(document=open(success_file, 'rb'), filename="success.txt")
-    await query.message.reply_document(document=open(failed_file, 'rb'), filename="failed.txt")
-    await query.message.reply_document(document=open(log_file, 'rb'), filename="log.txt")
+    # Only send non-empty files (Telegram API rejects empty files)
+    try:
+        if os.path.getsize(success_file) > 0:
+            with open(success_file, 'rb') as f:
+                await query.message.reply_document(document=f, filename="success.txt")
+    except Exception as e:
+        logger.warning(f"Failed to send success file: {e}")
+    
+    try:
+        if os.path.getsize(failed_file) > 0:
+            with open(failed_file, 'rb') as f:
+                await query.message.reply_document(document=f, filename="failed.txt")
+    except Exception as e:
+        logger.warning(f"Failed to send failed file: {e}")
+    
+    try:
+        if os.path.getsize(log_file) > 0:
+            with open(log_file, 'rb') as f:
+                await query.message.reply_document(document=f, filename="log.txt")
+    except Exception as e:
+        logger.warning(f"Failed to send log file: {e}")
+    
     await query.message.reply_text("✅ 结果已导出")
 
 
@@ -1562,7 +1764,12 @@ def main():
             TASK_NAME_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_task_name)],
             MESSAGE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_input)],
             FORMAT_SELECT: [CallbackQueryHandler(button_handler)],
+            SEND_METHOD_SELECT: [CallbackQueryHandler(button_handler)],
+            POSTBOT_CODE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_postbot_code_input)],
+            CHANNEL_LINK_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_link_input)],
+            PREVIEW_CONFIG: [CallbackQueryHandler(button_handler)],
             MEDIA_SELECT: [CallbackQueryHandler(button_handler)],
+            MEDIA_UPLOAD: [MessageHandler((filters.Document.ALL | filters.PHOTO | filters.VIDEO) & ~filters.COMMAND, handle_media_upload)],
             TARGET_INPUT: [MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, handle_target_input)]
         },
         fallbacks=[CommandHandler("start", start)]
