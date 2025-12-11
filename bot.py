@@ -136,6 +136,29 @@ class Config:
 
 
 # ============================================================================
+# 常量
+# ============================================================================
+# Postbot code validation
+POSTBOT_CODE_MIN_LENGTH = 10
+
+# UI labels mapping
+SEND_METHOD_LABELS = {
+    SendMethod.DIRECT: '📤 直接发送',
+    SendMethod.POSTBOT: '🤖 Post代码',
+    SendMethod.CHANNEL_FORWARD: '📢 频道转发',
+    SendMethod.CHANNEL_FORWARD_HIDDEN: '🔒 隐藏转发来源'
+}
+
+MEDIA_TYPE_LABELS = {
+    MediaType.TEXT: '📝 纯文本',
+    MediaType.IMAGE: '🖼️ 图片',
+    MediaType.VIDEO: '🎥 视频',
+    MediaType.DOCUMENT: '📄 文档',
+    MediaType.FORWARD: '📡 转发'
+}
+
+
+# ============================================================================
 # 枚举类型
 # ============================================================================
 class AccountStatus(enum.Enum):
@@ -1411,8 +1434,8 @@ async def handle_postbot_code_input(update: Update, context: ContextTypes.DEFAUL
     code = update.message.text.strip()
     
     # Validate postbot code format (must be like 693af80c53cb2)
-    # Pattern: alphanumeric characters, typically 13+ characters
-    if not re.match(r'^[a-zA-Z0-9]{10,}$', code):
+    # Pattern: alphanumeric characters, minimum length defined by constant
+    if not re.match(rf'^[a-zA-Z0-9]{{{POSTBOT_CODE_MIN_LENGTH},}}$', code):
         await update.message.reply_text(
             "❌ <b>代码格式错误</b>\n\n"
             "Post代码格式应该类似：<code>693af80c53cb2</code>\n\n"
@@ -1471,28 +1494,11 @@ async def show_preview(query, context):
     send_method = context.user_data.get('send_method', SendMethod.DIRECT)
     media_type = context.user_data.get('media_type', MediaType.TEXT)
     
-    # Map send method to Chinese
-    send_method_map = {
-        SendMethod.DIRECT: '📤 直接发送',
-        SendMethod.POSTBOT: '🤖 Post代码',
-        SendMethod.CHANNEL_FORWARD: '📢 频道转发',
-        SendMethod.CHANNEL_FORWARD_HIDDEN: '🔒 隐藏转发来源'
-    }
-    
-    # Map media type to Chinese
-    media_type_map = {
-        MediaType.TEXT: '📝 纯文本',
-        MediaType.IMAGE: '🖼️ 图片',
-        MediaType.VIDEO: '🎥 视频',
-        MediaType.DOCUMENT: '📄 文档',
-        MediaType.FORWARD: '📡 转发'
-    }
-    
     preview_text = (
         "👁️ <b>预览配置的广告文案！</b>\n\n"
-        f"📮 发送方式：{send_method_map.get(send_method, send_method.value)}\n"
+        f"📮 发送方式：{SEND_METHOD_LABELS.get(send_method, send_method.value)}\n"
         f"📝 消息格式：{message_format.value}\n"
-        f"📦 媒体类型：{media_type_map.get(media_type, media_type.value)}\n\n"
+        f"📦 媒体类型：{MEDIA_TYPE_LABELS.get(media_type, media_type.value)}\n\n"
         f"<b>消息内容：</b>\n{message_text[:200]}{'...' if len(message_text) > 200 else ''}\n\n"
         f"======下一步===\n"
         f"✅ 配置完成"
@@ -1512,28 +1518,11 @@ async def show_preview_from_update(update: Update, context: ContextTypes.DEFAULT
     send_method = context.user_data.get('send_method', SendMethod.DIRECT)
     media_type = context.user_data.get('media_type', MediaType.TEXT)
     
-    # Map send method to Chinese
-    send_method_map = {
-        SendMethod.DIRECT: '📤 直接发送',
-        SendMethod.POSTBOT: '🤖 Post代码',
-        SendMethod.CHANNEL_FORWARD: '📢 频道转发',
-        SendMethod.CHANNEL_FORWARD_HIDDEN: '🔒 隐藏转发来源'
-    }
-    
-    # Map media type to Chinese
-    media_type_map = {
-        MediaType.TEXT: '📝 纯文本',
-        MediaType.IMAGE: '🖼️ 图片',
-        MediaType.VIDEO: '🎥 视频',
-        MediaType.DOCUMENT: '📄 文档',
-        MediaType.FORWARD: '📡 转发'
-    }
-    
     preview_text = (
         "👁️ <b>预览配置的广告文案！</b>\n\n"
-        f"📮 发送方式：{send_method_map.get(send_method, send_method.value)}\n"
+        f"📮 发送方式：{SEND_METHOD_LABELS.get(send_method, send_method.value)}\n"
         f"📝 消息格式：{message_format.value}\n"
-        f"📦 媒体类型：{media_type_map.get(media_type, media_type.value)}\n\n"
+        f"📦 媒体类型：{MEDIA_TYPE_LABELS.get(media_type, media_type.value)}\n\n"
         f"<b>消息内容：</b>\n{message_text[:200]}{'...' if len(message_text) > 200 else ''}\n\n"
         f"======下一步===\n"
         f"✅ 配置完成"
