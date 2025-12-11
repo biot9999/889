@@ -148,12 +148,14 @@ print(Fernet.generate_key().decode())
 - ⚙️ **全局设置** - 查看系统配置
 - ❓ **帮助文档** - 查看使用说明
 
-#### 3. 添加账户
+#### 3. 添加账户（支持多种方式）
 1. 点击 "📱 账户管理"
 2. 点击 "➕ 添加账户"
 3. 选择添加方式：
-   - **🔑 Session String**: 直接粘贴从 Telethon 导出的 Session String
-   - **📞 手机号登录**: 输入手机号并接收验证码（开发中）
+   - **🔑 Session String**: 直接粘贴 Telethon 导出的 Session String
+   - **📄 Session JSON 文件**: 上传包含 session_string 的 JSON 文件
+   - **📁 TData 文件夹**: 上传 Telegram Desktop 的 tdata 文件夹（ZIP 压缩包）
+   - **📞 手机号+验证码**: 输入手机号，接收并输入验证码（支持两步验证）
 
 #### 4. 创建任务
 1. 点击 "📝 任务管理"
@@ -309,17 +311,41 @@ print(Fernet.generate_key().decode())
 ## 📝 常见问题
 
 ### Q: 如何获取 Session String？
-A: 您可以使用 Telethon 库导出 Session String：
+
+A: 有多种方式：
+
+**方式 1 - 使用 Telethon 代码导出：**
 ```python
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-api_id = YOUR_API_ID
-api_hash = 'YOUR_API_HASH'
+API_ID = 你的API_ID
+API_HASH = '你的API_Hash'
 
-with TelegramClient(StringSession(), api_id, api_hash) as client:
+with TelegramClient(StringSession(), API_ID, API_HASH) as client:
+    print("你的 Session String:")
     print(client.session.save())
 ```
+
+**方式 2 - 从 JSON 文件：**
+创建一个 JSON 文件（例如 session.json）：
+```json
+{
+  "session_string": "1AQAAAAAZ...",
+  "phone": "+86138xxxxxxxx"
+}
+```
+
+**方式 3 - 从 Telegram Desktop：**
+1. 找到 tdata 文件夹：
+   - Windows: `%APPDATA%\Telegram Desktop\tdata`
+   - Linux: `~/.local/share/TelegramDesktop/tdata`
+   - macOS: `~/Library/Application Support/Telegram Desktop/tdata`
+2. 将整个 tdata 文件夹压缩为 ZIP
+3. 上传到机器人
+
+**方式 4 - 直接使用手机号：**
+机器人会自动发送验证码到您的手机
 
 ### Q: 账户被限制了怎么办？
 A: 

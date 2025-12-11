@@ -658,7 +658,9 @@ def get_account_add_method_keyboard() -> InlineKeyboardMarkup:
     """获取账户添加方式选择键盘"""
     keyboard = [
         [InlineKeyboardButton("🔑 Session String", callback_data="account_add_session")],
-        [InlineKeyboardButton("📞 手机号登录", callback_data="account_add_phone")],
+        [InlineKeyboardButton("📄 Session JSON 文件", callback_data="account_add_json")],
+        [InlineKeyboardButton("📁 TData 文件夹", callback_data="account_add_tdata")],
+        [InlineKeyboardButton("📞 手机号+验证码", callback_data="account_add_phone")],
         [InlineKeyboardButton("🔙 返回", callback_data="menu_accounts")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -806,21 +808,64 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text(
             "🔑 通过 Session String 添加账户\n\n"
             "请发送您的 Telegram Session String：\n"
-            "（从 Telethon 导出的会话字符串）",
+            "（从 Telethon 导出的会话字符串）\n\n"
+            "格式示例：\n"
+            "1AQAAAAAZ4BH6vUGAgm...",
             reply_markup=get_back_keyboard("menu_accounts")
         )
         context.user_data['waiting_for'] = 'session_string'
         return WAITING_SESSION_STRING
     
+    # 通过 Session JSON 文件添加账户
+    elif data == "account_add_json":
+        await query.edit_message_text(
+            "📄 通过 Session JSON 文件添加账户\n\n"
+            "请上传您的 Session JSON 文件：\n"
+            "• 支持 Telethon 导出的 .session.json 文件\n"
+            "• 文件应包含 session_string 字段\n\n"
+            "JSON 格式示例：\n"
+            "{\n"
+            '  "session_string": "1AQAAAAAZ...",\n'
+            '  "phone": "+86138xxxxxxxx"\n'
+            "}",
+            reply_markup=get_back_keyboard("menu_accounts")
+        )
+        context.user_data['waiting_for'] = 'session_json'
+        return WAITING_SESSION_STRING
+    
+    # 通过 TData 文件夹添加账户
+    elif data == "account_add_tdata":
+        await query.edit_message_text(
+            "📁 通过 TData 文件夹添加账户\n\n"
+            "请上传 TData 文件夹中的文件：\n"
+            "• 需要上传 key_datas 文件\n"
+            "• 可选上传其他 tdata 相关文件\n\n"
+            "⚠️ 注意：\n"
+            "TData 文件来自 Telegram Desktop\n"
+            "路径通常在：\n"
+            "• Windows: %APPDATA%\\Telegram Desktop\\tdata\n"
+            "• Linux: ~/.local/share/TelegramDesktop/tdata\n"
+            "• macOS: ~/Library/Application Support/Telegram Desktop/tdata\n\n"
+            "请将整个 tdata 文件夹打包为 ZIP 后上传",
+            reply_markup=get_back_keyboard("menu_accounts")
+        )
+        context.user_data['waiting_for'] = 'tdata_file'
+        return WAITING_SESSION_STRING
+    
     # 通过手机号添加账户
     elif data == "account_add_phone":
         await query.edit_message_text(
-            "📞 通过手机号添加账户\n\n"
-            "请发送您的手机号（包含国家代码）：\n"
-            "例如: +86 138xxxxxxxx",
+            "📞 通过手机号+验证码添加账户\n\n"
+            "步骤 1/2: 请发送您的手机号\n\n"
+            "格式：+国家代码 手机号\n"
+            "例如：\n"
+            "• +86 138xxxxxxxx（中国）\n"
+            "• +1 2025551234（美国）\n"
+            "• +7 9161234567（俄罗斯）",
             reply_markup=get_back_keyboard("menu_accounts")
         )
         context.user_data['waiting_for'] = 'phone_number'
+        context.user_data['phone_login'] = {}
         return WAITING_PHONE_NUMBER
     
     # 账户列表
@@ -1082,7 +1127,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """消息处理器 - 处理用户输入"""
     user_id = update.effective_user.id
-    text = update.message.text
+    text = update.message.text if update.message.text else ""
     
     waiting_for = context.user_data.get('waiting_for')
     
@@ -1115,6 +1160,307 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ 添加账户失败: {str(e)}",
                 reply_markup=get_back_keyboard("menu_accounts")
             )
+    
+    # 处理 Session JSON 文件
+    elif waiting_for == 'session_json':
+        # 检查是否有文档
+        if update.message.document:
+            try:
+                file = await update.message.document.get_file()
+                file_content = await file.download_as_bytearray()
+                
+                # 解析 JSON
+                import json
+                session_data = json.loads(file_content.decode('utf-8'))
+                
+                # 提取 session string
+                session_string = session_data.get('session_string') or session_data.get('session')
+                phone_number = session_data.get('phone') or session_data.get('phone_number')
+                
+                if not session_string:
+                    await update.message.reply_text(
+                        "❌ JSON 文件中未找到 session_string 字段",
+                        reply_markup=get_back_keyboard("menu_accounts")
+                    )
+                    return
+                
+                # 添加账户
+                user = db_manager.get_or_create_user(user_id, update.effective_user.username)
+                account_manager.add_account(user.id, session_string, phone_number)
+                
+                await update.message.reply_text(
+                    f"✅ 账户添加成功！\n手机号: {phone_number or 'N/A'}",
+                    reply_markup=get_accounts_menu_keyboard()
+                )
+                
+                context.user_data['waiting_for'] = None
+                return ConversationHandler.END
+                
+            except json.JSONDecodeError:
+                await update.message.reply_text(
+                    "❌ JSON 文件格式错误，请检查文件内容",
+                    reply_markup=get_back_keyboard("menu_accounts")
+                )
+            except Exception as e:
+                logger.error(f"添加账户失败: {e}")
+                await update.message.reply_text(
+                    f"❌ 添加账户失败: {str(e)}",
+                    reply_markup=get_back_keyboard("menu_accounts")
+                )
+        else:
+            await update.message.reply_text(
+                "❌ 请上传 JSON 文件",
+                reply_markup=get_back_keyboard("menu_accounts")
+            )
+    
+    # 处理 TData 文件
+    elif waiting_for == 'tdata_file':
+        if update.message.document:
+            try:
+                file = await update.message.document.get_file()
+                
+                # 检查是否是 ZIP 文件
+                if not update.message.document.file_name.endswith('.zip'):
+                    await update.message.reply_text(
+                        "❌ 请上传 ZIP 格式的 tdata 文件夹压缩包",
+                        reply_markup=get_back_keyboard("menu_accounts")
+                    )
+                    return
+                
+                # 下载文件
+                import tempfile
+                import zipfile
+                from pathlib import Path
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_file:
+                    await file.download_to_drive(tmp_file.name)
+                    
+                    # 解压文件
+                    with zipfile.ZipFile(tmp_file.name, 'r') as zip_ref:
+                        extract_dir = tempfile.mkdtemp()
+                        zip_ref.extractall(extract_dir)
+                        
+                        # 查找 key_datas 文件
+                        key_datas_path = None
+                        for root, dirs, files in os.walk(extract_dir):
+                            if 'key_datas' in files:
+                                key_datas_path = os.path.join(root, 'key_datas')
+                                break
+                        
+                        if not key_datas_path:
+                            await update.message.reply_text(
+                                "❌ 未找到 key_datas 文件，请确认上传的是正确的 tdata 文件夹",
+                                reply_markup=get_back_keyboard("menu_accounts")
+                            )
+                            return
+                        
+                        # TODO: 这里需要实现 TData 到 Session String 的转换
+                        # 这需要使用 opentele 或类似库来转换
+                        await update.message.reply_text(
+                            "⚠️ TData 转换功能开发中\n\n"
+                            "建议使用以下方式：\n"
+                            "1. 使用 Session String 方式\n"
+                            "2. 使用 Session JSON 文件方式\n"
+                            "3. 使用手机号+验证码方式",
+                            reply_markup=get_back_keyboard("menu_accounts")
+                        )
+                        
+                        # 清理临时文件
+                        import shutil
+                        shutil.rmtree(extract_dir)
+                        os.unlink(tmp_file.name)
+                
+            except Exception as e:
+                logger.error(f"处理 TData 文件失败: {e}")
+                await update.message.reply_text(
+                    f"❌ 处理文件失败: {str(e)}",
+                    reply_markup=get_back_keyboard("menu_accounts")
+                )
+        else:
+            await update.message.reply_text(
+                "❌ 请上传 ZIP 文件",
+                reply_markup=get_back_keyboard("menu_accounts")
+            )
+    
+    # 处理手机号输入
+    elif waiting_for == 'phone_number':
+        try:
+            # 清理手机号格式
+            phone = text.strip().replace(' ', '').replace('-', '')
+            
+            if not phone.startswith('+'):
+                await update.message.reply_text(
+                    "❌ 手机号格式错误，必须包含国家代码\n"
+                    "例如: +86 138xxxxxxxx",
+                    reply_markup=get_back_keyboard("menu_accounts")
+                )
+                return
+            
+            # 保存手机号并发送验证码
+            context.user_data['phone_login']['phone'] = phone
+            
+            # 创建 Telethon 客户端并发送验证码
+            from telethon import TelegramClient
+            from telethon.sessions import StringSession
+            
+            client = TelegramClient(StringSession(), API_ID, API_HASH)
+            await client.connect()
+            
+            # 发送验证码
+            result = await client.send_code_request(phone)
+            context.user_data['phone_login']['phone_code_hash'] = result.phone_code_hash
+            context.user_data['phone_login']['client_session'] = client.session.save()
+            
+            await client.disconnect()
+            
+            await update.message.reply_text(
+                f"📲 验证码已发送到 {phone}\n\n"
+                f"步骤 2/2: 请输入收到的验证码\n\n"
+                f"格式：12345（5位数字）",
+                reply_markup=get_back_keyboard("menu_accounts")
+            )
+            
+            context.user_data['waiting_for'] = 'verification_code'
+            return WAITING_VERIFICATION_CODE
+            
+        except Exception as e:
+            logger.error(f"发送验证码失败: {e}")
+            await update.message.reply_text(
+                f"❌ 发送验证码失败: {str(e)}\n\n"
+                f"可能的原因：\n"
+                f"• 手机号格式错误\n"
+                f"• API_ID 或 API_HASH 配置错误\n"
+                f"• 网络连接问题",
+                reply_markup=get_back_keyboard("menu_accounts")
+            )
+            context.user_data['waiting_for'] = None
+    
+    # 处理验证码输入
+    elif waiting_for == 'verification_code':
+        try:
+            code = text.strip().replace(' ', '').replace('-', '')
+            
+            phone_login = context.user_data.get('phone_login', {})
+            phone = phone_login.get('phone')
+            phone_code_hash = phone_login.get('phone_code_hash')
+            saved_session = phone_login.get('client_session')
+            
+            if not all([phone, phone_code_hash, saved_session]):
+                await update.message.reply_text(
+                    "❌ 会话已过期，请重新开始",
+                    reply_markup=get_back_keyboard("menu_accounts")
+                )
+                context.user_data['waiting_for'] = None
+                return
+            
+            # 使用验证码登录
+            from telethon import TelegramClient
+            from telethon.sessions import StringSession
+            
+            client = TelegramClient(StringSession(saved_session), API_ID, API_HASH)
+            await client.connect()
+            
+            try:
+                # 尝试使用验证码登录
+                await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+            except Exception as e:
+                error_str = str(e).lower()
+                if 'password' in error_str or 'two-step' in error_str:
+                    # 需要两步验证密码
+                    await update.message.reply_text(
+                        "🔐 账户启用了两步验证\n\n"
+                        "请输入您的两步验证密码：",
+                        reply_markup=get_back_keyboard("menu_accounts")
+                    )
+                    context.user_data['waiting_for'] = 'two_factor_password'
+                    await client.disconnect()
+                    return
+                else:
+                    raise
+            
+            # 获取 session string
+            session_string = client.session.save()
+            await client.disconnect()
+            
+            # 添加账户
+            user = db_manager.get_or_create_user(user_id, update.effective_user.username)
+            account_manager.add_account(user.id, session_string, phone)
+            
+            await update.message.reply_text(
+                f"✅ 账户添加成功！\n"
+                f"手机号: {phone}",
+                reply_markup=get_accounts_menu_keyboard()
+            )
+            
+            context.user_data['waiting_for'] = None
+            context.user_data['phone_login'] = {}
+            return ConversationHandler.END
+            
+        except Exception as e:
+            logger.error(f"验证码登录失败: {e}")
+            await update.message.reply_text(
+                f"❌ 登录失败: {str(e)}\n\n"
+                f"可能的原因：\n"
+                f"• 验证码错误或已过期\n"
+                f"• 请重新开始添加流程",
+                reply_markup=get_back_keyboard("menu_accounts")
+            )
+            context.user_data['waiting_for'] = None
+            context.user_data['phone_login'] = {}
+    
+    # 处理两步验证密码
+    elif waiting_for == 'two_factor_password':
+        try:
+            password = text.strip()
+            
+            phone_login = context.user_data.get('phone_login', {})
+            phone = phone_login.get('phone')
+            saved_session = phone_login.get('client_session')
+            
+            if not all([phone, saved_session]):
+                await update.message.reply_text(
+                    "❌ 会话已过期，请重新开始",
+                    reply_markup=get_back_keyboard("menu_accounts")
+                )
+                context.user_data['waiting_for'] = None
+                return
+            
+            # 使用密码完成登录
+            from telethon import TelegramClient
+            from telethon.sessions import StringSession
+            
+            client = TelegramClient(StringSession(saved_session), API_ID, API_HASH)
+            await client.connect()
+            
+            await client.sign_in(password=password)
+            
+            # 获取 session string
+            session_string = client.session.save()
+            await client.disconnect()
+            
+            # 添加账户
+            user = db_manager.get_or_create_user(user_id, update.effective_user.username)
+            account_manager.add_account(user.id, session_string, phone)
+            
+            await update.message.reply_text(
+                f"✅ 账户添加成功！\n"
+                f"手机号: {phone}",
+                reply_markup=get_accounts_menu_keyboard()
+            )
+            
+            context.user_data['waiting_for'] = None
+            context.user_data['phone_login'] = {}
+            return ConversationHandler.END
+            
+        except Exception as e:
+            logger.error(f"两步验证失败: {e}")
+            await update.message.reply_text(
+                f"❌ 密码错误: {str(e)}\n\n"
+                f"请重新开始添加流程",
+                reply_markup=get_back_keyboard("menu_accounts")
+            )
+            context.user_data['waiting_for'] = None
+            context.user_data['phone_login'] = {}
     
     # 处理消息模板输入
     elif waiting_for == 'message_template':
@@ -1281,6 +1627,7 @@ def main():
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CallbackQueryHandler(button_callback_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    application.add_handler(MessageHandler(filters.Document.ALL, message_handler))  # 文档处理
     
     # 启动机器人
     logger.info("机器人已启动，按 Ctrl+C 停止")
