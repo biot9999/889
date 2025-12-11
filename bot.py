@@ -939,7 +939,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         format_name = data.split('_')[1]
         context.user_data['message_format'] = MessageFormat[format_name.upper()]
         logger.info(f"User {user_id} selected format: {format_name}")
-        await select_media_type(query)
+        return await select_media_type(query)
     
     # Media selection
     elif data.startswith('media_'):
@@ -947,9 +947,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['media_type'] = MediaType[media_name.upper()]
         logger.info(f"User {user_id} selected media type: {media_name}")
         if context.user_data['media_type'] == MediaType.TEXT:
-            await request_target_list(query)
+            return await request_target_list(query)
         else:
-            await request_media_upload(query)
+            return await request_media_upload(query)
     
     # Back
     elif data == 'back_main':
@@ -1300,38 +1300,66 @@ async def request_target_list(query):
 
 async def handle_target_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle target input"""
-    if update.message.text:
-        targets = update.message.text.strip().split('\n')
-    elif update.message.document:
-        file = await update.message.document.get_file()
-        content = await file.download_as_bytearray()
-        targets = task_manager.parse_target_file(bytes(content))
-    else:
-        await update.message.reply_text("❌ 无效输入")
+    user_id = update.effective_user.id
+    logger.info(f"User {user_id} submitting target input")
+    
+    try:
+        if update.message.text:
+            logger.info(f"User {user_id} sent text input")
+            targets = update.message.text.strip().split('\n')
+            logger.info(f"Parsed {len(targets)} targets from text")
+        elif update.message.document:
+            logger.info(f"User {user_id} sent document: {update.message.document.file_name}")
+            file = await update.message.document.get_file()
+            content = await file.download_as_bytearray()
+            logger.info(f"Downloaded file: {len(content)} bytes")
+            targets = task_manager.parse_target_file(bytes(content))
+            logger.info(f"Parsed {len(targets)} targets from file")
+        else:
+            logger.warning(f"User {user_id} sent invalid input (no text or document)")
+            await update.message.reply_text("❌ 无效输入\n\n请发送文本或上传 .txt 文件")
+            return TARGET_INPUT
+        
+        if not targets:
+            logger.warning(f"User {user_id} submitted empty target list")
+            await update.message.reply_text("❌ 目标列表为空\n\n请添加至少一个目标")
+            return TARGET_INPUT
+        
+        logger.info(f"Creating task for user {user_id}")
+        task = task_manager.create_task(
+            name=context.user_data['task_name'],
+            message_text=context.user_data['message_text'],
+            message_format=context.user_data['message_format'],
+            media_type=context.user_data.get('media_type', MediaType.TEXT),
+            media_path=context.user_data.get('media_path'),
+            min_interval=Config.DEFAULT_MIN_INTERVAL,
+            max_interval=Config.DEFAULT_MAX_INTERVAL
+        )
+        
+        logger.info(f"Adding {len(targets)} targets to task {task.id}")
+        added = task_manager.add_targets(task.id, targets)
+        logger.info(f"Successfully added {added} targets to task {task.id}")
+        
+        await update.message.reply_text(
+            f"✅ <b>任务创建成功！</b>\n\n"
+            f"任务: {task.name}\n"
+            f"目标: {added}\n\n"
+            f"使用 /start 查看任务",
+            parse_mode='HTML'
+        )
+        
+        context.user_data.clear()
+        return ConversationHandler.END
+        
+    except Exception as e:
+        logger.error(f"Error handling target input for user {user_id}: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ <b>处理失败</b>\n\n"
+            f"错误：{str(e)}\n\n"
+            f"请重试或使用 /start 返回主菜单",
+            parse_mode='HTML'
+        )
         return TARGET_INPUT
-    
-    task = task_manager.create_task(
-        name=context.user_data['task_name'],
-        message_text=context.user_data['message_text'],
-        message_format=context.user_data['message_format'],
-        media_type=context.user_data.get('media_type', MediaType.TEXT),
-        media_path=context.user_data.get('media_path'),
-        min_interval=Config.DEFAULT_MIN_INTERVAL,
-        max_interval=Config.DEFAULT_MAX_INTERVAL
-    )
-    
-    added = task_manager.add_targets(task.id, targets)
-    
-    await update.message.reply_text(
-        f"✅ <b>任务创建成功！</b>\n\n"
-        f"任务: {task.name}\n"
-        f"目标: {added}\n\n"
-        f"使用 /start 查看任务",
-        parse_mode='HTML'
-    )
-    
-    context.user_data.clear()
-    return ConversationHandler.END
 
 
 async def start_task_handler(query, task_id):
