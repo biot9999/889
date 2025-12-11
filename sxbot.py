@@ -1,1 +1,1272 @@
-#私信机器人  用于给其他人发送私信
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Telegram 私信机器人管理系统
+用于管理多个 Telegram 账户并执行批量私信任务
+使用内联按钮进行交互，无需使用命令
+"""
+
+import os
+import sys
+import asyncio
+import logging
+import random
+import json
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
+from pathlib import Path
+
+# 第三方库导入
+try:
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram.ext import (
+        Application, 
+        CallbackQueryHandler, 
+        CommandHandler,
+        MessageHandler,
+        ContextTypes,
+        ConversationHandler,
+        filters
+    )
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text, JSON, create_engine
+    from sqlalchemy.orm import relationship, declarative_base, sessionmaker, Session
+    from cryptography.fernet import Fernet
+    from dotenv import load_dotenv
+except ImportError as e:
+    print(f"缺少依赖库: {e}")
+    print("请运行: pip install python-telegram-bot telethon sqlalchemy cryptography python-dotenv")
+    sys.exit(1)
+
+# 加载环境变量
+load_dotenv()
+
+# ==================== 配置部分 ====================
+
+# 机器人配置
+BOT_TOKEN = os.getenv('BOT_TOKEN', '')
+API_ID = os.getenv('API_ID', '')
+API_HASH = os.getenv('API_HASH', '')
+
+# 数据库配置
+DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///telegram_bot.db')
+
+# 安全配置
+ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY', Fernet.generate_key().decode())
+ALLOWED_USERS = [int(uid.strip()) for uid in os.getenv('ALLOWED_USERS', '').split(',') if uid.strip()]
+
+# 发送限制配置
+MAX_MESSAGES_PER_ACCOUNT_PER_DAY = int(os.getenv('MAX_MESSAGES_PER_ACCOUNT_PER_DAY', '50'))
+MIN_DELAY_SECONDS = int(os.getenv('MIN_DELAY_SECONDS', '30'))
+MAX_DELAY_SECONDS = int(os.getenv('MAX_DELAY_SECONDS', '120'))
+
+# 日志配置
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('bot.log', encoding='utf-8')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ==================== 会话状态常量 ====================
+# 用于 ConversationHandler 的状态
+(
+    WAITING_SESSION_STRING,
+    WAITING_PHONE_NUMBER,
+    WAITING_VERIFICATION_CODE,
+    WAITING_MESSAGE_TEMPLATE,
+    WAITING_TARGET_LIST,
+    WAITING_ACCOUNT_SELECTION,
+    WAITING_DELAY_CONFIG,
+    WAITING_LIMIT_CONFIG,
+) = range(8)
+
+# ==================== 数据库模型 ====================
+
+Base = declarative_base()
+
+
+class User(Base):
+    """用户表 - 存储机器人用户信息"""
+    __tablename__ = 'users'
+    
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(Integer, unique=True, nullable=False, index=True)
+    username = Column(String(100))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    accounts = relationship('Account', back_populates='user', cascade='all, delete-orphan')
+    tasks = relationship('Task', back_populates='user', cascade='all, delete-orphan')
+
+
+class Account(Base):
+    """账户表 - 存储用于发送消息的 Telegram 账户"""
+    __tablename__ = 'accounts'
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    session_string = Column(Text, nullable=False)  # 加密存储
+    phone_number = Column(String(20))
+    status = Column(String(20), default='active')  # active, banned, limited
+    messages_sent_today = Column(Integer, default=0)
+    last_used_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    user = relationship('User', back_populates='accounts')
+    send_logs = relationship('SendLog', back_populates='account', cascade='all, delete-orphan')
+
+
+class Task(Base):
+    """任务表 - 存储私信发送任务"""
+    __tablename__ = 'tasks'
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    message_template = Column(Text, nullable=False)
+    target_list = Column(JSON)  # 目标用户列表
+    account_ids = Column(JSON)  # 使用的账户ID列表
+    status = Column(String(20), default='pending')  # pending, running, completed, failed, stopped
+    config = Column(JSON)  # 配置信息（包含媒体类型、格式等）
+    progress = Column(JSON)  # 进度信息
+    media_type = Column(String(20), default='text')  # text, photo, video, voice, document
+    media_url = Column(Text)  # 媒体文件URL或路径
+    parse_mode = Column(String(20), default='Markdown')  # None, Markdown, HTML
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+    
+    user = relationship('User', back_populates='tasks')
+    send_logs = relationship('SendLog', back_populates='task', cascade='all, delete-orphan')
+
+
+class SendLog(Base):
+    """发送日志表 - 记录每条消息的发送情况"""
+    __tablename__ = 'send_logs'
+    
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, ForeignKey('tasks.id'), nullable=False)
+    account_id = Column(Integer, ForeignKey('accounts.id'), nullable=False)
+    target_user = Column(String(100), nullable=False)
+    success = Column(Boolean, default=False)
+    error_message = Column(Text)
+    sent_at = Column(DateTime, default=datetime.utcnow)
+    
+    task = relationship('Task', back_populates='send_logs')
+    account = relationship('Account', back_populates='send_logs')
+
+
+# ==================== 数据库管理器 ====================
+
+class DatabaseManager:
+    """数据库管理器"""
+    
+    def __init__(self, database_url: str):
+        self.engine = create_engine(database_url, echo=False)
+        Base.metadata.create_all(self.engine)
+        self.SessionLocal = sessionmaker(bind=self.engine)
+    
+    def get_session(self) -> Session:
+        """获取数据库会话"""
+        return self.SessionLocal()
+    
+    def get_or_create_user(self, telegram_id: int, username: str = None) -> User:
+        """获取或创建用户"""
+        session = self.get_session()
+        try:
+            user = session.query(User).filter_by(telegram_id=telegram_id).first()
+            if not user:
+                user = User(telegram_id=telegram_id, username=username)
+                session.add(user)
+                session.commit()
+                session.refresh(user)
+            return user
+        finally:
+            session.close()
+
+
+# ==================== 加密工具 ====================
+
+class Encryptor:
+    """加密器 - 用于加密和解密敏感信息"""
+    
+    def __init__(self, key: str):
+        self.fernet = Fernet(key.encode())
+    
+    def encrypt(self, data: str) -> str:
+        """加密字符串"""
+        return self.fernet.encrypt(data.encode()).decode()
+    
+    def decrypt(self, encrypted_data: str) -> str:
+        """解密字符串"""
+        return self.fernet.decrypt(encrypted_data.encode()).decode()
+
+
+# ==================== 账户管理器 ====================
+
+class AccountManager:
+    """账户管理器 - 管理 Telegram 账户"""
+    
+    def __init__(self, db: DatabaseManager, encryptor: Encryptor):
+        self.db = db
+        self.encryptor = encryptor
+    
+    def add_account(self, user_id: int, session_string: str, phone_number: str = None) -> Account:
+        """添加新账户"""
+        session = self.db.get_session()
+        try:
+            encrypted_session = self.encryptor.encrypt(session_string)
+            account = Account(
+                user_id=user_id,
+                session_string=encrypted_session,
+                phone_number=phone_number,
+                status='active'
+            )
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            logger.info(f"添加账户成功: {phone_number}")
+            return account
+        finally:
+            session.close()
+    
+    def get_user_accounts(self, user_id: int) -> List[Account]:
+        """获取用户的所有账户"""
+        session = self.db.get_session()
+        try:
+            user = session.query(User).filter_by(telegram_id=user_id).first()
+            if user:
+                return session.query(Account).filter_by(user_id=user.id).all()
+            return []
+        finally:
+            session.close()
+    
+    def get_account(self, account_id: int) -> Optional[Account]:
+        """获取账户"""
+        session = self.db.get_session()
+        try:
+            return session.query(Account).filter_by(id=account_id).first()
+        finally:
+            session.close()
+    
+    def update_account_status(self, account_id: int, status: str):
+        """更新账户状态"""
+        session = self.db.get_session()
+        try:
+            account = session.query(Account).filter_by(id=account_id).first()
+            if account:
+                account.status = status
+                session.commit()
+                logger.info(f"账户 {account_id} 状态更新为: {status}")
+        finally:
+            session.close()
+    
+    async def verify_account(self, session_string: str) -> bool:
+        """验证账户是否有效"""
+        try:
+            decrypted_session = self.encryptor.decrypt(session_string) if session_string.startswith('gA') else session_string
+            client = TelegramClient(StringSession(decrypted_session), API_ID, API_HASH)
+            await client.connect()
+            if await client.is_user_authorized():
+                await client.disconnect()
+                return True
+            await client.disconnect()
+            return False
+        except Exception as e:
+            logger.error(f"账户验证失败: {e}")
+            return False
+
+
+# ==================== 任务管理器 ====================
+
+class TaskManager:
+    """任务管理器 - 管理私信发送任务"""
+    
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+        self.running_tasks: Dict[int, bool] = {}  # task_id -> is_running
+    
+    def create_task(
+        self,
+        user_id: int,
+        message_template: str,
+        target_list: List[str],
+        account_ids: List[int],
+        config: Dict[str, Any],
+        media_type: str = 'text',
+        media_url: str = None,
+        parse_mode: str = 'Markdown'
+    ) -> Task:
+        """创建新任务"""
+        session = self.db.get_session()
+        try:
+            user = session.query(User).filter_by(telegram_id=user_id).first()
+            task = Task(
+                user_id=user.id,
+                message_template=message_template,
+                target_list=target_list,
+                account_ids=account_ids,
+                status='pending',
+                config=config,
+                progress={'total': len(target_list), 'sent': 0, 'failed': 0},
+                media_type=media_type,
+                media_url=media_url,
+                parse_mode=parse_mode
+            )
+            session.add(task)
+            session.commit()
+            session.refresh(task)
+            logger.info(f"创建任务成功: Task ID {task.id}")
+            return task
+        finally:
+            session.close()
+    
+    def get_user_tasks(self, user_id: int) -> List[Task]:
+        """获取用户的所有任务"""
+        session = self.db.get_session()
+        try:
+            user = session.query(User).filter_by(telegram_id=user_id).first()
+            if user:
+                return session.query(Task).filter_by(user_id=user.id).order_by(Task.created_at.desc()).all()
+            return []
+        finally:
+            session.close()
+    
+    def get_task(self, task_id: int) -> Optional[Task]:
+        """获取任务"""
+        session = self.db.get_session()
+        try:
+            return session.query(Task).filter_by(id=task_id).first()
+        finally:
+            session.close()
+    
+    def update_task_status(self, task_id: int, status: str):
+        """更新任务状态"""
+        session = self.db.get_session()
+        try:
+            task = session.query(Task).filter_by(id=task_id).first()
+            if task:
+                task.status = status
+                if status == 'running':
+                    task.started_at = datetime.utcnow()
+                elif status in ['completed', 'failed', 'stopped']:
+                    task.completed_at = datetime.utcnow()
+                session.commit()
+        finally:
+            session.close()
+    
+    def update_task_progress(self, task_id: int, sent: int, failed: int):
+        """更新任务进度"""
+        session = self.db.get_session()
+        try:
+            task = session.query(Task).filter_by(id=task_id).first()
+            if task:
+                progress = task.progress or {}
+                progress['sent'] = sent
+                progress['failed'] = failed
+                task.progress = progress
+                session.commit()
+        finally:
+            session.close()
+    
+    def stop_task(self, task_id: int):
+        """停止任务"""
+        self.running_tasks[task_id] = False
+        self.update_task_status(task_id, 'stopped')
+        logger.info(f"任务 {task_id} 已停止")
+
+
+# ==================== 消息发送器 ====================
+
+class MessageSender:
+    """消息发送器 - 执行批量私信发送"""
+    
+    def __init__(
+        self,
+        db: DatabaseManager,
+        encryptor: Encryptor,
+        account_manager: AccountManager,
+        task_manager: TaskManager
+    ):
+        self.db = db
+        self.encryptor = encryptor
+        self.account_manager = account_manager
+        self.task_manager = task_manager
+    
+    async def send_task(self, task_id: int):
+        """执行发送任务"""
+        task = self.task_manager.get_task(task_id)
+        if not task:
+            logger.error(f"任务不存在: {task_id}")
+            return
+        
+        # 标记任务为运行中
+        self.task_manager.update_task_status(task_id, 'running')
+        self.task_manager.running_tasks[task_id] = True
+        
+        config = task.config or {}
+        min_delay = config.get('min_delay', MIN_DELAY_SECONDS)
+        max_delay = config.get('max_delay', MAX_DELAY_SECONDS)
+        max_per_account = config.get('max_per_account', MAX_MESSAGES_PER_ACCOUNT_PER_DAY)
+        
+        target_list = task.target_list
+        account_ids = task.account_ids
+        
+        sent_count = 0
+        failed_count = 0
+        
+        # 为每个目标分配账户（轮询方式）
+        account_index = 0
+        
+        for target in target_list:
+            # 检查任务是否被停止
+            if not self.task_manager.running_tasks.get(task_id, False):
+                logger.info(f"任务 {task_id} 已被停止")
+                break
+            
+            # 选择账户
+            if not account_ids:
+                logger.error("没有可用的账户")
+                break
+            
+            account_id = account_ids[account_index % len(account_ids)]
+            account = self.account_manager.get_account(account_id)
+            
+            if not account or account.status != 'active':
+                account_index += 1
+                continue
+            
+            # 检查账户今日发送限制
+            if account.messages_sent_today >= max_per_account:
+                logger.warning(f"账户 {account_id} 已达到今日发送限制")
+                account_index += 1
+                continue
+            
+            # 发送消息 - 传递媒体类型和解析模式
+            success = await self._send_message(
+                account, 
+                target, 
+                task.message_template, 
+                task_id,
+                media_type=task.media_type or 'text',
+                media_url=task.media_url,
+                parse_mode=task.parse_mode
+            )
+            
+            if success:
+                sent_count += 1
+                # 更新账户发送计数
+                self._update_account_sent_count(account_id)
+            else:
+                failed_count += 1
+            
+            # 更新任务进度
+            self.task_manager.update_task_progress(task_id, sent_count, failed_count)
+            
+            # 随机延迟
+            delay = random.randint(min_delay, max_delay)
+            logger.info(f"等待 {delay} 秒后发送下一条消息...")
+            await asyncio.sleep(delay)
+            
+            account_index += 1
+        
+        # 任务完成
+        self.task_manager.update_task_status(task_id, 'completed')
+        self.task_manager.running_tasks[task_id] = False
+        logger.info(f"任务 {task_id} 完成: 成功 {sent_count}, 失败 {failed_count}")
+    
+    async def _send_message(self, account: Account, target: str, message_template: str, task_id: int, media_type: str = 'text', media_url: str = None, parse_mode: str = None) -> bool:
+        """
+        发送单条消息 - 支持富媒体和个性化
+        
+        Args:
+            account: 发送账户
+            target: 目标用户
+            message_template: 消息模板
+            task_id: 任务ID
+            media_type: 媒体类型 (text, photo, video, voice, document)
+            media_url: 媒体文件URL或路径
+            parse_mode: 解析模式 (Markdown, HTML, None)
+        """
+        client = None
+        try:
+            # 解密 session string
+            decrypted_session = self.encryptor.decrypt(account.session_string)
+            
+            # 创建 Telethon 客户端
+            client = TelegramClient(StringSession(decrypted_session), API_ID, API_HASH)
+            await client.connect()
+            
+            if not await client.is_user_authorized():
+                logger.error(f"账户 {account.id} 未授权")
+                self.account_manager.update_account_status(account.id, 'limited')
+                await client.disconnect()
+                return False
+            
+            # 获取目标用户信息（用于个性化）
+            try:
+                target_entity = await client.get_entity(target)
+                first_name = getattr(target_entity, 'first_name', '')
+                last_name = getattr(target_entity, 'last_name', '')
+                username = getattr(target_entity, 'username', '')
+                
+                # 个性化变量替换 - 参考 TeleRaptor 的个性化功能
+                message = message_template
+                message = message.replace('{name}', username or first_name)
+                message = message.replace('{first_name}', first_name)
+                message = message.replace('{last_name}', last_name)
+                message = message.replace('{full_name}', f"{first_name} {last_name}".strip())
+                message = message.replace('{username}', f"@{username}" if username else first_name)
+                
+            except Exception as e:
+                logger.warning(f"无法获取用户信息 {target}: {e}")
+                message = message_template
+            
+            # 根据媒体类型发送 - 参考 TeleRaptor 的富媒体支持
+            if media_type == 'photo' and media_url:
+                # 发送图片消息
+                await client.send_file(
+                    target,
+                    media_url,
+                    caption=message,
+                    parse_mode=parse_mode
+                )
+            elif media_type == 'video' and media_url:
+                # 发送视频消息
+                await client.send_file(
+                    target,
+                    media_url,
+                    caption=message,
+                    parse_mode=parse_mode
+                )
+            elif media_type == 'voice' and media_url:
+                # 发送语音消息
+                await client.send_file(
+                    target,
+                    media_url,
+                    voice_note=True
+                )
+            elif media_type == 'document' and media_url:
+                # 发送文档
+                await client.send_file(
+                    target,
+                    media_url,
+                    caption=message,
+                    parse_mode=parse_mode
+                )
+            else:
+                # 发送纯文本消息 - 支持 Markdown/HTML 格式
+                if parse_mode == 'Markdown':
+                    await client.send_message(target, message, parse_mode='md')
+                elif parse_mode == 'HTML':
+                    await client.send_message(target, message, parse_mode='html')
+                else:
+                    await client.send_message(target, message)
+            
+            # 记录发送日志
+            self._log_send(task_id, account.id, target, True, None)
+            
+            # 更新账户最后使用时间
+            self._update_account_last_used(account.id)
+            
+            await client.disconnect()
+            logger.info(f"消息发送成功: {target} (类型: {media_type})")
+            return True
+            
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"消息发送失败 ({target}): {error_msg}")
+            
+            # 记录发送日志
+            self._log_send(task_id, account.id, target, False, error_msg)
+            
+            # 检查是否是账户被封禁
+            if 'banned' in error_msg.lower() or 'flood' in error_msg.lower():
+                self.account_manager.update_account_status(account.id, 'banned')
+            
+            if client:
+                await client.disconnect()
+            
+            return False
+    
+    def _log_send(self, task_id: int, account_id: int, target: str, success: bool, error: str = None):
+        """记录发送日志"""
+        session = self.db.get_session()
+        try:
+            log = SendLog(
+                task_id=task_id,
+                account_id=account_id,
+                target_user=target,
+                success=success,
+                error_message=error
+            )
+            session.add(log)
+            session.commit()
+        finally:
+            session.close()
+    
+    def _update_account_sent_count(self, account_id: int):
+        """更新账户发送计数"""
+        session = self.db.get_session()
+        try:
+            account = session.query(Account).filter_by(id=account_id).first()
+            if account:
+                account.messages_sent_today = (account.messages_sent_today or 0) + 1
+                session.commit()
+        finally:
+            session.close()
+    
+    def _update_account_last_used(self, account_id: int):
+        """更新账户最后使用时间"""
+        session = self.db.get_session()
+        try:
+            account = session.query(Account).filter_by(id=account_id).first()
+            if account:
+                account.last_used_at = datetime.utcnow()
+                session.commit()
+        finally:
+            session.close()
+
+
+# ==================== 内联键盘布局 ====================
+
+def get_main_menu_keyboard() -> InlineKeyboardMarkup:
+    """获取主菜单键盘"""
+    keyboard = [
+        [InlineKeyboardButton("📱 账户管理", callback_data="menu_accounts")],
+        [InlineKeyboardButton("📝 任务管理", callback_data="menu_tasks")],
+        [InlineKeyboardButton("⚙️ 全局设置", callback_data="menu_settings")],
+        [InlineKeyboardButton("❓ 帮助文档", callback_data="menu_help")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_accounts_menu_keyboard() -> InlineKeyboardMarkup:
+    """获取账户管理菜单键盘"""
+    keyboard = [
+        [InlineKeyboardButton("➕ 添加账户", callback_data="account_add")],
+        [InlineKeyboardButton("📋 账户列表", callback_data="account_list")],
+        [InlineKeyboardButton("🔙 返回主菜单", callback_data="back_main")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_account_add_method_keyboard() -> InlineKeyboardMarkup:
+    """获取账户添加方式选择键盘"""
+    keyboard = [
+        [InlineKeyboardButton("🔑 Session String", callback_data="account_add_session")],
+        [InlineKeyboardButton("📞 手机号登录", callback_data="account_add_phone")],
+        [InlineKeyboardButton("🔙 返回", callback_data="menu_accounts")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_tasks_menu_keyboard() -> InlineKeyboardMarkup:
+    """获取任务管理菜单键盘"""
+    keyboard = [
+        [InlineKeyboardButton("➕ 创建新任务", callback_data="task_new")],
+        [InlineKeyboardButton("📋 任务列表", callback_data="task_list")],
+        [InlineKeyboardButton("🔙 返回主菜单", callback_data="back_main")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_back_keyboard(callback_data: str = "back_main") -> InlineKeyboardMarkup:
+    """获取返回键盘"""
+    keyboard = [[InlineKeyboardButton("🔙 返回", callback_data=callback_data)]]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_task_action_keyboard(task_id: int, status: str) -> InlineKeyboardMarkup:
+    """获取任务操作键盘"""
+    keyboard = []
+    if status == 'pending':
+        keyboard.append([InlineKeyboardButton("▶️ 开始执行", callback_data=f"task_start_{task_id}")])
+    elif status == 'running':
+        keyboard.append([InlineKeyboardButton("⏸️ 停止任务", callback_data=f"task_stop_{task_id}")])
+    
+    keyboard.append([InlineKeyboardButton("📊 查看详情", callback_data=f"task_detail_{task_id}")])
+    keyboard.append([InlineKeyboardButton("🔙 返回", callback_data="task_list")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_media_type_keyboard() -> InlineKeyboardMarkup:
+    """获取媒体类型选择键盘 - TeleRaptor 风格的富媒体支持"""
+    keyboard = [
+        [InlineKeyboardButton("📝 纯文本", callback_data="media_text")],
+        [InlineKeyboardButton("🖼️ 图片消息", callback_data="media_photo")],
+        [InlineKeyboardButton("🎥 视频消息", callback_data="media_video")],
+        [InlineKeyboardButton("🎤 语音消息", callback_data="media_voice")],
+        [InlineKeyboardButton("📄 文档文件", callback_data="media_document")],
+        [InlineKeyboardButton("🔙 返回", callback_data="menu_tasks")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_parse_mode_keyboard() -> InlineKeyboardMarkup:
+    """获取解析模式选择键盘 - TeleRaptor 风格的格式化支持"""
+    keyboard = [
+        [InlineKeyboardButton("📝 Markdown 格式", callback_data="parse_markdown")],
+        [InlineKeyboardButton("🌐 HTML 格式", callback_data="parse_html")],
+        [InlineKeyboardButton("⚫ 无格式（纯文本）", callback_data="parse_none")],
+        [InlineKeyboardButton("🔙 返回", callback_data="menu_tasks")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+# ==================== 机器人处理器 ====================
+
+# 全局变量
+db_manager: DatabaseManager = None
+encryptor: Encryptor = None
+account_manager: AccountManager = None
+task_manager: TaskManager = None
+message_sender: MessageSender = None
+
+
+def check_user_permission(user_id: int) -> bool:
+    """检查用户权限"""
+    if not ALLOWED_USERS:
+        return True  # 如果没有配置白名单，允许所有用户
+    return user_id in ALLOWED_USERS
+
+
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """启动处理器 - 显示主菜单"""
+    user = update.effective_user
+    
+    # 检查权限
+    if not check_user_permission(user.id):
+        await update.message.reply_text("❌ 您没有权限使用此机器人。")
+        return
+    
+    # 创建或获取用户
+    db_manager.get_or_create_user(user.id, user.username)
+    
+    welcome_text = f"""
+👋 欢迎使用 Telegram 私信机器人管理系统！
+
+您好，{user.first_name}！
+
+这是一个功能强大的私信发送管理系统，您可以：
+• 管理多个 Telegram 账户
+• 创建批量私信任务
+• 监控发送进度和状态
+• 配置发送参数和限制
+
+请选择下方的功能按钮开始使用：
+"""
+    
+    await update.message.reply_text(
+        welcome_text,
+        reply_markup=get_main_menu_keyboard()
+    )
+
+
+async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """按钮回调处理器"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    # 检查权限
+    if not check_user_permission(user_id):
+        await query.edit_message_text("❌ 您没有权限使用此机器人。")
+        return
+    
+    data = query.data
+    
+    # 主菜单
+    if data == "back_main":
+        await query.edit_message_text(
+            "🏠 主菜单\n\n请选择功能：",
+            reply_markup=get_main_menu_keyboard()
+        )
+    
+    # 账户管理菜单
+    elif data == "menu_accounts":
+        await query.edit_message_text(
+            "📱 账户管理\n\n请选择操作：",
+            reply_markup=get_accounts_menu_keyboard()
+        )
+    
+    # 添加账户
+    elif data == "account_add":
+        await query.edit_message_text(
+            "➕ 添加账户\n\n请选择添加方式：",
+            reply_markup=get_account_add_method_keyboard()
+        )
+    
+    # 通过 Session String 添加账户
+    elif data == "account_add_session":
+        await query.edit_message_text(
+            "🔑 通过 Session String 添加账户\n\n"
+            "请发送您的 Telegram Session String：\n"
+            "（从 Telethon 导出的会话字符串）",
+            reply_markup=get_back_keyboard("menu_accounts")
+        )
+        context.user_data['waiting_for'] = 'session_string'
+        return WAITING_SESSION_STRING
+    
+    # 通过手机号添加账户
+    elif data == "account_add_phone":
+        await query.edit_message_text(
+            "📞 通过手机号添加账户\n\n"
+            "请发送您的手机号（包含国家代码）：\n"
+            "例如: +86 138xxxxxxxx",
+            reply_markup=get_back_keyboard("menu_accounts")
+        )
+        context.user_data['waiting_for'] = 'phone_number'
+        return WAITING_PHONE_NUMBER
+    
+    # 账户列表
+    elif data == "account_list":
+        accounts = account_manager.get_user_accounts(user_id)
+        
+        if not accounts:
+            await query.edit_message_text(
+                "📋 账户列表\n\n"
+                "暂无账户，请先添加账户。",
+                reply_markup=get_back_keyboard("menu_accounts")
+            )
+        else:
+            text = "📋 账户列表\n\n"
+            for i, acc in enumerate(accounts, 1):
+                status_emoji = "✅" if acc.status == "active" else "❌" if acc.status == "banned" else "⚠️"
+                text += f"{i}. {status_emoji} {acc.phone_number or 'N/A'}\n"
+                text += f"   状态: {acc.status}\n"
+                text += f"   今日已发: {acc.messages_sent_today or 0}\n"
+                text += f"   创建时间: {acc.created_at.strftime('%Y-%m-%d')}\n\n"
+            
+            await query.edit_message_text(
+                text,
+                reply_markup=get_back_keyboard("menu_accounts")
+            )
+    
+    # 任务管理菜单
+    elif data == "menu_tasks":
+        await query.edit_message_text(
+            "📝 任务管理\n\n请选择操作：",
+            reply_markup=get_tasks_menu_keyboard()
+        )
+    
+    # 创建新任务
+    elif data == "task_new":
+        # 检查是否有账户
+        accounts = account_manager.get_user_accounts(user_id)
+        if not accounts:
+            await query.edit_message_text(
+                "❌ 创建任务失败\n\n"
+                "您还没有添加任何账户，请先添加账户。",
+                reply_markup=get_back_keyboard("menu_tasks")
+            )
+            return
+        
+        # 步骤1：选择媒体类型 - TeleRaptor 风格
+        await query.edit_message_text(
+            "➕ 创建新任务\n\n"
+            "步骤 1/5: 选择消息类型\n\n"
+            "请选择要发送的消息类型：",
+            reply_markup=get_media_type_keyboard()
+        )
+        context.user_data['task_data'] = {}
+        return
+    
+    # 选择媒体类型
+    elif data.startswith("media_"):
+        media_type = data.split("_")[1]
+        context.user_data['task_data'] = {'media_type': media_type}
+        
+        # 步骤2：选择格式化模式
+        await query.edit_message_text(
+            f"➕ 创建新任务\n\n"
+            f"已选择: {{'text': '📝 纯文本', 'photo': '🖼️ 图片', 'video': '🎥 视频', 'voice': '🎤 语音', 'document': '📄 文档'}.get(media_type)}\n\n"
+            f"步骤 2/5: 选择文本格式化\n\n"
+            f"请选择消息文本的格式化方式：",
+            reply_markup=get_parse_mode_keyboard()
+        )
+        return
+    
+    # 选择解析模式
+    elif data.startswith("parse_"):
+        parse_mode = data.split("_")[1]
+        if parse_mode == 'none':
+            parse_mode = None
+        elif parse_mode == 'markdown':
+            parse_mode = 'Markdown'
+        elif parse_mode == 'html':
+            parse_mode = 'HTML'
+        
+        context.user_data['task_data']['parse_mode'] = parse_mode
+        
+        # 步骤3：输入消息模板
+        format_help = ""
+        if parse_mode == 'Markdown':
+            format_help = "\n\n🎨 Markdown 格式化语法：\n" \
+                         "**粗体** - 粗体文字\n" \
+                         "*斜体* - 斜体文字\n" \
+                         "[链接文字](URL) - 超链接\n" \
+                         "`代码` - 代码样式"
+        elif parse_mode == 'HTML':
+            format_help = "\n\n🎨 HTML 格式化语法：\n" \
+                         "<b>粗体</b> - 粗体文字\n" \
+                         "<i>斜体</i> - 斜体文字\n" \
+                         "<a href='URL'>链接</a> - 超链接\n" \
+                         "<code>代码</code> - 代码样式"
+        
+        await query.edit_message_text(
+            "➕ 创建新任务\n\n"
+            "步骤 3/5: 请输入消息模板\n\n"
+            "✨ 个性化变量（TeleRaptor 风格）：\n"
+            "{name} - 用户名或名字\n"
+            "{first_name} - 名字\n"
+            "{last_name} - 姓氏\n"
+            "{full_name} - 全名\n"
+            "{username} - @用户名"
+            f"{format_help}\n\n"
+            "例如: 你好 **{name}**，这是一条测试消息！",
+            reply_markup=get_back_keyboard("menu_tasks")
+        )
+        context.user_data['waiting_for'] = 'message_template'
+        return WAITING_MESSAGE_TEMPLATE
+    
+    # 任务列表
+    elif data == "task_list":
+        tasks = task_manager.get_user_tasks(user_id)
+        
+        if not tasks:
+            await query.edit_message_text(
+                "📋 任务列表\n\n"
+                "暂无任务，请先创建任务。",
+                reply_markup=get_back_keyboard("menu_tasks")
+            )
+        else:
+            # 创建任务列表按钮
+            keyboard = []
+            for task in tasks[:10]:  # 只显示最近10个任务
+                status_emoji = {
+                    'pending': '⏳',
+                    'running': '▶️',
+                    'completed': '✅',
+                    'failed': '❌',
+                    'stopped': '⏸️'
+                }.get(task.status, '❓')
+                
+                button_text = f"{status_emoji} 任务 #{task.id} - {task.status}"
+                keyboard.append([InlineKeyboardButton(button_text, callback_data=f"task_view_{task.id}")])
+            
+            keyboard.append([InlineKeyboardButton("🔙 返回", callback_data="menu_tasks")])
+            
+            await query.edit_message_text(
+                "📋 任务列表\n\n点击任务查看详情：",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+    
+    # 查看任务详情
+    elif data.startswith("task_view_"):
+        task_id = int(data.split("_")[2])
+        task = task_manager.get_task(task_id)
+        
+        if not task:
+            await query.edit_message_text("❌ 任务不存在")
+            return
+        
+        progress = task.progress or {}
+        text = f"""
+📊 任务详情 #{task.id}
+
+状态: {task.status}
+消息模板: {task.message_template[:50]}...
+目标数量: {progress.get('total', 0)}
+已发送: {progress.get('sent', 0)}
+失败: {progress.get('failed', 0)}
+创建时间: {task.created_at.strftime('%Y-%m-%d %H:%M')}
+"""
+        
+        if task.started_at:
+            text += f"开始时间: {task.started_at.strftime('%Y-%m-%d %H:%M')}\n"
+        if task.completed_at:
+            text += f"完成时间: {task.completed_at.strftime('%Y-%m-%d %H:%M')}\n"
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=get_task_action_keyboard(task_id, task.status)
+        )
+    
+    # 开始执行任务
+    elif data.startswith("task_start_"):
+        task_id = int(data.split("_")[2])
+        
+        # 在后台启动任务
+        asyncio.create_task(message_sender.send_task(task_id))
+        
+        await query.edit_message_text(
+            f"✅ 任务 #{task_id} 已开始执行！\n\n"
+            "任务将在后台运行，您可以随时查看进度。",
+            reply_markup=get_back_keyboard("task_list")
+        )
+    
+    # 停止任务
+    elif data.startswith("task_stop_"):
+        task_id = int(data.split("_")[2])
+        task_manager.stop_task(task_id)
+        
+        await query.edit_message_text(
+            f"⏸️ 任务 #{task_id} 已停止！",
+            reply_markup=get_back_keyboard("task_list")
+        )
+    
+    # 全局设置菜单
+    elif data == "menu_settings":
+        text = f"""
+⚙️ 全局设置
+
+当前配置：
+• 每账户每日最大发送: {MAX_MESSAGES_PER_ACCOUNT_PER_DAY} 条
+• 最小延迟: {MIN_DELAY_SECONDS} 秒
+• 最大延迟: {MAX_DELAY_SECONDS} 秒
+
+（配置修改请编辑 .env 文件）
+"""
+        await query.edit_message_text(
+            text,
+            reply_markup=get_back_keyboard("back_main")
+        )
+    
+    # 帮助文档
+    elif data == "menu_help":
+        help_text = """
+❓ 帮助文档
+
+📱 账户管理：
+• 添加账户：支持通过 Session String 或手机号添加
+• 账户列表：查看所有账户状态和发送统计
+
+📝 任务管理：
+• 创建任务：设置消息模板、目标列表、选择账户
+• 任务列表：查看任务状态和执行进度
+• 开始/停止：控制任务执行
+
+⚙️ 全局设置：
+• 发送延迟：避免频率限制
+• 每日限制：保护账户安全
+
+🔒 安全提示：
+• Session String 会加密存储
+• 建议设置合理的发送延迟
+• 监控账户状态，及时处理异常
+
+⚠️ 免责声明：
+请遵守 Telegram 服务条款，不要发送垃圾信息。
+"""
+        await query.edit_message_text(
+            help_text,
+            reply_markup=get_back_keyboard("back_main")
+        )
+
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """消息处理器 - 处理用户输入"""
+    user_id = update.effective_user.id
+    text = update.message.text
+    
+    waiting_for = context.user_data.get('waiting_for')
+    
+    # 处理 Session String 输入
+    if waiting_for == 'session_string':
+        try:
+            # 验证 session string（简单验证）
+            if len(text) < 50:
+                await update.message.reply_text(
+                    "❌ Session String 格式不正确，请重新输入。",
+                    reply_markup=get_back_keyboard("menu_accounts")
+                )
+                return
+            
+            # 添加账户
+            user = db_manager.get_or_create_user(user_id, update.effective_user.username)
+            account_manager.add_account(user.id, text)
+            
+            await update.message.reply_text(
+                "✅ 账户添加成功！",
+                reply_markup=get_accounts_menu_keyboard()
+            )
+            
+            context.user_data['waiting_for'] = None
+            return ConversationHandler.END
+            
+        except Exception as e:
+            logger.error(f"添加账户失败: {e}")
+            await update.message.reply_text(
+                f"❌ 添加账户失败: {str(e)}",
+                reply_markup=get_back_keyboard("menu_accounts")
+            )
+    
+    # 处理消息模板输入
+    elif waiting_for == 'message_template':
+        context.user_data['task_data']['message_template'] = text
+        
+        media_type = context.user_data['task_data'].get('media_type', 'text')
+        
+        # 如果需要媒体文件，要求上传
+        if media_type in ['photo', 'video', 'voice', 'document']:
+            await update.message.reply_text(
+                f"✅ 消息模板已保存\n\n"
+                f"步骤 4/5: 请上传{{'photo': '图片', 'video': '视频', 'voice': '语音', 'document': '文档'}.get(media_type)}文件\n\n"
+                f"请直接发送文件到这里。",
+                reply_markup=get_back_keyboard("menu_tasks")
+            )
+            context.user_data['waiting_for'] = 'media_file'
+            return
+        else:
+            # 纯文本消息，跳过媒体上传
+            await update.message.reply_text(
+                "✅ 消息模板已保存\n\n"
+                "步骤 4/5: 请输入目标用户列表\n\n"
+                "📋 支持多种格式：\n"
+                "• 每行一个用户名: @username\n"
+                "• 每行一个用户ID: 123456789\n"
+                "• 混合格式\n\n"
+                "例如：\n"
+                "@username1\n"
+                "@username2\n"
+                "123456789",
+                reply_markup=get_back_keyboard("menu_tasks")
+            )
+            context.user_data['waiting_for'] = 'target_list'
+            return WAITING_TARGET_LIST
+    
+    # 处理目标列表输入
+    elif waiting_for == 'target_list':
+        targets = [line.strip() for line in text.split('\n') if line.strip()]
+        
+        if not targets:
+            await update.message.reply_text(
+                "❌ 目标列表不能为空，请重新输入。",
+                reply_markup=get_back_keyboard("menu_tasks")
+            )
+            return
+        
+        context.user_data['task_data']['target_list'] = targets
+        
+        # 获取用户账户
+        accounts = account_manager.get_user_accounts(user_id)
+        active_accounts = [acc for acc in accounts if acc.status == 'active']
+        
+        if not active_accounts:
+            await update.message.reply_text(
+                "❌ 没有可用的活跃账户，请先添加账户。",
+                reply_markup=get_back_keyboard("menu_tasks")
+            )
+            return
+        
+        # 创建任务（使用所有活跃账户）
+        user = db_manager.get_or_create_user(user_id, update.effective_user.username)
+        account_ids = [acc.id for acc in active_accounts]
+        
+        task_data = context.user_data.get('task_data', {})
+        
+        task = task_manager.create_task(
+            user_id=user_id,
+            message_template=task_data.get('message_template', ''),
+            target_list=targets,
+            account_ids=account_ids,
+            config={
+                'min_delay': MIN_DELAY_SECONDS,
+                'max_delay': MAX_DELAY_SECONDS,
+                'max_per_account': MAX_MESSAGES_PER_ACCOUNT_PER_DAY
+            },
+            media_type=task_data.get('media_type', 'text'),
+            media_url=task_data.get('media_url'),
+            parse_mode=task_data.get('parse_mode', 'Markdown')
+        )
+        
+        media_type_name = {
+            'text': '📝 纯文本',
+            'photo': '🖼️ 图片',
+            'video': '🎥 视频',
+            'voice': '🎤 语音',
+            'document': '📄 文档'
+        }.get(task_data.get('media_type', 'text'), '📝 纯文本')
+        
+        await update.message.reply_text(
+            f"✅ 任务创建成功！\n\n"
+            f"📋 任务信息：\n"
+            f"任务 ID: #{task.id}\n"
+            f"消息类型: {media_type_name}\n"
+            f"目标数量: {len(targets)}\n"
+            f"使用账户: {len(account_ids)} 个\n"
+            f"格式化: {task_data.get('parse_mode', 'Markdown') or '无'}\n\n"
+            f"✨ 任务已就绪，可以开始执行！",
+            reply_markup=get_tasks_menu_keyboard()
+        )
+        
+        context.user_data['waiting_for'] = None
+        context.user_data['task_data'] = {}
+        return ConversationHandler.END
+    
+    # 默认回复
+    else:
+        await update.message.reply_text(
+            "请使用下方按钮进行操作。",
+            reply_markup=get_main_menu_keyboard()
+        )
+
+
+async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """取消处理器"""
+    context.user_data.clear()
+    await update.message.reply_text(
+        "操作已取消。",
+        reply_markup=get_main_menu_keyboard()
+    )
+    return ConversationHandler.END
+
+
+# ==================== 主程序 ====================
+
+def main():
+    """主程序入口"""
+    global db_manager, encryptor, account_manager, task_manager, message_sender
+    
+    # 检查配置
+    if not BOT_TOKEN:
+        logger.error("请在 .env 文件中配置 BOT_TOKEN")
+        return
+    
+    if not API_ID or not API_HASH:
+        logger.error("请在 .env 文件中配置 API_ID 和 API_HASH")
+        return
+    
+    # 初始化组件
+    logger.info("初始化数据库...")
+    db_manager = DatabaseManager(DATABASE_URL)
+    
+    logger.info("初始化加密器...")
+    encryptor = Encryptor(ENCRYPTION_KEY)
+    
+    logger.info("初始化管理器...")
+    account_manager = AccountManager(db_manager, encryptor)
+    task_manager = TaskManager(db_manager)
+    message_sender = MessageSender(db_manager, encryptor, account_manager, task_manager)
+    
+    # 创建应用
+    logger.info("启动机器人...")
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # 添加处理器
+    application.add_handler(CommandHandler("start", start_handler))
+    application.add_handler(CallbackQueryHandler(button_callback_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    
+    # 启动机器人
+    logger.info("机器人已启动，按 Ctrl+C 停止")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
