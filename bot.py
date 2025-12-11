@@ -1425,9 +1425,16 @@ async def export_results(query, task_id):
             status = "成功" if log.success else "失败"
             f.write(f"[{log.sent_at}] {status}: {log.error_message or 'OK'}\n")
     
-    await query.message.reply_document(document=open(success_file, 'rb'), filename="success.txt")
-    await query.message.reply_document(document=open(failed_file, 'rb'), filename="failed.txt")
-    await query.message.reply_document(document=open(log_file, 'rb'), filename="log.txt")
+    # Only send non-empty files (Telegram API rejects empty files)
+    if os.path.getsize(success_file) > 0:
+        with open(success_file, 'rb') as f:
+            await query.message.reply_document(document=f, filename="success.txt")
+    if os.path.getsize(failed_file) > 0:
+        with open(failed_file, 'rb') as f:
+            await query.message.reply_document(document=f, filename="failed.txt")
+    if os.path.getsize(log_file) > 0:
+        with open(log_file, 'rb') as f:
+            await query.message.reply_document(document=f, filename="log.txt")
     await query.message.reply_text("✅ 结果已导出")
 
 
