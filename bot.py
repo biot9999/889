@@ -390,42 +390,65 @@ class AccountManager:
     
     async def import_session_zip(self, zip_path, api_id=None, api_hash=None):
         """Import sessions from zip"""
+        logger.info(f"Starting session import from: {zip_path}")
         api_id = api_id or Config.API_ID
         api_hash = api_hash or Config.API_HASH
         imported = []
         temp_dir = os.path.join(Config.UPLOADS_DIR, 'temp')
         os.makedirs(temp_dir, exist_ok=True)
+        logger.info(f"Created temporary directory: {temp_dir}")
         
         try:
+            logger.info(f"Extracting zip file...")
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(temp_dir)
+            logger.info(f"Zip file extracted successfully")
             
+            session_files = []
             for root, dirs, files in os.walk(temp_dir):
                 for file in files:
                     if file.endswith('.session'):
-                        session_path = os.path.join(root, file)
-                        result = await self._verify_session(session_path, api_id, api_hash)
-                        if result:
-                            imported.append(result)
+                        session_files.append(os.path.join(root, file))
+            
+            logger.info(f"Found {len(session_files)} session files")
+            
+            for idx, session_path in enumerate(session_files, 1):
+                logger.info(f"Verifying session {idx}/{len(session_files)}: {os.path.basename(session_path)}")
+                result = await self._verify_session(session_path, api_id, api_hash)
+                if result:
+                    imported.append(result)
+                    logger.info(f"Session verified successfully: {result['account'].phone}")
+                else:
+                    logger.warning(f"Session verification failed: {os.path.basename(session_path)}")
+            
+            logger.info(f"Import completed: {len(imported)}/{len(session_files)} sessions imported successfully")
             return imported
         finally:
+            logger.info(f"Cleaning up temporary directory: {temp_dir}")
             shutil.rmtree(temp_dir, ignore_errors=True)
     
     async def _verify_session(self, session_path, api_id, api_hash):
         """Verify session file"""
+        logger.info(f"Connecting to Telegram with session: {os.path.basename(session_path)}")
         proxy = Config.get_proxy_dict()
         client = TelegramClient(session_path, api_id, api_hash, proxy=proxy)
         
         try:
             await client.connect()
+            logger.info(f"Connected successfully, checking authorization...")
+            
             if not await client.is_user_authorized():
+                logger.warning(f"Session not authorized: {os.path.basename(session_path)}")
                 return None
             
             me = await client.get_me()
             phone = me.phone if me.phone else f"user_{me.id}"
+            logger.info(f"User info retrieved: {me.first_name} ({phone})")
+            
             session_name = os.path.basename(session_path).replace('.session', '')
             new_path = os.path.join(Config.SESSIONS_DIR, f"{session_name}.session")
             shutil.copy2(session_path, new_path)
+            logger.info(f"Session file copied to: {new_path}")
             
             account = Account(
                 phone=phone,
@@ -436,11 +459,13 @@ class AccountManager:
             )
             self.db_session.add(account)
             self.db_session.commit()
+            logger.info(f"Account saved to database: {phone}")
+            
             await client.disconnect()
             
             return {'account': account, 'user': me}
         except Exception as e:
-            logger.error(f"Error verifying session: {e}")
+            logger.error(f"Error verifying session {os.path.basename(session_path)}: {e}", exc_info=True)
             if client.is_connected():
                 await client.disconnect()
             return None
@@ -601,13 +626,17 @@ class TaskManager:
     async def _execute_task(self, task_id):
         """Execute task"""
         task = self.db_session.query(Task).filter_by(id=task_id).first()
+        logger.info(f"Starting task execution: Task ID={task_id}, Name={task.name}")
         
         try:
             targets = self.db_session.query(Target).filter_by(
                 task_id=task_id, is_sent=False, is_valid=True
             ).all()
             
+            logger.info(f"Task {task_id}: Found {len(targets)} targets to process")
+            
             if not targets:
+                logger.info(f"Task {task_id}: No targets to process, marking as completed")
                 task.status = TaskStatus.COMPLETED
                 task.completed_at = datetime.utcnow()
                 self.db_session.commit()
@@ -615,20 +644,28 @@ class TaskManager:
             
             accounts = self.account_manager.get_active_accounts()
             if not accounts:
+                logger.error(f"Task {task_id}: No active accounts available")
                 raise ValueError("No active accounts")
             
+            logger.info(f"Task {task_id}: Using {len(accounts)} active accounts")
+            
             account_index = 0
-            for target in targets:
+            for idx, target in enumerate(targets, 1):
                 if self.stop_flags.get(task_id, False):
+                    logger.info(f"Task {task_id}: Stop flag detected, halting execution")
                     break
                 
                 account = accounts[account_index % len(accounts)]
                 account_index += 1
                 
+                logger.info(f"Task {task_id}: Processing target {idx}/{len(targets)} - {target.username or target.user_id}")
+                
                 if account.messages_sent_today >= account.daily_limit:
+                    logger.warning(f"Task {task_id}: Account {account.phone} reached daily limit, skipping")
                     continue
                 
                 if account.last_used and account.last_used.date() < datetime.utcnow().date():
+                    logger.info(f"Task {task_id}: Resetting daily counter for account {account.phone}")
                     account.messages_sent_today = 0
                 
                 success = await self._send_message(task, target, account)
@@ -637,22 +674,25 @@ class TaskManager:
                     task.sent_count += 1
                     account.messages_sent_today += 1
                     account.total_messages_sent += 1
+                    logger.info(f"Task {task_id}: Message sent successfully to {target.username or target.user_id}")
                 else:
                     task.failed_count += 1
+                    logger.warning(f"Task {task_id}: Failed to send message to {target.username or target.user_id}")
                 
                 account.last_used = datetime.utcnow()
                 self.db_session.commit()
                 
                 delay = random.randint(task.min_interval, task.max_interval)
-                logger.info(f"Waiting {delay} seconds...")
+                logger.info(f"Task {task_id}: Waiting {delay} seconds before next message... ({task.sent_count}/{task.total_targets} sent)")
                 await asyncio.sleep(delay)
             
+            logger.info(f"Task {task_id}: Execution completed - Sent: {task.sent_count}, Failed: {task.failed_count}")
             task.status = TaskStatus.COMPLETED
             task.completed_at = datetime.utcnow()
             self.db_session.commit()
             
         except Exception as e:
-            logger.error(f"Task {task_id} error: {e}")
+            logger.error(f"Task {task_id} error: {e}", exc_info=True)
             task.status = TaskStatus.FAILED
             self.db_session.commit()
         finally:
@@ -660,6 +700,7 @@ class TaskManager:
                 del self.running_tasks[task_id]
             if task_id in self.stop_flags:
                 del self.stop_flags[task_id]
+            logger.info(f"Task {task_id}: Cleanup completed")
     
     async def _send_message(self, task, target, account):
         """Send message"""
@@ -783,7 +824,7 @@ class TaskManager:
 # Conversation states
 (PHONE_INPUT, CODE_INPUT, PASSWORD_INPUT, 
  MESSAGE_INPUT, FORMAT_SELECT, MEDIA_SELECT, MEDIA_UPLOAD,
- TARGET_INPUT, TASK_NAME_INPUT) = range(9)
+ TARGET_INPUT, TASK_NAME_INPUT, SESSION_UPLOAD, TDATA_UPLOAD) = range(11)
 
 # Global managers
 account_manager = None
@@ -794,9 +835,16 @@ db_session = None
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command"""
     user_id = update.effective_user.id
+    username = update.effective_user.username or "unknown"
+    
+    logger.info(f"Start command received from user {username} ({user_id})")
+    
     if user_id != Config.ADMIN_USER_ID:
+        logger.warning(f"Unauthorized access attempt by user {username} ({user_id})")
         await update.message.reply_text("⛔ 未授权访问")
         return
+    
+    logger.info(f"Authorized user {username} ({user_id}) accessing main menu")
     
     keyboard = [
         [InlineKeyboardButton("📱 账户管理", callback_data='menu_accounts')],
@@ -826,63 +874,86 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    user_id = query.from_user.id
+    username = query.from_user.username or "unknown"
+    
+    logger.info(f"Button clicked by user {username} ({user_id}): {data}")
     
     # Main menu
     if data == 'menu_accounts':
+        logger.info(f"User {user_id} accessing accounts menu")
         await show_accounts_menu(query)
     elif data == 'menu_tasks':
+        logger.info(f"User {user_id} accessing tasks menu")
         await show_tasks_menu(query)
     elif data == 'menu_config':
+        logger.info(f"User {user_id} accessing config menu")
         await show_config(query)
     elif data == 'menu_stats':
+        logger.info(f"User {user_id} accessing stats menu")
         await show_stats(query)
     elif data == 'menu_help':
+        logger.info(f"User {user_id} accessing help menu")
         await show_help(query)
     
     # Accounts
     elif data == 'accounts_list':
+        logger.info(f"User {user_id} viewing accounts list")
         await list_accounts(query)
     elif data == 'accounts_add':
+        logger.info(f"User {user_id} initiating account add")
         await show_add_account_menu(query)
+    elif data == 'accounts_add_session':
+        logger.info(f"User {user_id} selecting session upload option")
+        await show_upload_type_menu(query)
+    # Note: upload_session_file and upload_tdata_file are handled by ConversationHandler
     elif data.startswith('account_check_'):
         account_id = int(data.split('_')[2])
+        logger.info(f"User {user_id} checking account {account_id}")
         await check_account(query, account_id)
     
     # Tasks
     elif data == 'tasks_list':
+        logger.info(f"User {user_id} viewing tasks list")
         await list_tasks(query)
-    elif data == 'tasks_create':
-        await start_create_task(query, context)
+    # Note: tasks_create is handled by ConversationHandler
     elif data.startswith('task_start_'):
         task_id = int(data.split('_')[2])
+        logger.info(f"User {user_id} starting task {task_id}")
         await start_task_handler(query, task_id)
     elif data.startswith('task_stop_'):
         task_id = int(data.split('_')[2])
+        logger.info(f"User {user_id} stopping task {task_id}")
         await stop_task_handler(query, task_id)
     elif data.startswith('task_progress_'):
         task_id = int(data.split('_')[2])
+        logger.info(f"User {user_id} viewing task {task_id} progress")
         await show_task_progress(query, task_id)
     elif data.startswith('task_export_'):
         task_id = int(data.split('_')[2])
+        logger.info(f"User {user_id} exporting task {task_id} results")
         await export_results(query, task_id)
     
     # Format selection
     elif data.startswith('format_'):
         format_name = data.split('_')[1]
         context.user_data['message_format'] = MessageFormat[format_name.upper()]
-        await select_media_type(query)
+        logger.info(f"User {user_id} selected format: {format_name}")
+        return await select_media_type(query)
     
     # Media selection
     elif data.startswith('media_'):
         media_name = data.split('_')[1]
         context.user_data['media_type'] = MediaType[media_name.upper()]
+        logger.info(f"User {user_id} selected media type: {media_name}")
         if context.user_data['media_type'] == MediaType.TEXT:
-            await request_target_list(query)
+            return await request_target_list(query)
         else:
-            await request_media_upload(query)
+            return await request_media_upload(query)
     
     # Back
     elif data == 'back_main':
+        logger.info(f"User {user_id} returning to main menu")
         await back_to_main(query)
 
 
@@ -912,6 +983,156 @@ async def show_add_account_menu(query):
         "请打包为 .zip 文件上传"
     )
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_upload_type_menu(query):
+    """Show upload type menu"""
+    logger.info(f"User {query.from_user.id} requested upload type menu")
+    keyboard = [
+        [InlineKeyboardButton("📁 上传 Session 文件", callback_data='upload_session_file')],
+        [InlineKeyboardButton("📂 上传 TData 文件", callback_data='upload_tdata_file')],
+        [InlineKeyboardButton("🔙 返回", callback_data='accounts_add')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    text = (
+        "📁 <b>上传文件</b>\n\n"
+        "请选择上传类型：\n\n"
+        "📁 <b>Session 文件</b>\n"
+        "支持 .session、session+json 格式\n"
+        "请打包为 .zip 文件上传\n\n"
+        "📂 <b>TData 文件</b>\n"
+        "Telegram Desktop 的 tdata 文件夹\n"
+        "请打包为 .zip 文件上传"
+    )
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def request_session_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Request session file upload - Conversation entry point.
+    
+    Handles the upload_session_file callback, prompts the user to upload a .zip file
+    containing session files, and transitions to SESSION_UPLOAD state.
+    
+    Returns:
+        int: SESSION_UPLOAD state constant
+    """
+    query = update.callback_query
+    await query.answer()
+    logger.info(f"User {query.from_user.id} requested session file upload")
+    context.user_data['upload_type'] = 'session'
+    await query.message.reply_text(
+        "📁 <b>上传 Session 文件</b>\n\n"
+        "请上传包含 Session 文件的 .zip 压缩包\n"
+        "支持格式：\n"
+        "- .session 文件\n"
+        "- .session + .json 文件\n\n"
+        "⚠️ 文件大小限制：50MB",
+        parse_mode='HTML'
+    )
+    return SESSION_UPLOAD
+
+
+async def request_tdata_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Request TData file upload - Conversation entry point.
+    
+    Handles the upload_tdata_file callback, prompts the user to upload a .zip file
+    containing Telegram Desktop tdata folder, and transitions to TDATA_UPLOAD state.
+    
+    Returns:
+        int: TDATA_UPLOAD state constant
+    """
+    query = update.callback_query
+    await query.answer()
+    logger.info(f"User {query.from_user.id} requested tdata file upload")
+    context.user_data['upload_type'] = 'tdata'
+    await query.message.reply_text(
+        "📂 <b>上传 TData 文件</b>\n\n"
+        "请上传 Telegram Desktop 的 tdata 文件夹压缩包\n"
+        "格式：tdata 文件夹打包为 .zip\n\n"
+        "⚠️ 文件大小限制：50MB",
+        parse_mode='HTML'
+    )
+    return TDATA_UPLOAD
+
+
+async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle file upload for session or tdata"""
+    upload_type = context.user_data.get('upload_type', 'session')
+    # Determine which state to return based on upload type
+    current_state = SESSION_UPLOAD if upload_type == 'session' else TDATA_UPLOAD
+    
+    logger.info(f"User {update.effective_user.id} is uploading {upload_type} file")
+    
+    if not update.message.document:
+        logger.warning(f"User {update.effective_user.id} sent non-document message")
+        await update.message.reply_text("❌ 请上传 .zip 文件")
+        return current_state
+    
+    document = update.message.document
+    if not document.file_name.endswith('.zip'):
+        logger.warning(f"User {update.effective_user.id} uploaded non-zip file: {document.file_name}")
+        await update.message.reply_text("❌ 只支持 .zip 格式文件")
+        return current_state
+    
+    # Download file
+    logger.info(f"Downloading file: {document.file_name} ({document.file_size} bytes)")
+    await update.message.reply_text("⏳ 正在下载文件...")
+    
+    try:
+        file = await document.get_file()
+        zip_path = os.path.join(Config.UPLOADS_DIR, f"{update.effective_user.id}_{document.file_name}")
+        await file.download_to_drive(zip_path)
+        logger.info(f"File downloaded successfully: {zip_path}")
+        
+        await update.message.reply_text("⏳ 正在导入账户...")
+        logger.info(f"Starting account import from: {zip_path}")
+        
+        # Import accounts
+        imported = await account_manager.import_session_zip(zip_path)
+        
+        if not imported:
+            logger.warning(f"No accounts imported from {zip_path}")
+            await update.message.reply_text(
+                "❌ <b>导入失败</b>\n\n"
+                "未找到有效的账户文件\n"
+                "请检查 .zip 文件内容",
+                parse_mode='HTML'
+            )
+        else:
+            logger.info(f"Successfully imported {len(imported)} accounts")
+            accounts_info = "\n".join([
+                f"• {result['user'].first_name or ''} ({result['account'].phone})"
+                for result in imported
+            ])
+            await update.message.reply_text(
+                f"✅ <b>导入成功！</b>\n\n"
+                f"成功导入 {len(imported)} 个账户：\n\n"
+                f"{accounts_info}\n\n"
+                f"使用 /start 查看账户列表",
+                parse_mode='HTML'
+            )
+        
+        # Cleanup
+        try:
+            os.remove(zip_path)
+            logger.info(f"Cleaned up temporary file: {zip_path}")
+        except Exception as e:
+            logger.error(f"Failed to cleanup file {zip_path}: {e}")
+        
+        context.user_data.clear()
+        return ConversationHandler.END
+        
+    except Exception as e:
+        logger.error(f"Error importing accounts: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ <b>导入失败</b>\n\n"
+            f"错误：{str(e)}\n\n"
+            f"请检查文件格式是否正确",
+            parse_mode='HTML'
+        )
+        return current_state
 
 
 async def list_accounts(query):
@@ -1003,8 +1224,19 @@ async def list_tasks(query):
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
 
 
-async def start_create_task(query, context):
-    """Start task creation"""
+async def start_create_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Start task creation - Conversation entry point.
+    
+    Handles the tasks_create callback, prompts the user to input a task name,
+    and transitions to TASK_NAME_INPUT state.
+    
+    Returns:
+        int: TASK_NAME_INPUT state constant
+    """
+    query = update.callback_query
+    await query.answer()
+    logger.info(f"User {query.from_user.id} starting task creation")
     await query.message.reply_text("➕ <b>创建新任务</b>\n\n请输入任务名称：", parse_mode='HTML')
     context.user_data['creating_task'] = True
     return TASK_NAME_INPUT
@@ -1068,38 +1300,66 @@ async def request_target_list(query):
 
 async def handle_target_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle target input"""
-    if update.message.text:
-        targets = update.message.text.strip().split('\n')
-    elif update.message.document:
-        file = await update.message.document.get_file()
-        content = await file.download_as_bytearray()
-        targets = task_manager.parse_target_file(bytes(content))
-    else:
-        await update.message.reply_text("❌ 无效输入")
+    user_id = update.effective_user.id
+    logger.info(f"User {user_id} submitting target input")
+    
+    try:
+        if update.message.text:
+            logger.info(f"User {user_id} sent text input")
+            targets = update.message.text.strip().split('\n')
+            logger.info(f"Parsed {len(targets)} targets from text")
+        elif update.message.document:
+            logger.info(f"User {user_id} sent document: {update.message.document.file_name}")
+            file = await update.message.document.get_file()
+            content = await file.download_as_bytearray()
+            logger.info(f"Downloaded file: {len(content)} bytes")
+            targets = task_manager.parse_target_file(bytes(content))
+            logger.info(f"Parsed {len(targets)} targets from file")
+        else:
+            logger.warning(f"User {user_id} sent invalid input (no text or document)")
+            await update.message.reply_text("❌ 无效输入\n\n请发送文本或上传 .txt 文件")
+            return TARGET_INPUT
+        
+        if not targets:
+            logger.warning(f"User {user_id} submitted empty target list")
+            await update.message.reply_text("❌ 目标列表为空\n\n请添加至少一个目标")
+            return TARGET_INPUT
+        
+        logger.info(f"Creating task for user {user_id}")
+        task = task_manager.create_task(
+            name=context.user_data['task_name'],
+            message_text=context.user_data['message_text'],
+            message_format=context.user_data['message_format'],
+            media_type=context.user_data.get('media_type', MediaType.TEXT),
+            media_path=context.user_data.get('media_path'),
+            min_interval=Config.DEFAULT_MIN_INTERVAL,
+            max_interval=Config.DEFAULT_MAX_INTERVAL
+        )
+        
+        logger.info(f"Adding {len(targets)} targets to task {task.id}")
+        added = task_manager.add_targets(task.id, targets)
+        logger.info(f"Successfully added {added} targets to task {task.id}")
+        
+        await update.message.reply_text(
+            f"✅ <b>任务创建成功！</b>\n\n"
+            f"任务: {task.name}\n"
+            f"目标: {added}\n\n"
+            f"使用 /start 查看任务",
+            parse_mode='HTML'
+        )
+        
+        context.user_data.clear()
+        return ConversationHandler.END
+        
+    except Exception as e:
+        logger.error(f"Error handling target input for user {user_id}: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ <b>处理失败</b>\n\n"
+            f"错误：{str(e)}\n\n"
+            f"请重试或使用 /start 返回主菜单",
+            parse_mode='HTML'
+        )
         return TARGET_INPUT
-    
-    task = task_manager.create_task(
-        name=context.user_data['task_name'],
-        message_text=context.user_data['message_text'],
-        message_format=context.user_data['message_format'],
-        media_type=context.user_data.get('media_type', MediaType.TEXT),
-        media_path=context.user_data.get('media_path'),
-        min_interval=Config.DEFAULT_MIN_INTERVAL,
-        max_interval=Config.DEFAULT_MAX_INTERVAL
-    )
-    
-    added = task_manager.add_targets(task.id, targets)
-    
-    await update.message.reply_text(
-        f"✅ <b>任务创建成功！</b>\n\n"
-        f"任务: {task.name}\n"
-        f"目标: {added}\n\n"
-        f"使用 /start 查看任务",
-        parse_mode='HTML'
-    )
-    
-    context.user_data.clear()
-    return ConversationHandler.END
 
 
 async def start_task_handler(query, task_id):
@@ -1244,24 +1504,58 @@ def main():
     """Main function"""
     global account_manager, task_manager, db_session
     
+    logger.info("=" * 80)
+    logger.info("Starting Telegram Bot")
+    logger.info("=" * 80)
+    
     try:
+        logger.info("Validating configuration...")
         Config.validate()
+        logger.info("Configuration validated successfully")
+        
+        logger.info("Ensuring directories exist...")
         Config.ensure_directories()
+        logger.info("Directories created/verified")
     except ValueError as e:
         logger.error(f"Config error: {e}")
         return
     
+    logger.info(f"Initializing database: {Config.DATABASE_URL}")
     engine = init_db(Config.DATABASE_URL)
     db_session = get_session(engine)
+    logger.info("Database initialized successfully")
     
+    logger.info("Initializing account manager...")
     account_manager = AccountManager(db_session)
-    task_manager = TaskManager(db_session, account_manager)
+    logger.info("Account manager initialized")
     
+    logger.info("Initializing task manager...")
+    task_manager = TaskManager(db_session, account_manager)
+    logger.info("Task manager initialized")
+    
+    logger.info("Building bot application...")
     application = Application.builder().token(Config.BOT_TOKEN).build()
     
+    logger.info("Registering command handlers...")
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button_handler))
     
+    # File upload conversation handler (registered BEFORE button_handler to catch specific callbacks first)
+    logger.info("Registering file upload conversation handler...")
+    upload_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(request_session_upload, pattern='^upload_session_file$'),
+            CallbackQueryHandler(request_tdata_upload, pattern='^upload_tdata_file$')
+        ],
+        states={
+            SESSION_UPLOAD: [MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_file_upload)],
+            TDATA_UPLOAD: [MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_file_upload)]
+        },
+        fallbacks=[CommandHandler("start", start)]
+    )
+    application.add_handler(upload_conv)
+    
+    # Task creation conversation handler
+    logger.info("Registering task conversation handler...")
     task_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_create_task, pattern='^tasks_create$')],
         states={
@@ -1276,7 +1570,13 @@ def main():
     
     application.add_handler(task_conv)
     
-    logger.info("Bot started")
+    # General button handler (registered AFTER conversation handlers)
+    logger.info("Registering general button handler...")
+    application.add_handler(CallbackQueryHandler(button_handler))
+    
+    logger.info("=" * 80)
+    logger.info("Bot started successfully! Listening for updates...")
+    logger.info("=" * 80)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
