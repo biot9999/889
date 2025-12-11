@@ -905,13 +905,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_add_account_menu(query)
     elif data == 'accounts_add_session':
         logger.info(f"User {user_id} selecting session upload option")
-        await show_upload_type_menu(query, context)
+        await show_upload_type_menu(query)
     elif data == 'upload_session_file':
         logger.info(f"User {user_id} choosing to upload session file")
-        await request_session_upload(query, context)
+        return await request_session_upload(update, context)
     elif data == 'upload_tdata_file':
         logger.info(f"User {user_id} choosing to upload tdata file")
-        await request_tdata_upload(query, context)
+        return await request_tdata_upload(update, context)
     elif data.startswith('account_check_'):
         account_id = int(data.split('_')[2])
         logger.info(f"User {user_id} checking account {account_id}")
@@ -992,7 +992,7 @@ async def show_add_account_menu(query):
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
 
 
-async def show_upload_type_menu(query, context):
+async def show_upload_type_menu(query):
     """Show upload type menu"""
     logger.info(f"User {query.from_user.id} requested upload type menu")
     keyboard = [
@@ -1014,8 +1014,10 @@ async def show_upload_type_menu(query, context):
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
 
 
-async def request_session_upload(query, context):
+async def request_session_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Request session file upload"""
+    query = update.callback_query
+    await query.answer()
     logger.info(f"User {query.from_user.id} requested session file upload")
     context.user_data['upload_type'] = 'session'
     await query.message.reply_text(
@@ -1030,8 +1032,10 @@ async def request_session_upload(query, context):
     return SESSION_UPLOAD
 
 
-async def request_tdata_upload(query, context):
+async def request_tdata_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Request tdata file upload"""
+    query = update.callback_query
+    await query.answer()
     logger.info(f"User {query.from_user.id} requested tdata file upload")
     context.user_data['upload_type'] = 'tdata'
     await query.message.reply_text(
