@@ -822,7 +822,9 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             "📄 通过 Session JSON 文件添加账户\n\n"
             "请上传您的 Session JSON 文件：\n"
             "• 支持 Telethon 导出的 .session.json 文件\n"
-            "• 文件应包含 session_string 字段\n\n"
+            "• 支持 ZIP 压缩包（自动解压第一个 JSON 文件）\n"
+            "• 文件应包含 session_string 字段\n"
+            "• 支持多种编码（UTF-8, GBK, GB2312 等）\n\n"
             "JSON 格式示例：\n"
             "{\n"
             '  "session_string": "1AQAAAAAZ...",\n'
@@ -1168,10 +1170,63 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 file = await update.message.document.get_file()
                 file_content = await file.download_as_bytearray()
+                file_name = update.message.document.file_name or ''
+                
+                # 检查是否是 ZIP 文件
+                if file_name.endswith('.zip'):
+                    import tempfile
+                    import zipfile
+                    
+                    # 保存到临时文件
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_file:
+                        tmp_file.write(file_content)
+                        tmp_file.flush()
+                        
+                        # 解压并查找 JSON 文件
+                        with zipfile.ZipFile(tmp_file.name, 'r') as zip_ref:
+                            json_files = [f for f in zip_ref.namelist() if f.endswith('.json')]
+                            
+                            if not json_files:
+                                await update.message.reply_text(
+                                    "❌ ZIP 文件中没有找到 JSON 文件",
+                                    reply_markup=get_back_keyboard("menu_accounts")
+                                )
+                                os.unlink(tmp_file.name)
+                                return
+                            
+                            # 处理第一个 JSON 文件
+                            json_file_name = json_files[0]
+                            json_content = zip_ref.read(json_file_name)
+                            file_content = json_content
+                            
+                        os.unlink(tmp_file.name)
+                
+                # 尝试多种编码解码文件
+                encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'gbk', 'gb2312', 'gb18030']
+                decoded_content = None
+                used_encoding = None
+                
+                for encoding in encodings:
+                    try:
+                        decoded_content = file_content.decode(encoding)
+                        used_encoding = encoding
+                        logger.info(f"成功使用 {encoding} 编码解码文件")
+                        break
+                    except (UnicodeDecodeError, AttributeError):
+                        continue
+                
+                if decoded_content is None:
+                    await update.message.reply_text(
+                        "❌ 无法解码文件内容\n\n"
+                        "请确保文件是有效的文本文件（JSON 格式）\n"
+                        "支持的编码：UTF-8, GBK, GB2312, Latin-1",
+                        reply_markup=get_back_keyboard("menu_accounts")
+                    )
+                    return
                 
                 # 解析 JSON
                 import json
-                session_data = json.loads(file_content.decode('utf-8'))
+                session_data = json.loads(decoded_content)
                 
                 # 提取 session string
                 session_string = session_data.get('session_string') or session_data.get('session')
@@ -1196,9 +1251,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data['waiting_for'] = None
                 return ConversationHandler.END
                 
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON 解析失败: {e}")
                 await update.message.reply_text(
-                    "❌ JSON 文件格式错误，请检查文件内容",
+                    "❌ JSON 文件格式错误，请检查文件内容\n\n"
+                    "确保文件是有效的 JSON 格式，例如：\n"
+                    '{\n'
+                    '  "session_string": "1AQAA...",\n'
+                    '  "phone": "+86138xxxxxxxx"\n'
+                    '}',
                     reply_markup=get_back_keyboard("menu_accounts")
                 )
             except Exception as e:
