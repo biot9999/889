@@ -136,29 +136,6 @@ class Config:
 
 
 # ============================================================================
-# 常量
-# ============================================================================
-# Postbot code validation
-POSTBOT_CODE_MIN_LENGTH = 10
-
-# UI labels mapping
-SEND_METHOD_LABELS = {
-    SendMethod.DIRECT: '📤 直接发送',
-    SendMethod.POSTBOT: '🤖 Post代码',
-    SendMethod.CHANNEL_FORWARD: '📢 频道转发',
-    SendMethod.CHANNEL_FORWARD_HIDDEN: '🔒 隐藏转发来源'
-}
-
-MEDIA_TYPE_LABELS = {
-    MediaType.TEXT: '📝 纯文本',
-    MediaType.IMAGE: '🖼️ 图片',
-    MediaType.VIDEO: '🎥 视频',
-    MediaType.DOCUMENT: '📄 文档',
-    MediaType.FORWARD: '📡 转发'
-}
-
-
-# ============================================================================
 # 枚举类型
 # ============================================================================
 class AccountStatus(enum.Enum):
@@ -201,6 +178,29 @@ class SendMethod(enum.Enum):
     POSTBOT = "postbot"  # post代码（使用@postbot配置）
     CHANNEL_FORWARD = "channel_forward"  # 频道转发
     CHANNEL_FORWARD_HIDDEN = "channel_forward_hidden"  # 隐藏转发来源
+
+
+# ============================================================================
+# 常量
+# ============================================================================
+# Postbot code validation
+POSTBOT_CODE_MIN_LENGTH = 10
+
+# UI labels mapping
+SEND_METHOD_LABELS = {
+    SendMethod.DIRECT: '📤 直接发送',
+    SendMethod.POSTBOT: '🤖 Post代码',
+    SendMethod.CHANNEL_FORWARD: '📢 频道转发',
+    SendMethod.CHANNEL_FORWARD_HIDDEN: '🔒 隐藏转发来源'
+}
+
+MEDIA_TYPE_LABELS = {
+    MediaType.TEXT: '📝 纯文本',
+    MediaType.IMAGE: '🖼️ 图片',
+    MediaType.VIDEO: '🎥 视频',
+    MediaType.DOCUMENT: '📄 文档',
+    MediaType.FORWARD: '📡 转发'
+}
 
 
 # ============================================================================
