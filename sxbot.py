@@ -15,8 +15,6 @@ import json
 import tempfile
 import zipfile
 import base64
-import struct
-import ipaddress
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
@@ -1269,9 +1267,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         # 确保临时文件被删除
                         if temp_file_path and os.path.exists(temp_file_path):
                             os.unlink(temp_file_path)
+                            temp_file_path = None  # 标记已清理
                 
                 # 尝试多种编码解码文件
-                encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'gbk', 'gb2312', 'gb18030']
+                encodings = ['utf-8', 'utf-8-sig', 'gb18030', 'latin-1']
                 decoded_content = None
                 used_encoding = None
                 
@@ -1339,10 +1338,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"JSON 解析失败: {e}")
                 await update.message.reply_text(
                     "❌ JSON 文件格式错误，请检查文件内容\n\n"
-                    "确保文件是有效的 JSON 格式，例如：\n"
+                    "确保文件是有效的 Telethon session JSON 格式，例如：\n"
                     '{\n'
-                    '  "session_string": "1AQAA...",\n'
-                    '  "phone": "+86138xxxxxxxx"\n'
+                    '  "dc_id": 2,\n'
+                    '  "server_address": "149.154.167.51",\n'
+                    '  "port": 443,\n'
+                    '  "auth_key": "base64编码的认证密钥",\n'
+                    '  "takeout_id": null\n'
                     '}',
                     reply_markup=get_back_keyboard("menu_accounts")
                 )
