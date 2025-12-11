@@ -881,10 +881,20 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         media_type = data.split("_")[1]
         context.user_data['task_data'] = {'media_type': media_type}
         
+        # 媒体类型名称映射
+        media_type_names = {
+            'text': '📝 纯文本',
+            'photo': '🖼️ 图片',
+            'video': '🎥 视频',
+            'voice': '🎤 语音',
+            'document': '📄 文档'
+        }
+        selected_name = media_type_names.get(media_type, '📝 纯文本')
+        
         # 步骤2：选择格式化模式
         await query.edit_message_text(
             f"➕ 创建新任务\n\n"
-            f"已选择: {{'text': '📝 纯文本', 'photo': '🖼️ 图片', 'video': '🎥 视频', 'voice': '🎤 语音', 'document': '📄 文档'}.get(media_type)}\n\n"
+            f"已选择: {selected_name}\n\n"
             f"步骤 2/5: 选择文本格式化\n\n"
             f"请选择消息文本的格式化方式：",
             reply_markup=get_parse_mode_keyboard()
@@ -1112,11 +1122,20 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         media_type = context.user_data['task_data'].get('media_type', 'text')
         
+        # 媒体类型名称映射
+        media_file_names = {
+            'photo': '图片',
+            'video': '视频',
+            'voice': '语音',
+            'document': '文档'
+        }
+        
         # 如果需要媒体文件，要求上传
         if media_type in ['photo', 'video', 'voice', 'document']:
+            file_type_name = media_file_names.get(media_type, '文件')
             await update.message.reply_text(
                 f"✅ 消息模板已保存\n\n"
-                f"步骤 4/5: 请上传{{'photo': '图片', 'video': '视频', 'voice': '语音', 'document': '文档'}.get(media_type)}文件\n\n"
+                f"步骤 4/5: 请上传{file_type_name}文件\n\n"
                 f"请直接发送文件到这里。",
                 reply_markup=get_back_keyboard("menu_tasks")
             )
