@@ -14,6 +14,9 @@ import random
 import json
 import tempfile
 import zipfile
+import base64
+import struct
+import ipaddress
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
@@ -822,15 +825,17 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     elif data == "account_add_json":
         await query.edit_message_text(
             "📄 通过 Session JSON 文件添加账户\n\n"
-            "请上传您的 Session JSON 文件：\n"
-            "• 支持 Telethon 导出的 .session.json 文件\n"
+            "请上传 Telethon session JSON 文件：\n"
+            "• 支持标准 Telethon session.json 格式\n"
             "• 支持 ZIP 压缩包（自动解压第一个 JSON 文件）\n"
-            "• 文件应包含 session_string 字段\n"
             "• 支持多种编码（UTF-8, GBK, GB2312 等）\n\n"
             "JSON 格式示例：\n"
             "{\n"
-            '  "session_string": "1AQAAAAAZ...",\n'
-            '  "phone": "+86138xxxxxxxx"\n'
+            '  "dc_id": 2,\n'
+            '  "server_address": "149.154.167.51",\n'
+            '  "port": 443,\n'
+            '  "auth_key": "base64编码的认证密钥",\n'
+            '  "takeout_id": null\n'
             "}",
             reply_markup=get_back_keyboard("menu_accounts")
         )
@@ -1236,19 +1241,75 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
                 
-                # 解析 JSON
+                # 解析 JSON - Telethon session format
                 session_data = json.loads(decoded_content)
                 
-                # 提取 session string
-                session_string = session_data.get('session_string') or session_data.get('session')
-                phone_number = session_data.get('phone') or session_data.get('phone_number')
+                # 验证必需字段
+                required_fields = ['dc_id', 'server_address', 'port', 'auth_key']
+                missing_fields = [f for f in required_fields if f not in session_data]
                 
-                if not session_string:
+                if missing_fields:
                     await update.message.reply_text(
-                        "❌ JSON 文件中未找到 session_string 字段",
+                        f"❌ JSON 文件缺少必需字段: {', '.join(missing_fields)}\n\n"
+                        "Telethon session JSON 格式示例：\n"
+                        '{\n'
+                        '  "dc_id": 2,\n'
+                        '  "server_address": "149.154.167.51",\n'
+                        '  "port": 443,\n'
+                        '  "auth_key": "base64_encoded_auth_key",\n'
+                        '  "takeout_id": null\n'
+                        '}',
                         reply_markup=get_back_keyboard("menu_accounts")
                     )
                     return
+                
+                # 转换 session JSON 为 StringSession 格式
+                try:
+                    from telethon.crypto import AuthKey
+                    import struct
+                    import ipaddress
+                    
+                    dc_id = session_data['dc_id']
+                    server_address = session_data['server_address']
+                    port = session_data['port']
+                    auth_key_b64 = session_data['auth_key']
+                    
+                    # 解码 auth_key
+                    auth_key_bytes = base64.b64decode(auth_key_b64)
+                    
+                    # 创建 AuthKey 对象
+                    auth_key = AuthKey(data=auth_key_bytes)
+                    
+                    # 转换 IP 为打包格式
+                    ip = ipaddress.ip_address(server_address).packed
+                    
+                    # 打包数据
+                    _STRUCT_PREFORMAT = '>B{}sH256s'
+                    packed_data = struct.pack(
+                        _STRUCT_PREFORMAT.format(len(ip)),
+                        dc_id,
+                        ip,
+                        port,
+                        auth_key.key
+                    )
+                    
+                    # 编码为 StringSession 格式
+                    CURRENT_VERSION = '1'
+                    session_string = CURRENT_VERSION + base64.urlsafe_b64encode(packed_data).decode('ascii')
+                    
+                    logger.info(f"成功转换 session JSON 为 StringSession 格式")
+                    
+                except Exception as e:
+                    logger.error(f"转换 session 失败: {e}")
+                    await update.message.reply_text(
+                        f"❌ 转换 session 失败: {str(e)}\n\n"
+                        "请确保 auth_key 是有效的 base64 编码字符串",
+                        reply_markup=get_back_keyboard("menu_accounts")
+                    )
+                    return
+                
+                # 提取手机号（可选）
+                phone_number = session_data.get('phone') or session_data.get('phone_number')
                 
                 # 添加账户
                 user = db_manager.get_or_create_user(user_id, update.effective_user.username)
