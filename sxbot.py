@@ -219,11 +219,63 @@ class AccountManager:
         self.db = db
         self.encryptor = encryptor
     
-    def add_account(self, user_id: int, session_string: str, phone_number: str = None) -> Account:
-        """添加新账户"""
+    def create_client_from_session(self, session_data: str) -> TelegramClient:
+        """
+        从 session 数据创建 TelegramClient
+        支持:
+        1. Telethon session JSON 格式
+        2. StringSession 格式  
+        3. SQLite session 文件内容
+        """
+        from telethon.sessions import MemorySession, StringSession, SQLiteSession
+        from telethon.crypto import AuthKey
+        
+        try:
+            # 尝试作为 JSON 解析 (Telethon session JSON)
+            session_json = json.loads(session_data)
+            
+            # 验证是否为 Telethon session JSON 格式
+            if all(k in session_json for k in ['dc_id', 'server_address', 'port', 'auth_key']):
+                logger.info("检测到 Telethon session JSON 格式")
+                
+                # 创建 MemorySession 并加载数据
+                session = MemorySession()
+                session.set_dc(
+                    session_json['dc_id'],
+                    session_json['server_address'],
+                    session_json['port']
+                )
+                
+                # 设置 auth_key
+                auth_key_bytes = base64.b64decode(session_json['auth_key'])
+                session.auth_key = AuthKey(data=auth_key_bytes)
+                
+                return TelegramClient(session, API_ID, API_HASH)
+        except (json.JSONDecodeError, KeyError, ValueError):
+            pass
+        
+        # 尝试作为 StringSession
+        try:
+            if session_data.startswith('1'):  # StringSession version prefix
+                logger.info("检测到 StringSession 格式")
+                return TelegramClient(StringSession(session_data), API_ID, API_HASH)
+        except Exception:
+            pass
+        
+        # 如果以上都不是，抛出错误
+        raise ValueError("不支持的 session 格式")
+    
+    def add_account(self, user_id: int, session_data: str, phone_number: str = None) -> Account:
+        """
+        添加新账户
+        session_data 可以是:
+        1. JSON 字符串 (Telethon session JSON)
+        2. StringSession 格式
+        3. SQLite session 文件路径 (临时)
+        """
         session = self.db.get_session()
         try:
-            encrypted_session = self.encryptor.encrypt(session_string)
+            encrypted_session = self.encryptor.encrypt(session_data)
             account = Account(
                 user_id=user_id,
                 session_string=encrypted_session,
@@ -269,11 +321,11 @@ class AccountManager:
         finally:
             session.close()
     
-    async def verify_account(self, session_string: str) -> bool:
+    async def verify_account(self, session_data: str) -> bool:
         """验证账户是否有效"""
         try:
-            decrypted_session = self.encryptor.decrypt(session_string) if session_string.startswith('gA') else session_string
-            client = TelegramClient(StringSession(decrypted_session), API_ID, API_HASH)
+            decrypted_session = self.encryptor.decrypt(session_data) if session_data.startswith('gA') else session_data
+            client = self.create_client_from_session(decrypted_session)
             await client.connect()
             if await client.is_user_authorized():
                 await client.disconnect()
@@ -498,11 +550,11 @@ class MessageSender:
         """
         client = None
         try:
-            # 解密 session string
+            # 解密 session 数据
             decrypted_session = self.encryptor.decrypt(account.session_string)
             
-            # 创建 Telethon 客户端
-            client = TelegramClient(StringSession(decrypted_session), API_ID, API_HASH)
+            # 创建 Telethon 客户端（支持多种格式）
+            client = self.account_manager.create_client_from_session(decrypted_session)
             await client.connect()
             
             if not await client.is_user_authorized():
@@ -1242,11 +1294,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 
                 # 解析 JSON - Telethon session format
-                session_data = json.loads(decoded_content)
+                session_data_dict = json.loads(decoded_content)
                 
                 # 验证必需字段
                 required_fields = ['dc_id', 'server_address', 'port', 'auth_key']
-                missing_fields = [f for f in required_fields if f not in session_data]
+                missing_fields = [f for f in required_fields if f not in session_data_dict]
                 
                 if missing_fields:
                     await update.message.reply_text(
@@ -1263,57 +1315,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
                 
-                # 转换 session JSON 为 StringSession 格式
-                try:
-                    from telethon.crypto import AuthKey
-                    import struct
-                    import ipaddress
-                    
-                    dc_id = session_data['dc_id']
-                    server_address = session_data['server_address']
-                    port = session_data['port']
-                    auth_key_b64 = session_data['auth_key']
-                    
-                    # 解码 auth_key
-                    auth_key_bytes = base64.b64decode(auth_key_b64)
-                    
-                    # 创建 AuthKey 对象
-                    auth_key = AuthKey(data=auth_key_bytes)
-                    
-                    # 转换 IP 为打包格式
-                    ip = ipaddress.ip_address(server_address).packed
-                    
-                    # 打包数据
-                    _STRUCT_PREFORMAT = '>B{}sH256s'
-                    packed_data = struct.pack(
-                        _STRUCT_PREFORMAT.format(len(ip)),
-                        dc_id,
-                        ip,
-                        port,
-                        auth_key.key
-                    )
-                    
-                    # 编码为 StringSession 格式
-                    CURRENT_VERSION = '1'
-                    session_string = CURRENT_VERSION + base64.urlsafe_b64encode(packed_data).decode('ascii')
-                    
-                    logger.info(f"成功转换 session JSON 为 StringSession 格式")
-                    
-                except Exception as e:
-                    logger.error(f"转换 session 失败: {e}")
-                    await update.message.reply_text(
-                        f"❌ 转换 session 失败: {str(e)}\n\n"
-                        "请确保 auth_key 是有效的 base64 编码字符串",
-                        reply_markup=get_back_keyboard("menu_accounts")
-                    )
-                    return
+                # 直接存储 JSON 字符串（不转换）
+                session_data_str = decoded_content
                 
                 # 提取手机号（可选）
-                phone_number = session_data.get('phone') or session_data.get('phone_number')
+                phone_number = session_data_dict.get('phone') or session_data_dict.get('phone_number')
+                
+                logger.info(f"成功解析 Telethon session JSON")
                 
                 # 添加账户
                 user = db_manager.get_or_create_user(user_id, update.effective_user.username)
-                account_manager.add_account(user.id, session_string, phone_number)
+                account_manager.add_account(user.id, session_data_str, phone_number)
                 
                 await update.message.reply_text(
                     f"✅ 账户添加成功！\n手机号: {phone_number or 'N/A'}",
