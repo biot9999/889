@@ -1010,7 +1010,15 @@ async def show_upload_type_menu(query):
 
 
 async def request_session_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Request session file upload"""
+    """
+    Request session file upload - Conversation entry point.
+    
+    Handles the upload_session_file callback, prompts the user to upload a .zip file
+    containing session files, and transitions to SESSION_UPLOAD state.
+    
+    Returns:
+        int: SESSION_UPLOAD state constant
+    """
     query = update.callback_query
     await query.answer()
     logger.info(f"User {query.from_user.id} requested session file upload")
@@ -1028,7 +1036,15 @@ async def request_session_upload(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def request_tdata_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Request tdata file upload"""
+    """
+    Request TData file upload - Conversation entry point.
+    
+    Handles the upload_tdata_file callback, prompts the user to upload a .zip file
+    containing Telegram Desktop tdata folder, and transitions to TDATA_UPLOAD state.
+    
+    Returns:
+        int: TDATA_UPLOAD state constant
+    """
     query = update.callback_query
     await query.answer()
     logger.info(f"User {query.from_user.id} requested tdata file upload")
@@ -1046,18 +1062,21 @@ async def request_tdata_upload(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle file upload for session or tdata"""
     upload_type = context.user_data.get('upload_type', 'session')
+    # Determine which state to return based on upload type
+    current_state = SESSION_UPLOAD if upload_type == 'session' else TDATA_UPLOAD
+    
     logger.info(f"User {update.effective_user.id} is uploading {upload_type} file")
     
     if not update.message.document:
         logger.warning(f"User {update.effective_user.id} sent non-document message")
         await update.message.reply_text("❌ 请上传 .zip 文件")
-        return SESSION_UPLOAD if upload_type == 'session' else TDATA_UPLOAD
+        return current_state
     
     document = update.message.document
     if not document.file_name.endswith('.zip'):
         logger.warning(f"User {update.effective_user.id} uploaded non-zip file: {document.file_name}")
         await update.message.reply_text("❌ 只支持 .zip 格式文件")
-        return SESSION_UPLOAD if upload_type == 'session' else TDATA_UPLOAD
+        return current_state
     
     # Download file
     logger.info(f"Downloading file: {document.file_name} ({document.file_size} bytes)")
@@ -1115,7 +1134,7 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"请检查文件格式是否正确",
             parse_mode='HTML'
         )
-        return SESSION_UPLOAD if upload_type == 'session' else TDATA_UPLOAD
+        return current_state
 
 
 async def list_accounts(query):
