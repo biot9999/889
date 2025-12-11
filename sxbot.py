@@ -12,6 +12,8 @@ import asyncio
 import logging
 import random
 import json
+import tempfile
+import zipfile
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
@@ -1167,6 +1169,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif waiting_for == 'session_json':
         # 检查是否有文档
         if update.message.document:
+            temp_file_path = None
             try:
                 file = await update.message.document.get_file()
                 file_content = await file.download_as_bytearray()
@@ -1174,16 +1177,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 # 检查是否是 ZIP 文件
                 if file_name.endswith('.zip'):
-                    import tempfile
-                    import zipfile
-                    
                     # 保存到临时文件
                     with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_file:
                         tmp_file.write(file_content)
                         tmp_file.flush()
-                        
+                        temp_file_path = tmp_file.name
+                    
+                    try:
                         # 解压并查找 JSON 文件
-                        with zipfile.ZipFile(tmp_file.name, 'r') as zip_ref:
+                        with zipfile.ZipFile(temp_file_path, 'r') as zip_ref:
                             json_files = [f for f in zip_ref.namelist() if f.endswith('.json')]
                             
                             if not json_files:
@@ -1191,15 +1193,25 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     "❌ ZIP 文件中没有找到 JSON 文件",
                                     reply_markup=get_back_keyboard("menu_accounts")
                                 )
-                                os.unlink(tmp_file.name)
                                 return
                             
                             # 处理第一个 JSON 文件
                             json_file_name = json_files[0]
+                            
+                            # 验证路径安全性 - 防止目录遍历攻击
+                            if '..' in json_file_name or json_file_name.startswith('/'):
+                                await update.message.reply_text(
+                                    "❌ 检测到不安全的文件路径",
+                                    reply_markup=get_back_keyboard("menu_accounts")
+                                )
+                                return
+                            
                             json_content = zip_ref.read(json_file_name)
                             file_content = json_content
-                            
-                        os.unlink(tmp_file.name)
+                    finally:
+                        # 确保临时文件被删除
+                        if temp_file_path and os.path.exists(temp_file_path):
+                            os.unlink(temp_file_path)
                 
                 # 尝试多种编码解码文件
                 encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'gbk', 'gb2312', 'gb18030']
@@ -1212,7 +1224,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         used_encoding = encoding
                         logger.info(f"成功使用 {encoding} 编码解码文件")
                         break
-                    except (UnicodeDecodeError, AttributeError):
+                    except UnicodeDecodeError:
                         continue
                 
                 if decoded_content is None:
@@ -1225,7 +1237,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 
                 # 解析 JSON
-                import json
                 session_data = json.loads(decoded_content)
                 
                 # 提取 session string
@@ -1268,6 +1279,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"❌ 添加账户失败: {str(e)}",
                     reply_markup=get_back_keyboard("menu_accounts")
                 )
+            finally:
+                # 确保临时文件被清理（如果在 try 块之外创建）
+                if temp_file_path and os.path.exists(temp_file_path):
+                    try:
+                        os.unlink(temp_file_path)
+                    except Exception:
+                        pass
         else:
             await update.message.reply_text(
                 "❌ 请上传 JSON 文件",
