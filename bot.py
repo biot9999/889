@@ -916,9 +916,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'tasks_list':
         logger.info(f"User {user_id} viewing tasks list")
         await list_tasks(query)
-    elif data == 'tasks_create':
-        logger.info(f"User {user_id} starting task creation")
-        await start_create_task(query, context)
+    # Note: tasks_create is handled by ConversationHandler
     elif data.startswith('task_start_'):
         task_id = int(data.split('_')[2])
         logger.info(f"User {user_id} starting task {task_id}")
@@ -1226,8 +1224,19 @@ async def list_tasks(query):
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
 
 
-async def start_create_task(query, context):
-    """Start task creation"""
+async def start_create_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Start task creation - Conversation entry point.
+    
+    Handles the tasks_create callback, prompts the user to input a task name,
+    and transitions to TASK_NAME_INPUT state.
+    
+    Returns:
+        int: TASK_NAME_INPUT state constant
+    """
+    query = update.callback_query
+    await query.answer()
+    logger.info(f"User {query.from_user.id} starting task creation")
     await query.message.reply_text("➕ <b>创建新任务</b>\n\n请输入任务名称：", parse_mode='HTML')
     context.user_data['creating_task'] = True
     return TASK_NAME_INPUT
