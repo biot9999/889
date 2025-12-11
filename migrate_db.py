@@ -43,7 +43,7 @@ def migrate_database():
         
         # 需要添加的列
         new_columns = [
-            ("send_method", "VARCHAR(50) DEFAULT 'direct'"),
+            ("send_method", "VARCHAR(50)"),
             ("postbot_code", "TEXT"),
             ("channel_link", "VARCHAR(500)")
         ]
@@ -60,6 +60,16 @@ def migrate_database():
                     print(f"⚠️  添加列 {col_name} 时出错: {e}")
             else:
                 print(f"ℹ️  列已存在: {col_name}")
+        
+        # 设置默认值 - 为所有 NULL 的 send_method 设置默认值
+        if 'send_method' in existing_columns or added_count > 0:
+            try:
+                cursor.execute("UPDATE tasks SET send_method = 'direct' WHERE send_method IS NULL")
+                updated_count = cursor.rowcount
+                if updated_count > 0:
+                    print(f"✅ 已为 {updated_count} 个任务设置默认发送方式")
+            except sqlite3.OperationalError as e:
+                print(f"⚠️  设置默认值时出错: {e}")
         
         # 提交更改
         conn.commit()

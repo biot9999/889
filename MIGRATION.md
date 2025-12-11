@@ -3,8 +3,9 @@
 ## 问题 / Problem
 
 如果你在使用新版本时遇到以下错误：
-If you encounter this error when using the new version:
+If you encounter these errors when using the new version:
 
+### 错误 1: 缺少列 / Missing Column
 ```
 sqlite3.OperationalError: table tasks has no column named send_method
 ```
@@ -12,15 +13,53 @@ sqlite3.OperationalError: table tasks has no column named send_method
 这是因为你的数据库是旧版本创建的，缺少新增的列。
 This is because your database was created with an old version and is missing new columns.
 
+### 错误 2: 枚举值错误 / Enum Value Error
+```
+KeyError: 'direct'
+sqlalchemy.sql.sqltypes._object_value_for_elem
+```
+
+这是因为数据库中的枚举值格式不正确。
+This is because enum values in the database are not in the correct format.
+
 ## 解决方案 / Solution
 
-### 方案 1：运行迁移脚本（推荐）/ Run Migration Script (Recommended)
+### 步骤 1：运行迁移脚本 / Step 1: Run Migration Script
 
 这个方法会保留你现有的数据。
 This method preserves your existing data.
 
 ```bash
+# 添加缺失的列
+# Add missing columns
 python3 migrate_db.py
+```
+
+### 步骤 2：修复枚举值 / Step 2: Fix Enum Values
+
+```bash
+# 修复枚举值格式
+# Fix enum value format
+python3 fix_enum_values.py
+```
+
+### 方案 2：重新初始化数据库（如果上述方法无效）/ Option 2: Reinitialize Database (if above doesn't work)
+
+**⚠️ 警告：这会删除所有现有数据！**
+**⚠️ Warning: This will delete all existing data!**
+
+```bash
+# 1. 备份旧数据库（如果需要）
+# Backup old database (if needed)
+cp telegram_bot.db telegram_bot.db.backup
+
+# 2. 删除旧数据库
+# Delete old database
+rm telegram_bot.db
+
+# 3. 重新初始化
+# Reinitialize
+python3 init_db.py
 ```
 
 迁移脚本会自动添加以下新列：

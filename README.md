@@ -69,7 +69,8 @@
 889/
 ├── bot.py              # 主程序（所有功能集成在一个文件中）
 ├── init_db.py          # 数据库初始化脚本
-├── migrate_db.py       # 数据库迁移脚本（用于升级现有数据库）
+├── migrate_db.py       # 数据库迁移脚本（添加新列）
+├── fix_enum_values.py  # 修复枚举值脚本（修复数据格式问题）
 ├── start.sh            # 快速启动脚本
 ├── requirements.txt    # Python 依赖
 ├── .env.example        # 环境变量模板
@@ -133,7 +134,11 @@ python3 init_db.py
 
 **⚠️ 如果是升级现有数据库**：如果你已经在使用旧版本，运行以下命令迁移数据库（保留现有数据）：
 ```bash
+# 步骤 1: 添加新列
 python3 migrate_db.py
+
+# 步骤 2: 修复枚举值（如果遇到 KeyError 错误）
+python3 fix_enum_values.py
 ```
 详细说明请查看 [MIGRATION.md](MIGRATION.md)
 

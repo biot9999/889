@@ -213,7 +213,7 @@ class Account(Base):
     id = Column(Integer, primary_key=True)
     phone = Column(String(20), unique=True, nullable=False)
     session_name = Column(String(100), unique=True, nullable=False)
-    status = Column(SQLEnum(AccountStatus), default=AccountStatus.ACTIVE)
+    status = Column(SQLEnum(AccountStatus, native_enum=False), default=AccountStatus.ACTIVE)
     api_id = Column(String(50))
     api_hash = Column(String(100))
     messages_sent_today = Column(Integer, default=0)
@@ -233,12 +233,12 @@ class Task(Base):
     
     id = Column(Integer, primary_key=True)
     name = Column(String(200), nullable=False)
-    status = Column(SQLEnum(TaskStatus), default=TaskStatus.PENDING)
+    status = Column(SQLEnum(TaskStatus, native_enum=False), default=TaskStatus.PENDING)
     message_text = Column(Text, nullable=False)
-    message_format = Column(SQLEnum(MessageFormat), default=MessageFormat.PLAIN)
-    media_type = Column(SQLEnum(MediaType), default=MediaType.TEXT)
+    message_format = Column(SQLEnum(MessageFormat, native_enum=False), default=MessageFormat.PLAIN)
+    media_type = Column(SQLEnum(MediaType, native_enum=False), default=MediaType.TEXT)
     media_path = Column(String(500), nullable=True)
-    send_method = Column(SQLEnum(SendMethod), default=SendMethod.DIRECT)
+    send_method = Column(SQLEnum(SendMethod, native_enum=False), default=SendMethod.DIRECT)
     postbot_code = Column(Text, nullable=True)  # post代码内容
     channel_link = Column(String(500), nullable=True)  # 频道链接
     min_interval = Column(Integer, default=30)
