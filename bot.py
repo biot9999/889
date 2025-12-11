@@ -1014,6 +1014,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # After preview, always go to target list
         return await request_target_list(query)
     
+    # Preview back - allow user to modify configuration
+    elif data == 'preview_back':
+        send_method = context.user_data.get('send_method', SendMethod.DIRECT)
+        logger.info(f"User {user_id} going back from preview, send_method: {send_method.value}")
+        
+        if send_method == SendMethod.DIRECT:
+            # For direct send, go back to message input
+            await query.message.reply_text(
+                "📤 <b>直接发送</b>\n\n"
+                "请重新输入消息内容：\n\n"
+                "💡 可使用变量：{name}, {first_name}, {last_name}, {full_name}, {username}",
+                parse_mode='HTML'
+            )
+            return MESSAGE_INPUT
+        elif send_method == SendMethod.POSTBOT:
+            # For postbot, go back to code input
+            return await request_postbot_code(query)
+        elif send_method in [SendMethod.CHANNEL_FORWARD, SendMethod.CHANNEL_FORWARD_HIDDEN]:
+            # For channel forward, go back to link input
+            return await request_channel_link(query)
+    
     # Media selection
     elif data.startswith('media_'):
         media_name = data.split('_')[1]
@@ -1504,7 +1525,10 @@ async def show_preview(query, context):
         f"✅ 配置完成"
     )
     
-    keyboard = [[InlineKeyboardButton("✅ 配置完成", callback_data='preview_continue')]]
+    keyboard = [
+        [InlineKeyboardButton("✅ 配置完成", callback_data='preview_continue')],
+        [InlineKeyboardButton("🔙 返回修改", callback_data='preview_back')]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.message.reply_text(preview_text, parse_mode='HTML', reply_markup=reply_markup)
@@ -1528,7 +1552,10 @@ async def show_preview_from_update(update: Update, context: ContextTypes.DEFAULT
         f"✅ 配置完成"
     )
     
-    keyboard = [[InlineKeyboardButton("✅ 配置完成", callback_data='preview_continue')]]
+    keyboard = [
+        [InlineKeyboardButton("✅ 配置完成", callback_data='preview_continue')],
+        [InlineKeyboardButton("🔙 返回修改", callback_data='preview_back')]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(preview_text, parse_mode='HTML', reply_markup=reply_markup)

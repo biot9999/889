@@ -69,11 +69,13 @@
 889/
 ├── bot.py              # 主程序（所有功能集成在一个文件中）
 ├── init_db.py          # 数据库初始化脚本
+├── migrate_db.py       # 数据库迁移脚本（用于升级现有数据库）
 ├── start.sh            # 快速启动脚本
 ├── requirements.txt    # Python 依赖
 ├── .env.example        # 环境变量模板
 ├── .gitignore          # Git 忽略文件
-└── README.md           # 项目文档
+├── README.md           # 项目文档
+└── MIGRATION.md        # 数据库迁移指南
 ```
 
 ### 安装步骤
@@ -128,6 +130,12 @@ cp .env.example .env
 ```bash
 python3 init_db.py
 ```
+
+**⚠️ 如果是升级现有数据库**：如果你已经在使用旧版本，运行以下命令迁移数据库（保留现有数据）：
+```bash
+python3 migrate_db.py
+```
+详细说明请查看 [MIGRATION.md](MIGRATION.md)
 
 6. 启动机器人：
 ```bash
