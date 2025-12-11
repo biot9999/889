@@ -1356,6 +1356,48 @@ async def request_media_upload(query):
     return MEDIA_UPLOAD
 
 
+async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle media file upload"""
+    user_id = update.effective_user.id
+    logger.info(f"User {user_id} uploading media file")
+    
+    try:
+        if not update.message.document and not update.message.photo and not update.message.video:
+            await update.message.reply_text("❌ 请上传有效的媒体文件")
+            return MEDIA_UPLOAD
+        
+        # Save the file
+        if update.message.document:
+            file = await update.message.document.get_file()
+            file_ext = os.path.splitext(update.message.document.file_name)[1]
+        elif update.message.photo:
+            file = await update.message.photo[-1].get_file()
+            file_ext = '.jpg'
+        elif update.message.video:
+            file = await update.message.video.get_file()
+            file_ext = '.mp4'
+        else:
+            await update.message.reply_text("❌ 不支持的媒体类型")
+            return MEDIA_UPLOAD
+        
+        # Save to media directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"media_{user_id}_{timestamp}{file_ext}"
+        media_path = os.path.join(Config.MEDIA_DIR, filename)
+        await file.download_to_drive(media_path)
+        
+        context.user_data['media_path'] = media_path
+        logger.info(f"User {user_id} uploaded media to {media_path}")
+        
+        await update.message.reply_text("✅ 媒体文件已保存")
+        return await request_target_list_from_update(update)
+        
+    except Exception as e:
+        logger.error(f"Error handling media upload for user {user_id}: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ 上传失败：{str(e)}")
+        return MEDIA_UPLOAD
+
+
 async def request_postbot_code(query):
     """Request postbot code input"""
     await query.message.reply_text(
@@ -1567,15 +1609,27 @@ async def export_results(query, task_id):
             f.write(f"[{log.sent_at}] {status}: {log.error_message or 'OK'}\n")
     
     # Only send non-empty files (Telegram API rejects empty files)
-    if os.path.getsize(success_file) > 0:
-        with open(success_file, 'rb') as f:
-            await query.message.reply_document(document=f, filename="success.txt")
-    if os.path.getsize(failed_file) > 0:
-        with open(failed_file, 'rb') as f:
-            await query.message.reply_document(document=f, filename="failed.txt")
-    if os.path.getsize(log_file) > 0:
-        with open(log_file, 'rb') as f:
-            await query.message.reply_document(document=f, filename="log.txt")
+    try:
+        if os.path.getsize(success_file) > 0:
+            with open(success_file, 'rb') as f:
+                await query.message.reply_document(document=f, filename="success.txt")
+    except Exception as e:
+        logger.warning(f"Failed to send success file: {e}")
+    
+    try:
+        if os.path.getsize(failed_file) > 0:
+            with open(failed_file, 'rb') as f:
+                await query.message.reply_document(document=f, filename="failed.txt")
+    except Exception as e:
+        logger.warning(f"Failed to send failed file: {e}")
+    
+    try:
+        if os.path.getsize(log_file) > 0:
+            with open(log_file, 'rb') as f:
+                await query.message.reply_document(document=f, filename="log.txt")
+    except Exception as e:
+        logger.warning(f"Failed to send log file: {e}")
+    
     await query.message.reply_text("✅ 结果已导出")
 
 
@@ -1715,6 +1769,7 @@ def main():
             CHANNEL_LINK_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_link_input)],
             PREVIEW_CONFIG: [CallbackQueryHandler(button_handler)],
             MEDIA_SELECT: [CallbackQueryHandler(button_handler)],
+            MEDIA_UPLOAD: [MessageHandler((filters.Document.ALL | filters.PHOTO | filters.VIDEO) & ~filters.COMMAND, handle_media_upload)],
             TARGET_INPUT: [MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, handle_target_input)]
         },
         fallbacks=[CommandHandler("start", start)]
