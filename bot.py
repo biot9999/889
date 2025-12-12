@@ -1247,7 +1247,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_upload_type_menu(query)
     # Note: upload_session_file and upload_tdata_file are handled by ConversationHandler
     elif data.startswith('account_check_'):
-        account_id = int(data.split('_')[2])
+        account_id = data.split('_')[2]
         logger.info(f"User {user_id} checking account {account_id}")
         await check_account(query, account_id)
     
@@ -1257,40 +1257,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await list_tasks(query)
     # Note: tasks_create is handled by ConversationHandler
     elif data.startswith('task_detail_'):
-        task_id = int(data.split('_')[2])
+        task_id = data.split('_')[2]
         logger.info(f"User {user_id} viewing task {task_id} detail")
         await show_task_detail(query, task_id)
     elif data.startswith('task_config_'):
-        task_id = int(data.split('_')[2])
+        task_id = data.split('_')[2]
         logger.info(f"User {user_id} configuring task {task_id}")
         await show_task_config(query, task_id)
     elif data.startswith('cfg_toggle_'):
         # Handle toggle buttons for pin_message, delete_dialog, repeat_send
         parts = data.split('_')
         toggle_type = parts[2]  # pin, delete, repeat
-        task_id = int(parts[3])
+        task_id = parts[3]
         await toggle_task_config(query, task_id, toggle_type)
     elif data == 'noop':
         # No operation for info-only buttons
         await query.answer()
     elif data.startswith('task_start_'):
-        task_id = int(data.split('_')[2])
+        task_id = data.split('_')[2]
         logger.info(f"User {user_id} starting task {task_id}")
         await start_task_handler(query, task_id)
     elif data.startswith('task_stop_'):
-        task_id = int(data.split('_')[2])
+        task_id = data.split('_')[2]
         logger.info(f"User {user_id} stopping task {task_id}")
         await stop_task_handler(query, task_id)
     elif data.startswith('task_progress_'):
-        task_id = int(data.split('_')[2])
+        task_id = data.split('_')[2]
         logger.info(f"User {user_id} viewing task {task_id} progress")
         await show_task_progress(query, task_id)
     elif data.startswith('task_export_'):
-        task_id = int(data.split('_')[2])
+        task_id = data.split('_')[2]
         logger.info(f"User {user_id} exporting task {task_id} results")
         await export_results(query, task_id)
     elif data.startswith('task_delete_'):
-        task_id = int(data.split('_')[2])
+        task_id = data.split('_')[2]
         logger.info(f"User {user_id} deleting task {task_id}")
         await delete_task_handler(query, task_id)
     
