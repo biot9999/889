@@ -181,6 +181,29 @@ class SendMethod(enum.Enum):
 
 
 # ============================================================================
+# 常量
+# ============================================================================
+# Postbot code validation
+POSTBOT_CODE_MIN_LENGTH = 10
+
+# UI labels mapping
+SEND_METHOD_LABELS = {
+    SendMethod.DIRECT: '📤 直接发送',
+    SendMethod.POSTBOT: '🤖 Post代码',
+    SendMethod.CHANNEL_FORWARD: '📢 频道转发',
+    SendMethod.CHANNEL_FORWARD_HIDDEN: '🔒 隐藏转发来源'
+}
+
+MEDIA_TYPE_LABELS = {
+    MediaType.TEXT: '📝 纯文本',
+    MediaType.IMAGE: '🖼️ 图片',
+    MediaType.VIDEO: '🎥 视频',
+    MediaType.DOCUMENT: '📄 文档',
+    MediaType.FORWARD: '📡 转发'
+}
+
+
+# ============================================================================
 # 数据库模型
 # ============================================================================
 class Account(Base):
@@ -190,7 +213,7 @@ class Account(Base):
     id = Column(Integer, primary_key=True)
     phone = Column(String(20), unique=True, nullable=False)
     session_name = Column(String(100), unique=True, nullable=False)
-    status = Column(SQLEnum(AccountStatus), default=AccountStatus.ACTIVE)
+    status = Column(SQLEnum(AccountStatus, native_enum=False), default=AccountStatus.ACTIVE)
     api_id = Column(String(50))
     api_hash = Column(String(100))
     messages_sent_today = Column(Integer, default=0)
@@ -210,12 +233,12 @@ class Task(Base):
     
     id = Column(Integer, primary_key=True)
     name = Column(String(200), nullable=False)
-    status = Column(SQLEnum(TaskStatus), default=TaskStatus.PENDING)
+    status = Column(SQLEnum(TaskStatus, native_enum=False), default=TaskStatus.PENDING)
     message_text = Column(Text, nullable=False)
-    message_format = Column(SQLEnum(MessageFormat), default=MessageFormat.PLAIN)
-    media_type = Column(SQLEnum(MediaType), default=MediaType.TEXT)
+    message_format = Column(SQLEnum(MessageFormat, native_enum=False), default=MessageFormat.PLAIN)
+    media_type = Column(SQLEnum(MediaType, native_enum=False), default=MediaType.TEXT)
     media_path = Column(String(500), nullable=True)
-    send_method = Column(SQLEnum(SendMethod), default=SendMethod.DIRECT)
+    send_method = Column(SQLEnum(SendMethod, native_enum=False), default=SendMethod.DIRECT)
     postbot_code = Column(Text, nullable=True)  # post代码内容
     channel_link = Column(String(500), nullable=True)  # 频道链接
     min_interval = Column(Integer, default=30)
@@ -955,7 +978,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         format_name = data.split('_')[1]
         context.user_data['message_format'] = MessageFormat[format_name.upper()]
         logger.info(f"User {user_id} selected format: {format_name}")
-        return await select_send_method(query)
+        # After format selection, go to media type selection
+        return await select_media_type(query)
     
     # Send method selection
     elif data.startswith('sendmethod_'):
@@ -964,7 +988,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == 'sendmethod_direct':
             context.user_data['send_method'] = SendMethod.DIRECT
             logger.info(f"User {user_id} selected send method: direct")
-            return await select_media_type(query)
+            # For direct send, request message input
+            await query.message.reply_text(
+                "📤 <b>直接发送</b>\n\n"
+                "请输入消息内容：\n\n"
+                "💡 可使用变量：{name}, {first_name}, {last_name}, {full_name}, {username}",
+                parse_mode='HTML'
+            )
+            return MESSAGE_INPUT
         elif data == 'sendmethod_postbot':
             context.user_data['send_method'] = SendMethod.POSTBOT
             logger.info(f"User {user_id} selected send method: postbot")
@@ -980,12 +1011,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Preview continue
     elif data == 'preview_continue':
+        # After preview, always go to target list
+        return await request_target_list(query)
+    
+    # Preview back - allow user to modify configuration
+    elif data == 'preview_back':
         send_method = context.user_data.get('send_method', SendMethod.DIRECT)
+        logger.info(f"User {user_id} going back from preview, send_method: {send_method.value}")
+        
         if send_method == SendMethod.DIRECT:
-            return await select_media_type(query)
+            # For direct send, go back to message input
+            await query.message.reply_text(
+                "📤 <b>直接发送</b>\n\n"
+                "请重新输入消息内容：\n\n"
+                "💡 可使用变量：{name}, {first_name}, {last_name}, {full_name}, {username}",
+                parse_mode='HTML'
+            )
+            return MESSAGE_INPUT
         elif send_method == SendMethod.POSTBOT:
+            # For postbot, go back to code input
             return await request_postbot_code(query)
         elif send_method in [SendMethod.CHANNEL_FORWARD, SendMethod.CHANNEL_FORWARD_HIDDEN]:
+            # For channel forward, go back to link input
             return await request_channel_link(query)
     
     # Media selection
@@ -994,7 +1041,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['media_type'] = MediaType[media_name.upper()]
         logger.info(f"User {user_id} selected media type: {media_name}")
         if context.user_data['media_type'] == MediaType.TEXT:
-            return await request_target_list(query)
+            # Show preview before going to target list
+            return await show_preview(query, context)
         else:
             return await request_media_upload(query)
     
@@ -1292,13 +1340,27 @@ async def start_create_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_task_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle task name"""
     context.user_data['task_name'] = update.message.text
+    
+    # Now go directly to send method selection
+    keyboard = [
+        [InlineKeyboardButton("📤 直接发送", callback_data='sendmethod_direct')],
+        [InlineKeyboardButton("🤖 Post代码", callback_data='sendmethod_postbot')],
+        [InlineKeyboardButton("📢 频道转发", callback_data='sendmethod_channel_forward')],
+        [InlineKeyboardButton("🔒 隐藏转发来源", callback_data='sendmethod_channel_forward_hidden')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await update.message.reply_text(
         f"✅ 任务名称: <b>{update.message.text}</b>\n\n"
-        "请输入消息内容：\n\n"
-        "💡 可使用变量：{name}, {first_name}, {last_name}, {full_name}, {username}",
-        parse_mode='HTML'
+        "📮 <b>请选择发送方式配置：</b>\n\n"
+        "📤 <b>直接发送</b> - 请配置文本消息（可以纯文字，也可以直接发图片带文字）\n"
+        "🤖 <b>Post代码</b> - 使用 @postbot 配置的图文按钮\n"
+        "📢 <b>频道转发</b> - 转发频道帖子\n"
+        "🔒 <b>隐藏转发来源</b> - 转发频道帖子但隐藏来源",
+        parse_mode='HTML',
+        reply_markup=reply_markup
     )
-    return MESSAGE_INPUT
+    return SEND_METHOD_SELECT
 
 
 async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1312,29 +1374,6 @@ async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYP
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("✅ 消息已保存\n\n请选择格式：", reply_markup=reply_markup)
     return FORMAT_SELECT
-
-
-async def select_send_method(query):
-    """Select send method"""
-    keyboard = [
-        [InlineKeyboardButton("📤 直接发送", callback_data='sendmethod_direct')],
-        [InlineKeyboardButton("🤖 Post代码", callback_data='sendmethod_postbot')],
-        [InlineKeyboardButton("📢 频道转发", callback_data='sendmethod_channel_forward')],
-        [InlineKeyboardButton("🔒 隐藏转发来源", callback_data='sendmethod_channel_forward_hidden')],
-        [InlineKeyboardButton("👁️ 查看预览", callback_data='sendmethod_preview')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.message.reply_text(
-        "📮 <b>发送方式配置</b>\n\n"
-        "请选择发送方式：\n"
-        "📤 直接发送 - 直接发送纯文本消息\n"
-        "🤖 Post代码 - 使用 @postbot 配置的图文按钮\n"
-        "📢 频道转发 - 转发频道帖子\n"
-        "🔒 隐藏转发来源 - 转发频道帖子但隐藏来源",
-        parse_mode='HTML',
-        reply_markup=reply_markup
-    )
-    return SEND_METHOD_SELECT
 
 
 async def select_media_type(query):
@@ -1390,7 +1429,9 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.info(f"User {user_id} uploaded media to {media_path}")
         
         await update.message.reply_text("✅ 媒体文件已保存")
-        return await request_target_list_from_update(update)
+        
+        # Show preview before going to target list
+        return await show_preview_from_update(update, context)
         
     except Exception as e:
         logger.error(f"Error handling media upload for user {user_id}: {e}", exc_info=True)
@@ -1410,10 +1451,29 @@ async def request_postbot_code(query):
 
 
 async def handle_postbot_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle postbot code input"""
-    context.user_data['postbot_code'] = update.message.text
+    """Handle postbot code input with validation"""
+    code = update.message.text.strip()
+    
+    # Validate postbot code format (must be like 693af80c53cb2)
+    # Pattern: alphanumeric characters, minimum length defined by constant
+    if not re.match(rf'^[a-zA-Z0-9]{{{POSTBOT_CODE_MIN_LENGTH},}}$', code):
+        await update.message.reply_text(
+            "❌ <b>代码格式错误</b>\n\n"
+            "Post代码格式应该类似：<code>693af80c53cb2</code>\n\n"
+            "请重新输入正确的代码：",
+            parse_mode='HTML'
+        )
+        return POSTBOT_CODE_INPUT
+    
+    context.user_data['postbot_code'] = code
+    context.user_data['message_text'] = f"使用 @postbot 代码: {code}"
+    context.user_data['message_format'] = MessageFormat.PLAIN
+    context.user_data['media_type'] = MediaType.TEXT
+    
     await update.message.reply_text("✅ Post代码已保存")
-    return await request_target_list_from_update(update)
+    
+    # Show preview before going to target list
+    return await show_preview_from_update(update, context)
 
 
 async def request_channel_link(query):
@@ -1429,9 +1489,23 @@ async def request_channel_link(query):
 
 async def handle_channel_link_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle channel link input"""
-    context.user_data['channel_link'] = update.message.text
+    link = update.message.text.strip()
+    context.user_data['channel_link'] = link
+    
+    # Set default values for channel forward
+    send_method = context.user_data.get('send_method', SendMethod.CHANNEL_FORWARD)
+    if send_method == SendMethod.CHANNEL_FORWARD_HIDDEN:
+        context.user_data['message_text'] = f"转发频道帖子（隐藏来源）: {link}"
+    else:
+        context.user_data['message_text'] = f"转发频道帖子: {link}"
+    
+    context.user_data['message_format'] = MessageFormat.PLAIN
+    context.user_data['media_type'] = MediaType.FORWARD
+    
     await update.message.reply_text("✅ 频道链接已保存")
-    return await request_target_list_from_update(update)
+    
+    # Show preview before going to target list
+    return await show_preview_from_update(update, context)
 
 
 async def show_preview(query, context):
@@ -1439,18 +1513,52 @@ async def show_preview(query, context):
     message_text = context.user_data.get('message_text', '')
     message_format = context.user_data.get('message_format', MessageFormat.PLAIN)
     send_method = context.user_data.get('send_method', SendMethod.DIRECT)
+    media_type = context.user_data.get('media_type', MediaType.TEXT)
     
     preview_text = (
-        "👁️ <b>消息预览</b>\n\n"
-        f"📝 格式：{message_format.value}\n"
-        f"📮 发送方式：{send_method.value}\n\n"
-        f"<b>内容：</b>\n{message_text[:200]}{'...' if len(message_text) > 200 else ''}"
+        "👁️ <b>预览配置的广告文案！</b>\n\n"
+        f"📮 发送方式：{SEND_METHOD_LABELS.get(send_method, send_method.value)}\n"
+        f"📝 消息格式：{message_format.value}\n"
+        f"📦 媒体类型：{MEDIA_TYPE_LABELS.get(media_type, media_type.value)}\n\n"
+        f"<b>消息内容：</b>\n{message_text[:200]}{'...' if len(message_text) > 200 else ''}\n\n"
+        f"======下一步===\n"
+        f"✅ 配置完成"
     )
     
-    keyboard = [[InlineKeyboardButton("✅ 继续配置", callback_data='preview_continue')]]
+    keyboard = [
+        [InlineKeyboardButton("✅ 配置完成", callback_data='preview_continue')],
+        [InlineKeyboardButton("🔙 返回修改", callback_data='preview_back')]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.message.reply_text(preview_text, parse_mode='HTML', reply_markup=reply_markup)
+    return PREVIEW_CONFIG
+
+
+async def show_preview_from_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show preview from update message (helper for text input handlers)"""
+    message_text = context.user_data.get('message_text', '')
+    message_format = context.user_data.get('message_format', MessageFormat.PLAIN)
+    send_method = context.user_data.get('send_method', SendMethod.DIRECT)
+    media_type = context.user_data.get('media_type', MediaType.TEXT)
+    
+    preview_text = (
+        "👁️ <b>预览配置的广告文案！</b>\n\n"
+        f"📮 发送方式：{SEND_METHOD_LABELS.get(send_method, send_method.value)}\n"
+        f"📝 消息格式：{message_format.value}\n"
+        f"📦 媒体类型：{MEDIA_TYPE_LABELS.get(media_type, media_type.value)}\n\n"
+        f"<b>消息内容：</b>\n{message_text[:200]}{'...' if len(message_text) > 200 else ''}\n\n"
+        f"======下一步===\n"
+        f"✅ 配置完成"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ 配置完成", callback_data='preview_continue')],
+        [InlineKeyboardButton("🔙 返回修改", callback_data='preview_back')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(preview_text, parse_mode='HTML', reply_markup=reply_markup)
     return PREVIEW_CONFIG
 
 
@@ -1469,11 +1577,12 @@ async def request_target_list_from_update(update: Update):
 async def request_target_list(query):
     """Request target list"""
     await query.message.reply_text(
-        "✅ 配置完成\n\n"
-        "请发送目标列表：\n"
+        "✅ <b>配置完成</b>\n\n"
+        "<b>请发送目标列表：</b>\n"
         "1️⃣ 直接发送（每行一个）\n"
         "2️⃣ 上传 .txt 文件\n\n"
-        "格式：@username 或 用户ID"
+        "格式：@username（不带@也行）或 用户ID",
+        parse_mode='HTML'
     )
     return TARGET_INPUT
 
@@ -1505,6 +1614,9 @@ async def handle_target_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("❌ 目标列表为空\n\n请添加至少一个目标")
             return TARGET_INPUT
         
+        # Count original targets before deduplication
+        original_count = len(targets)
+        
         logger.info(f"Creating task for user {user_id}")
         task = task_manager.create_task(
             name=context.user_data['task_name'],
@@ -1523,11 +1635,18 @@ async def handle_target_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         added = task_manager.add_targets(task.id, targets)
         logger.info(f"Successfully added {added} targets to task {task.id}")
         
+        # Calculate deduplication stats
+        duplicates = original_count - added
+        
         await update.message.reply_text(
             f"✅ <b>任务创建成功！</b>\n\n"
-            f"任务: {task.name}\n"
-            f"目标: {added}\n\n"
-            f"使用 /start 查看任务",
+            f"📝 任务名称: {task.name}\n"
+            f"📊 已收到 {original_count} 个用户\n"
+            f"🔄 已去重 {duplicates} 个用户\n"
+            f"✅ 最终添加 {added} 个用户\n\n"
+            f"<b>注意：</b>用户名发一个自动删除一个，用完代表任务结束\n\n"
+            f"前往任务列表开始任务\n\n"
+            f"使用 /start 查看任务列表",
             parse_mode='HTML'
         )
         
