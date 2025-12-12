@@ -911,7 +911,7 @@ class TaskManager:
         return True
     
     async def _execute_task(self, task_id):
-        """执行任务 - 支持多线程并发发送"""
+        """执行任务 - 支持重复发送模式和正常模式"""
         task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
         task = Task.from_dict(task_doc)
         
@@ -921,6 +921,7 @@ class TaskManager:
         logger.info(f"任务名称: {task.name}")
         logger.info(f"发送方式: {task.send_method}")
         logger.info(f"线程数配置: {task.thread_count}")
+        logger.info(f"重复发送模式: {task.repeat_send}")
         logger.info("=" * 80)
         
         # 启动进度监控任务
@@ -982,34 +983,11 @@ class TaskManager:
                     stats_text = "\n".join([f"  • {status}: {count}" for status, count in status_stats.items()])
                     raise ValueError(f"❌ 没有可用的活跃账户！\n\n账户状态统计：\n{stats_text}\n\n请检查账户状态或添加新账户。")
             
-            # 使用线程数配置确定并发执行
-            thread_count = min(task.thread_count, len(accounts))
-            logger.info("=" * 80)
-            logger.info(f"并发执行配置:")
-            logger.info(f"  配置的线程数: {task.thread_count}")
-            logger.info(f"  实际使用线程数: {thread_count}")
-            logger.info(f"  活跃账户数: {len(accounts)}")
-            logger.info("=" * 80)
-            
-            # 将目标分批处理
-            batch_size = max(1, len(targets) // thread_count)
-            batches = [targets[i:i + batch_size] for i in range(0, len(targets), batch_size)]
-            logger.info(f"目标分批: {len(batches)} 批，每批约 {batch_size} 个目标")
-            
-            # 为每个批次创建并发任务
-            concurrent_tasks = []
-            for batch_idx, batch in enumerate(batches[:thread_count]):
-                account = accounts[batch_idx % len(accounts)]
-                logger.info(f"批次 {batch_idx + 1}: 分配账户 {account.phone}，处理 {len(batch)} 个目标")
-                concurrent_tasks.append(
-                    self._process_batch(task_id, task, batch, account, batch_idx)
-                )
-            
-            # 并发执行所有批次
-            logger.info("=" * 80)
-            logger.info(f"开始并发执行 {len(concurrent_tasks)} 个批次...")
-            logger.info("=" * 80)
-            await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+            # 根据重复发送模式选择不同的执行逻辑
+            if task.repeat_send:
+                await self._execute_repeat_send_mode(task_id, task, targets, accounts)
+            else:
+                await self._execute_normal_mode(task_id, task, targets, accounts)
             
             # 获取最终任务状态
             task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
@@ -1061,6 +1039,211 @@ class TaskManager:
             if task_id in self.stop_flags:
                 del self.stop_flags[task_id]
             logger.info(f"任务 {task_id}: 清理完成")
+    
+    async def _execute_repeat_send_mode(self, task_id, task, targets, accounts):
+        """执行重复发送模式：所有账号轮流给所有用户发送消息"""
+        logger.info("=" * 80)
+        logger.info("执行模式：重复发送")
+        logger.info(f"目标用户数: {len(targets)}")
+        logger.info(f"可用账号数: {len(accounts)}")
+        logger.info(f"线程数: {task.thread_count}")
+        logger.info("=" * 80)
+        
+        # 将账号分批，每批使用 thread_count 个账号
+        batch_size = task.thread_count
+        account_batches = [accounts[i:i + batch_size] for i in range(0, len(accounts), batch_size)]
+        
+        logger.info(f"账号分批: {len(account_batches)} 批，每批 {batch_size} 个账号")
+        
+        # 每批账号给所有用户发送
+        for batch_index, account_batch in enumerate(account_batches):
+            if self.stop_flags.get(task_id, False):
+                logger.info("检测到停止标志，终止任务")
+                break
+            
+            logger.info("=" * 80)
+            logger.info(f"第 {batch_index + 1}/{len(account_batches)} 轮")
+            logger.info(f"使用账号: {[acc.phone for acc in account_batch]}")
+            logger.info("=" * 80)
+            
+            # 每个账号并发发送给所有用户
+            async def send_to_all_targets(account):
+                """单个账号发送给所有目标"""
+                logger.info(f"账号 {account.phone} 开始给所有用户发送")
+                
+                for target_idx, target in enumerate(targets):
+                    if self.stop_flags.get(task_id, False):
+                        logger.info(f"账号 {account.phone}: 检测到停止标志")
+                        break
+                    
+                    # 检查每日限额
+                    account_doc = self.db[Account.COLLECTION_NAME].find_one({'_id': account._id})
+                    if account_doc:
+                        account = Account.from_dict(account_doc)
+                        if account.messages_sent_today >= account.daily_limit:
+                            logger.warning(f"账号 {account.phone} 达到每日限额")
+                            break
+                        
+                        # 重置每日计数器
+                        if account.last_used and account.last_used.date() < datetime.utcnow().date():
+                            self.db[Account.COLLECTION_NAME].update_one(
+                                {'_id': account._id},
+                                {'$set': {'messages_sent_today': 0, 'updated_at': datetime.utcnow()}}
+                            )
+                            account.messages_sent_today = 0
+                    
+                    # 发送消息
+                    logger.info(f"账号 {account.phone} -> 用户 {target.username or target.user_id} ({target_idx + 1}/{len(targets)})")
+                    success = await self._send_message(task, target, account)
+                    
+                    if success:
+                        self.tasks_col.update_one(
+                            {'_id': ObjectId(task_id)},
+                            {'$inc': {'sent_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                        )
+                        self.db[Account.COLLECTION_NAME].update_one(
+                            {'_id': account._id},
+                            {
+                                '$inc': {'messages_sent_today': 1, 'total_messages_sent': 1},
+                                '$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}
+                            }
+                        )
+                        logger.info(f"✅ 发送成功")
+                    else:
+                        self.tasks_col.update_one(
+                            {'_id': ObjectId(task_id)},
+                            {'$inc': {'failed_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                        )
+                        logger.warning(f"❌ 发送失败")
+                    
+                    # 更新账户最后使用时间
+                    self.db[Account.COLLECTION_NAME].update_one(
+                        {'_id': account._id},
+                        {'$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}}
+                    )
+                    
+                    # 消息间隔
+                    delay = random.randint(task.min_interval, task.max_interval)
+                    logger.debug(f"等待 {delay} 秒...")
+                    await asyncio.sleep(delay)
+                
+                logger.info(f"账号 {account.phone} 完成所有发送")
+            
+            # 并发执行当前批次的所有账号
+            await asyncio.gather(*[send_to_all_targets(acc) for acc in account_batch], return_exceptions=True)
+            
+            logger.info(f"第 {batch_index + 1} 轮完成")
+    
+    async def _execute_normal_mode(self, task_id, task, targets, accounts):
+        """执行正常模式：每个用户按顺序尝试账号，直到成功或无账号可用"""
+        logger.info("=" * 80)
+        logger.info("执行模式：正常模式")
+        logger.info(f"目标用户数: {len(targets)}")
+        logger.info(f"可用账号数: {len(accounts)}")
+        logger.info(f"线程数: {task.thread_count}")
+        logger.info("=" * 80)
+        
+        # 使用线程数配置确定并发执行
+        thread_count = min(task.thread_count, len(accounts))
+        
+        # 将目标分批处理，每批由一个账号处理
+        batch_size = max(1, len(targets) // thread_count)
+        batches = [targets[i:i + batch_size] for i in range(0, len(targets), batch_size)]
+        logger.info(f"目标分批: {len(batches)} 批，每批约 {batch_size} 个目标")
+        
+        # 为每个批次创建并发任务
+        concurrent_tasks = []
+        for batch_idx, batch in enumerate(batches[:thread_count]):
+            account = accounts[batch_idx % len(accounts)]
+            logger.info(f"批次 {batch_idx + 1}: 分配账户 {account.phone}，处理 {len(batch)} 个目标")
+            concurrent_tasks.append(
+                self._process_batch_normal_mode(task_id, task, batch, accounts, batch_idx)
+            )
+        
+        # 并发执行所有批次
+        logger.info("=" * 80)
+        logger.info(f"开始并发执行 {len(concurrent_tasks)} 个批次...")
+        logger.info("=" * 80)
+        await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+    
+    async def _process_batch_normal_mode(self, task_id, task, targets, all_accounts, batch_idx):
+        """处理一批目标 - 正常模式：失败时尝试下一个账号"""
+        logger.info(f"[批次 {batch_idx}] 开始处理 {len(targets)} 个目标")
+        
+        account_pool = all_accounts.copy()
+        account_index = 0
+        
+        for idx, target in enumerate(targets):
+            # 检查停止标志
+            if self.stop_flags.get(task_id, False):
+                logger.info(f"[批次 {batch_idx}] 检测到停止标志，停止执行")
+                break
+            
+            logger.info(f"[批次 {batch_idx}] 处理目标 {idx + 1}/{len(targets)}: {target.username or target.user_id}")
+            
+            success = False
+            attempts = 0
+            max_attempts = len(account_pool)
+            
+            # 尝试多个账号直到成功
+            while not success and attempts < max_attempts:
+                account = account_pool[account_index % len(account_pool)]
+                
+                # 检查每日限额
+                account_doc = self.db[Account.COLLECTION_NAME].find_one({'_id': account._id})
+                if account_doc:
+                    account = Account.from_dict(account_doc)
+                    if account.messages_sent_today >= account.daily_limit:
+                        logger.warning(f"[批次 {batch_idx}] 账户 {account.phone} 达到每日限额，尝试下一个账户")
+                        account_index += 1
+                        attempts += 1
+                        continue
+                    
+                    # 重置每日计数器
+                    if account.last_used and account.last_used.date() < datetime.utcnow().date():
+                        self.db[Account.COLLECTION_NAME].update_one(
+                            {'_id': account._id},
+                            {'$set': {'messages_sent_today': 0, 'updated_at': datetime.utcnow()}}
+                        )
+                        account.messages_sent_today = 0
+                
+                # 发送消息
+                logger.info(f"[批次 {batch_idx}] 使用账户 {account.phone} 尝试发送")
+                success = await self._send_message(task, target, account)
+                
+                if not success:
+                    logger.warning(f"[批次 {batch_idx}] 账户 {account.phone} 发送失败，尝试下一个账户")
+                    account_index += 1
+                    attempts += 1
+                else:
+                    # 发送成功
+                    self.tasks_col.update_one(
+                        {'_id': ObjectId(task_id)},
+                        {'$inc': {'sent_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                    )
+                    self.db[Account.COLLECTION_NAME].update_one(
+                        {'_id': account._id},
+                        {
+                            '$inc': {'messages_sent_today': 1, 'total_messages_sent': 1},
+                            '$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}
+                        }
+                    )
+                    logger.info(f"[批次 {batch_idx}] ✅ 发送成功")
+                    
+                    # 消息间隔
+                    delay = random.randint(task.min_interval, task.max_interval)
+                    await asyncio.sleep(delay)
+                    break
+            
+            # 如果所有账号都尝试过仍然失败
+            if not success:
+                self.tasks_col.update_one(
+                    {'_id': ObjectId(task_id)},
+                    {'$inc': {'failed_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                )
+                logger.warning(f"[批次 {batch_idx}] ❌ 所有账户尝试后仍然失败: {target.username or target.user_id}")
+        
+        logger.info(f"[批次 {batch_idx}] 批次处理完成")
     
     async def _process_batch(self, task_id, task, targets, account, batch_idx):
         """处理一批目标 - 使用单个账户"""
@@ -1131,13 +1314,15 @@ class TaskManager:
         logger.info(f"[批次 {batch_idx}] 批次处理完成")
     
     async def _monitor_progress(self, task_id):
-        """监控和更新任务进度 - 每10秒检查一次"""
+        """监控和更新任务进度 - 使用30-60秒随机间隔"""
         try:
             while True:
-                await asyncio.sleep(PROGRESS_MONITOR_INTERVAL)
+                # Use random interval between 30-60 seconds
+                interval = random.randint(30, 60)
+                await asyncio.sleep(interval)
                 # 进度在 _process_batch 中自动更新
                 # 这里只是保持监控任务活跃
-                logger.debug(f"任务 {task_id}: 进度监控心跳")
+                logger.debug(f"任务 {task_id}: 进度监控心跳 (下次检查间隔: {interval}秒)")
         except asyncio.CancelledError:
             logger.info(f"Task {task_id}: Progress monitor cancelled")
             raise
@@ -1731,6 +1916,90 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'accounts_add_session':
         logger.info(f"User {user_id} selecting session upload option")
         await show_upload_type_menu(query)
+    elif data == 'accounts_check_status':
+        logger.info(f"User {user_id} checking all accounts status")
+        await query.answer("🔍 正在检查账户状态，请稍候...", show_alert=False)
+        await query.message.reply_text("⏳ 正在调用 @spambot 检查所有账户...\n这可能需要几分钟时间。")
+        
+        try:
+            status_results = await check_all_accounts_status()
+            
+            text = (
+                f"✅ <b>账户状态检查完成！</b>\n\n"
+                f"📊 <b>统计结果：</b>\n"
+                f"✅ 无限制账号：{len(status_results['unlimited'])} 个\n"
+                f"⚠️ 双向限制账号：{len(status_results['limited'])} 个\n"
+                f"❄️ 冻结账号：{len(status_results['restricted'])} 个\n"
+                f"🚫 封禁账号：{len(status_results['banned'])} 个\n\n"
+                f"使用下方按钮导出账户文件："
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("📥 全部账户提取", callback_data='accounts_export_all')],
+                [InlineKeyboardButton("⚠️ 受限账户提取", callback_data='accounts_export_limited')],
+                [InlineKeyboardButton("🔙 返回", callback_data='menu_accounts')]
+            ]
+            
+            await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"Error checking accounts status: {e}", exc_info=True)
+            await query.message.reply_text(f"❌ 检查失败：{str(e)}")
+    
+    elif data == 'accounts_export_all':
+        logger.info(f"User {user_id} exporting all accounts")
+        await query.answer("📥 正在导出所有账户...", show_alert=False)
+        
+        try:
+            all_accounts = list(db[Account.COLLECTION_NAME].find())
+            account_ids = [str(acc['_id']) for acc in all_accounts]
+            
+            if not account_ids:
+                await query.answer("❌ 没有账户可导出", show_alert=True)
+                return
+            
+            zip_path = await export_accounts(account_ids, 'all')
+            
+            with open(zip_path, 'rb') as f:
+                await query.message.reply_document(
+                    document=f,
+                    filename=os.path.basename(zip_path),
+                    caption=f"📥 <b>所有账户导出</b>\n\n共 {len(account_ids)} 个账户",
+                    parse_mode='HTML'
+                )
+            
+            os.remove(zip_path)
+        except Exception as e:
+            logger.error(f"Error exporting all accounts: {e}", exc_info=True)
+            await query.answer(f"❌ 导出失败：{str(e)}", show_alert=True)
+    
+    elif data == 'accounts_export_limited':
+        logger.info(f"User {user_id} exporting limited accounts")
+        await query.answer("⚠️ 正在导出受限账户...", show_alert=False)
+        
+        try:
+            limited_accounts = list(db[Account.COLLECTION_NAME].find({
+                'status': {'$in': [AccountStatus.LIMITED.value, AccountStatus.BANNED.value, AccountStatus.INACTIVE.value]}
+            }))
+            account_ids = [str(acc['_id']) for acc in limited_accounts]
+            
+            if not account_ids:
+                await query.answer("✅ 没有受限账户", show_alert=True)
+                return
+            
+            zip_path = await export_accounts(account_ids, 'limited')
+            
+            with open(zip_path, 'rb') as f:
+                await query.message.reply_document(
+                    document=f,
+                    filename=os.path.basename(zip_path),
+                    caption=f"⚠️ <b>受限账户导出</b>\n\n共 {len(account_ids)} 个账户",
+                    parse_mode='HTML'
+                )
+            
+            os.remove(zip_path)
+        except Exception as e:
+            logger.error(f"Error exporting limited accounts: {e}", exc_info=True)
+            await query.answer(f"❌ 导出失败：{str(e)}", show_alert=True)
     # Note: upload_session_file and upload_tdata_file are handled by ConversationHandler
     elif data.startswith('account_check_'):
         account_id = data.split('_')[2]
@@ -1866,14 +2135,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_accounts_menu(query):
-    """Show accounts menu"""
+    """Show enhanced accounts menu with statistics"""
+    # 统计账户数量
+    total_accounts = db[Account.COLLECTION_NAME].count_documents({})
+    active_accounts = db[Account.COLLECTION_NAME].count_documents({'status': AccountStatus.ACTIVE.value})
+    
     keyboard = [
-        [InlineKeyboardButton("📋 查看账户列表", callback_data='accounts_list')],
-        [InlineKeyboardButton("➕ 添加账户", callback_data='accounts_add')],
+        [InlineKeyboardButton("📋 账号列表", callback_data='accounts_list')],
+        [InlineKeyboardButton("➕ 添加账号", callback_data='accounts_add')],
+        [InlineKeyboardButton("🔍 检查账户状态", callback_data='accounts_check_status')],
         [InlineKeyboardButton("🔙 返回主菜单", callback_data='back_main')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    text = "📱 <b>账户管理</b>\n\n请选择操作："
+    
+    text = (
+        f"📱 <b>账户管理</b>\n\n"
+        f"当前状态：可用 {active_accounts}/{total_accounts} 个账号\n\n"
+        f"请选择操作："
+    )
+    
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
 
 
@@ -2041,6 +2321,240 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode='HTML'
         )
         return current_state
+
+
+async def check_all_accounts_status():
+    """Check all accounts using @spambot with enhanced multi-language pattern matching"""
+    accounts = list(db[Account.COLLECTION_NAME].find())
+    
+    # 增强版状态模式 - 支持多语言和更精确的分类
+    status_patterns = {
+        # 地理限制提示 - 判定为无限制（优先级最高）
+        # "some phone numbers may trigger a harsh response" 是地理限制，不是双向限制
+        "地理限制": [
+            "some phone numbers may trigger a harsh response",
+            "phone numbers may trigger",
+        ],
+        "无限制": [
+            "good news, no limits are currently applied",
+            "you're free as a bird",
+            "no limits",
+            "free as a bird",
+            "no restrictions",
+            # 新增英文关键词
+            "all good",
+            "account is free",
+            "working fine",
+            "not limited",
+            # 中文关键词
+            "正常",
+            "没有限制",
+            "一切正常",
+            "无限制"
+        ],
+        "临时限制": [
+            # 临时限制的关键指标（优先级最高）
+            "account is now limited until",
+            "limited until",
+            "account is limited until",
+            "moderators have confirmed the report",
+            "users found your messages annoying",
+            "will be automatically released",
+            "limitations will last longer next time",
+            "while the account is limited",
+            # 新增临时限制关键词
+            "temporarily limited",
+            "temporarily restricted",
+            "temporary ban",
+            # 中文关键词
+            "暂时限制",
+            "临时限制",
+            "暂时受限"
+        ],
+        "垃圾邮件": [
+            # 真正的限制 - "actions can trigger" 表示账号行为触发了限制
+            "actions can trigger a harsh response from our anti-spam systems",
+            "account was limited",
+            "you will not be able to send messages",
+            "limited by mistake",
+            "peer flood",
+            "you can only",
+            # 中文关键词
+            "违规",
+        ],
+        "冻结": [
+            # 永久限制的关键指标
+            "permanently banned",
+            "account has been frozen permanently",
+            "permanently restricted",
+            "account is permanently",
+            "banned permanently",
+            "permanent ban",
+            # 原有的patterns
+            "account was blocked for violations",
+            "telegram terms of service",
+            "blocked for violations",
+            "terms of service",
+            "violations of the telegram",
+            "banned",
+            "suspended",
+            # 中文关键词
+            "永久限制",
+            "永久封禁",
+            "永久受限"
+        ],
+        "等待验证": [
+            "wait",
+            "pending",
+            "verification",
+            # 中文关键词
+            "等待",
+            "审核中",
+            "验证"
+        ]
+    }
+    
+    status_results = {
+        'unlimited': [],      # 无限制
+        'limited': [],        # 双向限制/临时限制
+        'restricted': [],     # 受限/冻结
+        'banned': []          # 封禁/死亡账户
+    }
+    
+    def classify_status(response_text):
+        """
+        Classify account status based on @spambot response with priority-based matching
+        Returns: (category, status_value)
+        """
+        # 转换为小写以便匹配（支持英文）
+        response_lower = response_text.lower()
+        
+        # 优先级1: 地理限制（判定为无限制）
+        for pattern in status_patterns["地理限制"]:
+            if pattern in response_lower:
+                logger.info(f"Detected geographical restriction (treated as unlimited): {pattern}")
+                return ('unlimited', AccountStatus.ACTIVE.value)
+        
+        # 优先级2: 临时限制
+        for pattern in status_patterns["临时限制"]:
+            if pattern in response_lower:
+                logger.info(f"Detected temporary limitation: {pattern}")
+                return ('limited', AccountStatus.LIMITED.value)
+        
+        # 优先级3: 冻结/永久封禁
+        for pattern in status_patterns["冻结"]:
+            if pattern in response_lower:
+                logger.info(f"Detected permanent ban/freeze: {pattern}")
+                return ('banned', AccountStatus.BANNED.value)
+        
+        # 优先级4: 垃圾邮件限制（双向限制）
+        for pattern in status_patterns["垃圾邮件"]:
+            if pattern in response_lower:
+                logger.info(f"Detected spam limitation: {pattern}")
+                return ('limited', AccountStatus.LIMITED.value)
+        
+        # 优先级5: 等待验证
+        for pattern in status_patterns["等待验证"]:
+            if pattern in response_lower:
+                logger.info(f"Detected pending verification: {pattern}")
+                return ('restricted', AccountStatus.LIMITED.value)
+        
+        # 优先级6: 无限制（最后检查）
+        for pattern in status_patterns["无限制"]:
+            if pattern in response_lower:
+                logger.info(f"Detected unlimited status: {pattern}")
+                return ('unlimited', AccountStatus.ACTIVE.value)
+        
+        # 默认：无法分类，归为无限制
+        logger.warning(f"Unable to classify response, defaulting to unlimited: {response_text[:100]}...")
+        return ('unlimited', AccountStatus.ACTIVE.value)
+    
+    for account_doc in accounts:
+        account = Account.from_dict(account_doc)
+        try:
+            client = await account_manager.get_client(str(account._id))
+            
+            # 向 @spambot 发送消息
+            spambot = await client.get_entity('spambot')
+            await client.send_message(spambot, '/start')
+            await asyncio.sleep(2)
+            
+            # 获取 @spambot 的回复
+            messages = await client.get_messages(spambot, limit=1)
+            if messages:
+                response = messages[0].text
+                logger.info(f"Account {account.phone} @spambot response: {response[:100]}...")
+                
+                # 使用增强的分类系统
+                category, new_status = classify_status(response)
+                
+                status_results[category].append(account)
+                
+                # 更新数据库
+                db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': new_status, 'updated_at': datetime.utcnow()}}
+                )
+            else:
+                # 没有收到回复，可能是无法对话
+                logger.warning(f"Account {account.phone}: No response from @spambot")
+                status_results['banned'].append(account)
+                db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
+                )
+                
+        except Exception as e:
+            # 无法连接或对话的账户认为是封禁/死亡账户
+            logger.error(f"Failed to check account {account.phone}: {e}")
+            status_results['banned'].append(account)
+            db[Account.COLLECTION_NAME].update_one(
+                {'_id': account._id},
+                {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
+            )
+    
+    return status_results
+
+
+async def export_accounts(account_ids, export_type='all'):
+    """Export accounts as zip file"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    export_dir = os.path.join(Config.RESULTS_DIR, f"export_{timestamp}")
+    os.makedirs(export_dir, exist_ok=True)
+    
+    for account_id in account_ids:
+        account_doc = db[Account.COLLECTION_NAME].find_one({'_id': ObjectId(account_id)})
+        if not account_doc:
+            continue
+        
+        account = Account.from_dict(account_doc)
+        session_name = account.session_name
+        session_path = os.path.join(Config.SESSIONS_DIR, f"{session_name}.session")
+        
+        if os.path.exists(session_path):
+            # 复制 session 文件
+            shutil.copy2(session_path, export_dir)
+            
+            # 如果有对应的 json 文件也复制
+            json_path = f"{session_path}.json"
+            if os.path.exists(json_path):
+                shutil.copy2(json_path, export_dir)
+    
+    # 打包为 zip
+    zip_filename = f"accounts_{export_type}_{timestamp}.zip"
+    zip_path = os.path.join(Config.RESULTS_DIR, zip_filename)
+    
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
+        for root, dirs, files in os.walk(export_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                arcname = os.path.basename(file_path)
+                zipf.write(file_path, arcname)
+    
+    # 清理临时目录
+    shutil.rmtree(export_dir)
+    
+    return zip_path
 
 
 async def list_accounts(query):
@@ -2251,13 +2765,15 @@ async def request_thread_config(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
-    await query.message.reply_text(
+    prompt_msg = await query.message.reply_text(
         "🧵 <b>配置线程数</b>\n\n"
         "请输入要使用的账号数量（线程数）：\n\n"
         "💡 建议：1-10\n"
         "⚠️ 线程数越多，发送速度越快，但风险也越高",
         parse_mode='HTML'
     )
+    # Store prompt message ID for later deletion
+    context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
     return CONFIG_THREAD_INPUT
 
 
@@ -2267,7 +2783,7 @@ async def request_interval_config(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
-    await query.message.reply_text(
+    prompt_msg = await query.message.reply_text(
         "⏱️ <b>配置发送间隔</b>\n\n"
         "请输入最小间隔和最大间隔（秒），用空格分隔：\n\n"
         "💡 格式：最小值 最大值\n"
@@ -2275,6 +2791,8 @@ async def request_interval_config(update: Update, context: ContextTypes.DEFAULT_
         "⚠️ 间隔越短，风险越高",
         parse_mode='HTML'
     )
+    # Store prompt message ID for later deletion
+    context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
     return CONFIG_INTERVAL_MIN_INPUT
 
 
@@ -2284,7 +2802,7 @@ async def request_bidirect_config(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
-    await query.message.reply_text(
+    prompt_msg = await query.message.reply_text(
         "🔄 <b>配置无视双向次数</b>\n\n"
         "请输入无视双向联系人限制的次数：\n\n"
         "💡 0 = 不忽略限制\n"
@@ -2292,6 +2810,8 @@ async def request_bidirect_config(update: Update, context: ContextTypes.DEFAULT_
         "⚠️ 设置过高可能导致封号",
         parse_mode='HTML'
     )
+    # Store prompt message ID for later deletion
+    context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
     return CONFIG_BIDIRECT_INPUT
 
 
@@ -2658,8 +3178,17 @@ async def handle_thread_config(update: Update, context: ContextTypes.DEFAULT_TYP
         # Auto-delete after configured delay
         await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)
         try:
+            # Delete confirmation message
             await msg.delete()
+            # Delete user input message
             await update.message.delete()
+            # Delete prompt message
+            prompt_msg_id = context.user_data.get('config_prompt_msg_id')
+            if prompt_msg_id:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=prompt_msg_id
+                )
         except Exception as e:
             logger.warning(f"Failed to delete config message: {e}")
         
@@ -2700,8 +3229,17 @@ async def handle_interval_config(update: Update, context: ContextTypes.DEFAULT_T
         # Auto-delete after configured delay
         await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)
         try:
+            # Delete confirmation message
             await msg.delete()
+            # Delete user input message
             await update.message.delete()
+            # Delete prompt message
+            prompt_msg_id = context.user_data.get('config_prompt_msg_id')
+            if prompt_msg_id:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=prompt_msg_id
+                )
         except Exception as e:
             logger.warning(f"Failed to delete config message: {e}")
         
@@ -2731,8 +3269,17 @@ async def handle_bidirect_config(update: Update, context: ContextTypes.DEFAULT_T
         # Auto-delete after configured delay
         await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)
         try:
+            # Delete confirmation message
             await msg.delete()
+            # Delete user input message
             await update.message.delete()
+            # Delete prompt message
+            prompt_msg_id = context.user_data.get('config_prompt_msg_id')
+            if prompt_msg_id:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=prompt_msg_id
+                )
         except Exception as e:
             logger.warning(f"Failed to delete config message: {e}")
         
@@ -2780,7 +3327,46 @@ async def start_task_handler(query, task_id):
         ]
         
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        progress_msg = await query.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        
+        # Wait 1 second then refresh to show initial progress
+        await asyncio.sleep(1)
+        
+        # Get updated task data
+        task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+        if task_doc:
+            task = Task.from_dict(task_doc)
+            progress = (task.sent_count / task.total_targets * 100) if task.total_targets > 0 else 0
+            
+            text = (
+                f"⬇ <b>正在私信中</b> ⬇\n"
+                f"进度 {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n"
+            )
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("👥 总用户数", callback_data='noop'),
+                    InlineKeyboardButton(f"{task.total_targets}", callback_data='noop')
+                ],
+                [
+                    InlineKeyboardButton("✅ 发送成功", callback_data='noop'),
+                    InlineKeyboardButton(f"{task.sent_count}", callback_data='noop')
+                ],
+                [
+                    InlineKeyboardButton("❌ 发送失败", callback_data='noop'),
+                    InlineKeyboardButton(f"{task.failed_count}", callback_data='noop')
+                ],
+                [
+                    InlineKeyboardButton("🔄 刷新进度", callback_data=f'task_progress_refresh_{task_id}'),
+                    InlineKeyboardButton("⏸️ 停止任务", callback_data=f'task_stop_{task_id}')
+                ]
+            ]
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            try:
+                await progress_msg.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+            except Exception as e:
+                logger.warning(f"Failed to update initial progress: {e}")
         
     except ValueError as e:
         # ValueError 通常包含用户友好的错误消息
