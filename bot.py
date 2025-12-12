@@ -214,7 +214,7 @@ class Account:
     
     def __init__(self, phone, session_name, status=None, api_id=None, api_hash=None,
                  messages_sent_today=0, total_messages_sent=0, last_used=None,
-                 daily_limit=50, created_at=None, updated_at=None, _id=None):
+                 daily_limit=50, created_at=None, updated_at=None, proxy_id=None, _id=None):
         self._id = _id
         self.phone = phone
         self.session_name = session_name
@@ -225,6 +225,7 @@ class Account:
         self.total_messages_sent = total_messages_sent
         self.last_used = last_used
         self.daily_limit = daily_limit
+        self.proxy_id = proxy_id  # Reference to Proxy document
         self.created_at = created_at or datetime.utcnow()
         self.updated_at = updated_at or datetime.utcnow()
     
@@ -240,6 +241,7 @@ class Account:
             'total_messages_sent': self.total_messages_sent,
             'last_used': self.last_used,
             'daily_limit': self.daily_limit,
+            'proxy_id': self.proxy_id,
             'created_at': self.created_at,
             'updated_at': self.updated_at
         }
@@ -262,6 +264,7 @@ class Account:
             total_messages_sent=doc.get('total_messages_sent', 0),
             last_used=doc.get('last_used'),
             daily_limit=doc.get('daily_limit', 50),
+            proxy_id=doc.get('proxy_id'),
             created_at=doc.get('created_at'),
             updated_at=doc.get('updated_at'),
             _id=doc.get('_id')
@@ -476,6 +479,80 @@ class MessageLog:
         )
 
 
+class Proxy:
+    """Proxy model - MongoDB document"""
+    COLLECTION_NAME = 'proxies'
+    
+    def __init__(self, proxy_type, host, port, username=None, password=None,
+                 is_active=True, success_count=0, fail_count=0, last_used=None,
+                 created_at=None, updated_at=None, _id=None):
+        self._id = _id
+        self.proxy_type = proxy_type  # 'socks5', 'http', 'https'
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.is_active = is_active
+        self.success_count = success_count
+        self.fail_count = fail_count
+        self.last_used = last_used
+        self.created_at = created_at or datetime.utcnow()
+        self.updated_at = updated_at or datetime.utcnow()
+    
+    def to_dict(self):
+        """Convert to dictionary for MongoDB"""
+        doc = {
+            'proxy_type': self.proxy_type,
+            'host': self.host,
+            'port': self.port,
+            'username': self.username,
+            'password': self.password,
+            'is_active': self.is_active,
+            'success_count': self.success_count,
+            'fail_count': self.fail_count,
+            'last_used': self.last_used,
+            'created_at': self.created_at,
+            'updated_at': self.updated_at
+        }
+        if self._id:
+            doc['_id'] = self._id
+        return doc
+    
+    @classmethod
+    def from_dict(cls, doc):
+        """Create instance from MongoDB document"""
+        if not doc:
+            return None
+        return cls(
+            proxy_type=doc.get('proxy_type'),
+            host=doc.get('host'),
+            port=doc.get('port'),
+            username=doc.get('username'),
+            password=doc.get('password'),
+            is_active=doc.get('is_active', True),
+            success_count=doc.get('success_count', 0),
+            fail_count=doc.get('fail_count', 0),
+            last_used=doc.get('last_used'),
+            created_at=doc.get('created_at'),
+            updated_at=doc.get('updated_at'),
+            _id=doc.get('_id')
+        )
+    
+    def get_proxy_dict(self):
+        """Get proxy configuration for Telethon"""
+        proxy = {
+            'proxy_type': self.proxy_type,
+            'addr': self.host,
+            'port': self.port
+        }
+        if self.username:
+            proxy['username'] = self.username
+        if self.password:
+            proxy['password'] = self.password
+        return proxy
+
+
+
 def init_db(mongodb_uri, database_name):
     """Initialize MongoDB database"""
     client = MongoClient(mongodb_uri)
@@ -485,6 +562,7 @@ def init_db(mongodb_uri, database_name):
     db[Account.COLLECTION_NAME].create_index('phone', unique=True)
     db[Account.COLLECTION_NAME].create_index('session_name', unique=True)
     db[Account.COLLECTION_NAME].create_index('status')
+    db[Account.COLLECTION_NAME].create_index('proxy_id')
     
     db[Task.COLLECTION_NAME].create_index('status')
     db[Task.COLLECTION_NAME].create_index('account_id')
@@ -497,6 +575,9 @@ def init_db(mongodb_uri, database_name):
     db[MessageLog.COLLECTION_NAME].create_index('account_id')
     db[MessageLog.COLLECTION_NAME].create_index('sent_at')
     
+    db[Proxy.COLLECTION_NAME].create_index('is_active')
+    db[Proxy.COLLECTION_NAME].create_index([('host', 1), ('port', 1)])
+    
     return db
 
 
@@ -504,6 +585,211 @@ def get_db_client(mongodb_uri, database_name):
     """Get MongoDB database client"""
     client = MongoClient(mongodb_uri)
     return client[database_name]
+
+
+# ============================================================================
+# 代理管理函数
+# ============================================================================
+def parse_proxy_line(line):
+    """
+    Parse proxy line from multiple formats:
+    - IP:端口:用户名:密码
+    - socks5://IP:端口:用户名:密码
+    - socks5://user:pass@host:port (ABCProxy格式)
+    - IP:端口 (简单格式)
+    
+    Returns Proxy object or None if invalid
+    """
+    line = line.strip()
+    if not line or line.startswith('#'):
+        return None
+    
+    try:
+        # ABCProxy format: socks5://user:pass@host:port or http://user:pass@host:port
+        if '://' in line and '@' in line:
+            # Extract protocol
+            protocol, rest = line.split('://', 1)
+            proxy_type = protocol.lower()
+            
+            # Extract auth and host
+            auth_part, host_part = rest.split('@', 1)
+            username, password = auth_part.split(':', 1)
+            
+            # Extract host and port
+            if ':' in host_part:
+                host, port = host_part.rsplit(':', 1)
+                port = int(port)
+            else:
+                return None
+            
+            return Proxy(
+                proxy_type=proxy_type,
+                host=host,
+                port=port,
+                username=username,
+                password=password
+            )
+        
+        # Protocol prefix format: socks5://IP:端口:用户名:密码
+        elif '://' in line:
+            protocol, rest = line.split('://', 1)
+            proxy_type = protocol.lower()
+            parts = rest.split(':')
+            
+            if len(parts) == 4:
+                # With auth
+                host, port, username, password = parts
+                return Proxy(
+                    proxy_type=proxy_type,
+                    host=host,
+                    port=int(port),
+                    username=username,
+                    password=password
+                )
+            elif len(parts) == 2:
+                # Without auth
+                host, port = parts
+                return Proxy(
+                    proxy_type=proxy_type,
+                    host=host,
+                    port=int(port)
+                )
+        
+        # Standard format: IP:端口:用户名:密码 or IP:端口
+        else:
+            parts = line.split(':')
+            if len(parts) == 4:
+                # With auth
+                host, port, username, password = parts
+                return Proxy(
+                    proxy_type='socks5',  # Default to socks5
+                    host=host,
+                    port=int(port),
+                    username=username,
+                    password=password
+                )
+            elif len(parts) == 2:
+                # Without auth
+                host, port = parts
+                return Proxy(
+                    proxy_type='socks5',  # Default to socks5
+                    host=host,
+                    port=int(port)
+                )
+    except Exception as e:
+        logger.warning(f"Failed to parse proxy line: {line}, error: {e}")
+        return None
+    
+    return None
+
+
+async def test_proxy(db, proxy_id):
+    """Test proxy connection using a temporary Telegram client"""
+    try:
+        proxy_doc = db[Proxy.COLLECTION_NAME].find_one({'_id': ObjectId(proxy_id)})
+        if not proxy_doc:
+            return False, "Proxy not found"
+        
+        proxy = Proxy.from_dict(proxy_doc)
+        proxy_dict = proxy.get_proxy_dict()
+        
+        # Create temporary client to test proxy
+        test_session = os.path.join(Config.SESSIONS_DIR, f"test_proxy_{proxy_id}")
+        client = TelegramClient(test_session, Config.API_ID, Config.API_HASH, proxy=proxy_dict)
+        
+        try:
+            await client.connect()
+            # If we can connect, proxy is working
+            success = client.is_connected()
+            await client.disconnect()
+            
+            # Clean up test session
+            if os.path.exists(f"{test_session}.session"):
+                os.remove(f"{test_session}.session")
+            
+            # Update proxy statistics
+            if success:
+                db[Proxy.COLLECTION_NAME].update_one(
+                    {'_id': ObjectId(proxy_id)},
+                    {
+                        '$inc': {'success_count': 1},
+                        '$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}
+                    }
+                )
+                return True, "Connection successful"
+            else:
+                db[Proxy.COLLECTION_NAME].update_one(
+                    {'_id': ObjectId(proxy_id)},
+                    {
+                        '$inc': {'fail_count': 1},
+                        '$set': {'updated_at': datetime.utcnow()}
+                    }
+                )
+                
+                # Auto-disable after 3 failures
+                updated_proxy = db[Proxy.COLLECTION_NAME].find_one({'_id': ObjectId(proxy_id)})
+                if updated_proxy and updated_proxy.get('fail_count', 0) >= 3:
+                    db[Proxy.COLLECTION_NAME].update_one(
+                        {'_id': ObjectId(proxy_id)},
+                        {'$set': {'is_active': False, 'updated_at': datetime.utcnow()}}
+                    )
+                
+                return False, "Connection failed"
+        except Exception as e:
+            logger.error(f"Proxy test error: {e}")
+            # Update fail count
+            db[Proxy.COLLECTION_NAME].update_one(
+                {'_id': ObjectId(proxy_id)},
+                {
+                    '$inc': {'fail_count': 1},
+                    '$set': {'updated_at': datetime.utcnow()}
+                }
+            )
+            
+            # Auto-disable after 3 failures
+            updated_proxy = db[Proxy.COLLECTION_NAME].find_one({'_id': ObjectId(proxy_id)})
+            if updated_proxy and updated_proxy.get('fail_count', 0) >= 3:
+                db[Proxy.COLLECTION_NAME].update_one(
+                    {'_id': ObjectId(proxy_id)},
+                    {'$set': {'is_active': False, 'updated_at': datetime.utcnow()}}
+                )
+            
+            return False, f"Error: {str(e)}"
+    except Exception as e:
+        logger.error(f"Proxy test failed: {e}", exc_info=True)
+        return False, str(e)
+
+
+def assign_proxies_to_accounts(db):
+    """Assign proxies to accounts in round-robin fashion"""
+    try:
+        # Get all active proxies
+        active_proxies = list(db[Proxy.COLLECTION_NAME].find({'is_active': True}))
+        if not active_proxies:
+            logger.warning("No active proxies available for assignment")
+            return 0
+        
+        # Get all accounts
+        accounts = list(db[Account.COLLECTION_NAME].find())
+        if not accounts:
+            logger.warning("No accounts to assign proxies to")
+            return 0
+        
+        # Assign proxies in round-robin
+        assigned_count = 0
+        for i, account in enumerate(accounts):
+            proxy = active_proxies[i % len(active_proxies)]
+            db[Account.COLLECTION_NAME].update_one(
+                {'_id': account['_id']},
+                {'$set': {'proxy_id': str(proxy['_id']), 'updated_at': datetime.utcnow()}}
+            )
+            assigned_count += 1
+            logger.info(f"Assigned proxy {proxy['host']}:{proxy['port']} to account {account['phone']}")
+        
+        return assigned_count
+    except Exception as e:
+        logger.error(f"Failed to assign proxies: {e}", exc_info=True)
+        return 0
 
 
 # ============================================================================
@@ -722,7 +1008,30 @@ class AccountManager:
         
         account = Account.from_dict(account_doc)
         session_path = os.path.join(Config.SESSIONS_DIR, account.session_name)
-        proxy = Config.get_proxy_dict()
+        
+        # Get proxy: prioritize account-specific proxy, then fall back to global config
+        proxy = None
+        if account.proxy_id:
+            # Use account-specific proxy
+            try:
+                proxy_doc = self.db[Proxy.COLLECTION_NAME].find_one({
+                    '_id': ObjectId(account.proxy_id),
+                    'is_active': True
+                })
+                if proxy_doc:
+                    proxy_obj = Proxy.from_dict(proxy_doc)
+                    proxy = proxy_obj.get_proxy_dict()
+                    logger.info(f"Using account-specific proxy: {proxy_obj.host}:{proxy_obj.port}")
+                else:
+                    logger.warning(f"Account proxy {account.proxy_id} not found or inactive, using global config")
+                    proxy = Config.get_proxy_dict()
+            except Exception as e:
+                logger.warning(f"Failed to load account proxy: {e}, using global config")
+                proxy = Config.get_proxy_dict()
+        else:
+            # Use global proxy config
+            proxy = Config.get_proxy_dict()
+        
         client = TelegramClient(session_path, int(account.api_id), account.api_hash, proxy=proxy)
         
         await client.connect()
@@ -1911,6 +2220,77 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'menu_config':
         logger.info(f"User {user_id} accessing config menu")
         await show_config(query)
+    elif data == 'config_proxy':
+        logger.info(f"User {user_id} accessing proxy management")
+        await show_proxy_menu(query)
+    elif data == 'proxy_list':
+        logger.info(f"User {user_id} viewing proxy list")
+        await list_proxies(query)
+    elif data == 'proxy_upload':
+        logger.info(f"User {user_id} initiating proxy upload")
+        await query.edit_message_text(
+            "📤 <b>上传代理文件</b>\n\n"
+            "请上传包含代理信息的 .txt 文件\n\n"
+            "支持格式:\n"
+            "• IP:端口:用户名:密码\n"
+            "• socks5://IP:端口:用户名:密码\n"
+            "• socks5://user:pass@host:port\n"
+            "• IP:端口 (无认证)\n\n"
+            "每行一个代理",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data='config_proxy')]])
+        )
+        # Set context for file upload handler
+        context.user_data['waiting_for'] = 'proxy_file'
+    elif data == 'proxy_assign':
+        logger.info(f"User {user_id} assigning proxies to accounts")
+        await query.answer("⏳ 正在分配代理...", show_alert=False)
+        assigned_count = assign_proxies_to_accounts(db)
+        await query.message.reply_text(
+            f"✅ 代理分配完成！\n\n已为 {assigned_count} 个账户分配代理",
+            parse_mode='HTML'
+        )
+    elif data == 'proxy_clear':
+        logger.info(f"User {user_id} clearing all proxies")
+        # Delete all proxies
+        delete_result = db[Proxy.COLLECTION_NAME].delete_many({})
+        # Clear proxy_id from all accounts
+        db[Account.COLLECTION_NAME].update_many({}, {'$set': {'proxy_id': None}})
+        await query.message.reply_text(
+            f"✅ 已清空所有代理\n\n删除了 {delete_result.deleted_count} 个代理",
+            parse_mode='HTML'
+        )
+    elif data.startswith('proxy_test_'):
+        proxy_id = data.split('_')[2]
+        logger.info(f"User {user_id} testing proxy {proxy_id}")
+        await query.answer("⏳ 正在测试代理...", show_alert=False)
+        success, message = await test_proxy(db, proxy_id)
+        emoji = "✅" if success else "❌"
+        await query.message.reply_text(f"{emoji} {message}")
+    elif data.startswith('proxy_delete_'):
+        proxy_id = data.split('_')[2]
+        logger.info(f"User {user_id} deleting proxy {proxy_id}")
+        db[Proxy.COLLECTION_NAME].delete_one({'_id': ObjectId(proxy_id)})
+        # Remove proxy_id from accounts using this proxy
+        db[Account.COLLECTION_NAME].update_many(
+            {'proxy_id': proxy_id},
+            {'$set': {'proxy_id': None}}
+        )
+        await query.answer("✅ 代理已删除", show_alert=True)
+        await list_proxies(query)
+    elif data.startswith('proxy_toggle_'):
+        proxy_id = data.split('_')[2]
+        logger.info(f"User {user_id} toggling proxy {proxy_id}")
+        proxy_doc = db[Proxy.COLLECTION_NAME].find_one({'_id': ObjectId(proxy_id)})
+        if proxy_doc:
+            new_status = not proxy_doc.get('is_active', True)
+            db[Proxy.COLLECTION_NAME].update_one(
+                {'_id': ObjectId(proxy_id)},
+                {'$set': {'is_active': new_status, 'updated_at': datetime.utcnow()}}
+            )
+            status_text = "启用" if new_status else "禁用"
+            await query.answer(f"✅ 代理已{status_text}", show_alert=True)
+            await list_proxies(query)
     elif data == 'menu_stats':
         logger.info(f"User {user_id} accessing stats menu")
         await show_stats(query)
@@ -3702,15 +4082,23 @@ async def delete_task_handler(query, task_id):
 
 async def show_config(query):
     """Show config"""
+    # Get proxy count
+    total_proxies = db[Proxy.COLLECTION_NAME].count_documents({})
+    active_proxies = db[Proxy.COLLECTION_NAME].count_documents({'is_active': True})
+    
     text = (
         "⚙️ <b>全局配置</b>\n\n"
         f"⏱️ 最小间隔: {Config.DEFAULT_MIN_INTERVAL}s\n"
         f"⏱️ 最大间隔: {Config.DEFAULT_MAX_INTERVAL}s\n"
         f"📮 每日限制: {Config.DEFAULT_DAILY_LIMIT}\n"
-        f"🌐 代理: {'启用' if Config.PROXY_ENABLED else '禁用'}\n\n"
+        f"🌐 全局代理: {'启用' if Config.PROXY_ENABLED else '禁用'}\n"
+        f"🌐 代理池: {active_proxies}/{total_proxies} 个可用\n\n"
         "修改请编辑 .env 文件"
     )
-    keyboard = [[InlineKeyboardButton("🔙 返回", callback_data='back_main')]]
+    keyboard = [
+        [InlineKeyboardButton("🌐 代理管理", callback_data='config_proxy')],
+        [InlineKeyboardButton("🔙 返回", callback_data='back_main')]
+    ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
@@ -3764,6 +4152,121 @@ async def back_to_main(query):
     reply_markup = InlineKeyboardMarkup(keyboard)
     text = "🤖 <b>主菜单</b>\n\n请选择："
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+# ============================================================================
+# 代理管理界面
+# ============================================================================
+async def show_proxy_menu(query):
+    """Show proxy management menu"""
+    total_proxies = db[Proxy.COLLECTION_NAME].count_documents({})
+    active_proxies = db[Proxy.COLLECTION_NAME].count_documents({'is_active': True})
+    
+    text = (
+        "🌐 <b>代理管理</b>\n\n"
+        f"代理总数: {total_proxies}\n"
+        f"可用代理: {active_proxies}\n\n"
+        "选择操作："
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("📋 代理列表", callback_data='proxy_list')],
+        [InlineKeyboardButton("📤 上传代理文件", callback_data='proxy_upload')],
+        [InlineKeyboardButton("🔄 分配代理到账户", callback_data='proxy_assign')],
+        [InlineKeyboardButton("🗑️ 清空所有代理", callback_data='proxy_clear')],
+        [InlineKeyboardButton("🔙 返回", callback_data='menu_config')]
+    ]
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def list_proxies(query):
+    """List all proxies"""
+    proxies = list(db[Proxy.COLLECTION_NAME].find().limit(20))
+    
+    if not proxies:
+        text = "🌐 <b>代理列表</b>\n\n暂无代理"
+        keyboard = [
+            [InlineKeyboardButton("📤 上传代理文件", callback_data='proxy_upload')],
+            [InlineKeyboardButton("🔙 返回", callback_data='config_proxy')]
+        ]
+    else:
+        text = f"🌐 <b>代理列表</b> (共 {len(proxies)} 个)\n\n"
+        keyboard = []
+        
+        for proxy_doc in proxies:
+            proxy = Proxy.from_dict(proxy_doc)
+            status_emoji = '✅' if proxy.is_active else '❌'
+            auth_info = f"({proxy.username})" if proxy.username else "(无认证)"
+            text += (
+                f"{status_emoji} <code>{proxy.host}:{proxy.port}</code> {auth_info}\n"
+                f"   类型: {proxy.proxy_type} | 成功: {proxy.success_count} | 失败: {proxy.fail_count}\n\n"
+            )
+            
+            # Add action buttons for each proxy
+            keyboard.append([
+                InlineKeyboardButton(f"测试 {proxy.host}:{proxy.port}", callback_data=f'proxy_test_{str(proxy._id)}'),
+                InlineKeyboardButton("🔄" if not proxy.is_active else "⏸️", callback_data=f'proxy_toggle_{str(proxy._id)}'),
+                InlineKeyboardButton("🗑️", callback_data=f'proxy_delete_{str(proxy._id)}')
+            ])
+        
+        keyboard.append([InlineKeyboardButton("🔙 返回", callback_data='config_proxy')])
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def handle_proxy_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle proxy file upload"""
+    if context.user_data.get('waiting_for') != 'proxy_file':
+        return
+    
+    user_id = update.message.from_user.id
+    if user_id != Config.ADMIN_USER_ID:
+        await update.message.reply_text("❌ 无权限")
+        return
+    
+    try:
+        # Download file
+        file = await update.message.document.get_file()
+        file_path = os.path.join(Config.UPLOADS_DIR, f"proxies_{user_id}.txt")
+        await file.download_to_drive(file_path)
+        
+        # Parse and import proxies
+        imported_count = 0
+        failed_count = 0
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                proxy = parse_proxy_line(line)
+                if proxy:
+                    try:
+                        db[Proxy.COLLECTION_NAME].insert_one(proxy.to_dict())
+                        imported_count += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to insert proxy: {e}")
+                        failed_count += 1
+                else:
+                    failed_count += 1
+        
+        # Clean up
+        os.remove(file_path)
+        context.user_data['waiting_for'] = None
+        
+        # Auto-assign proxies to accounts
+        assigned_count = assign_proxies_to_accounts(db)
+        
+        await update.message.reply_text(
+            f"✅ <b>代理导入完成</b>\n\n"
+            f"成功导入: {imported_count} 个\n"
+            f"导入失败: {failed_count} 个\n"
+            f"自动分配: {assigned_count} 个账户",
+            parse_mode='HTML'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error uploading proxies: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ 上传失败：{str(e)}")
+        context.user_data['waiting_for'] = None
 
 
 # ============================================================================
@@ -3861,6 +4364,10 @@ def main():
         fallbacks=[CommandHandler("start", start)]
     )
     application.add_handler(config_conv)
+    
+    # Proxy file upload handler (for document uploads when waiting for proxy file)
+    logger.info("Registering proxy file upload handler...")
+    application.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_proxy_upload))
     
     # General button handler (registered AFTER conversation handlers)
     logger.info("Registering general button handler...")
