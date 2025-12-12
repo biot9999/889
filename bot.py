@@ -181,6 +181,12 @@ class SendMethod(enum.Enum):
 # ============================================================================
 # Postbot code validation
 POSTBOT_CODE_MIN_LENGTH = 10
+POSTBOT_RESPONSE_WAIT_SECONDS = 2
+
+# Task execution timing
+PROGRESS_MONITOR_INTERVAL = 10
+TASK_STOP_TIMEOUT_SECONDS = 2.0
+CONFIG_MESSAGE_DELETE_DELAY = 3
 
 # UI labels mapping
 SEND_METHOD_LABELS = {
@@ -1081,7 +1087,7 @@ class TaskManager:
         """Monitor and update task progress every 10 seconds"""
         try:
             while True:
-                await asyncio.sleep(10)
+                await asyncio.sleep(PROGRESS_MONITOR_INTERVAL)
                 # Progress is automatically updated in _process_batch
                 # This just keeps the monitoring alive
                 logger.debug(f"Task {task_id}: Progress monitor tick")
@@ -1146,7 +1152,7 @@ class TaskManager:
                     # Send code to postbot
                     await client.send_message(postbot, task.postbot_code)
                     # Wait for postbot to respond
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(POSTBOT_RESPONSE_WAIT_SECONDS)
                     # Get the message with buttons from postbot
                     async for message in client.iter_messages(postbot, limit=1):
                         if message.buttons:
@@ -2324,8 +2330,8 @@ async def handle_thread_config(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         
         msg = await update.message.reply_text(f"✅ 线程数已设置为：{thread_count}")
-        # Auto-delete after 3 seconds
-        await asyncio.sleep(3)
+        # Auto-delete after configured delay
+        await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)
         try:
             await msg.delete()
             await update.message.delete()
@@ -2366,8 +2372,8 @@ async def handle_interval_config(update: Update, context: ContextTypes.DEFAULT_T
         )
         
         msg = await update.message.reply_text(f"✅ 发送间隔已设置为：{min_interval}-{max_interval} 秒")
-        # Auto-delete after 3 seconds
-        await asyncio.sleep(3)
+        # Auto-delete after configured delay
+        await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)
         try:
             await msg.delete()
             await update.message.delete()
@@ -2397,8 +2403,8 @@ async def handle_bidirect_config(update: Update, context: ContextTypes.DEFAULT_T
         )
         
         msg = await update.message.reply_text(f"✅ 无视双向次数已设置为：{limit}")
-        # Auto-delete after 3 seconds
-        await asyncio.sleep(3)
+        # Auto-delete after configured delay
+        await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)
         try:
             await msg.delete()
             await update.message.delete()
@@ -2446,7 +2452,7 @@ async def stop_task_handler(query, task_id):
         if task_id in task_manager.running_tasks:
             asyncio_task = task_manager.running_tasks[task_id]
             try:
-                await asyncio.wait_for(asyncio_task, timeout=2.0)
+                await asyncio.wait_for(asyncio_task, timeout=TASK_STOP_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
                 # Cancel forcefully if it takes too long
                 asyncio_task.cancel()

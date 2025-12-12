@@ -21,7 +21,7 @@ def check_bot_py():
         'Channel forwarding': 'CHANNEL_FORWARD' in content and 'forward_messages' in content,
         'Pin message': 'pin_message' in content,
         'Delete dialog': 'delete_dialog' in content,
-        'Auto-delete config messages': 'await asyncio.sleep(3)' in content and 'delete()' in content,
+        'Auto-delete config messages': ('CONFIG_MESSAGE_DELETE_DELAY' in content and 'await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)' in content and 'delete()' in content),
         'Real-time progress display': '⬇ 正在私信中 ⬇' in content or '正在私信中' in content,
         'Refresh button': '刷新进度' in content,
         'Immediate stop response': 'stop_flags[task_id] = True' in content,
