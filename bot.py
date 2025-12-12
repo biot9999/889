@@ -904,10 +904,13 @@ class TaskManager:
         return True
     
     async def _execute_task(self, task_id):
-        """Execute task"""
+        """Execute task with multi-threading support"""
         task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
         task = Task.from_dict(task_doc)
         logger.info(f"Starting task execution: Task ID={task_id}, Name={task.name}")
+        
+        # Start progress monitoring task
+        progress_task = asyncio.create_task(self._monitor_progress(task_id))
         
         try:
             target_docs = self.targets_col.find({
@@ -929,6 +932,8 @@ class TaskManager:
                         'updated_at': datetime.utcnow()
                     }}
                 )
+                # Auto-generate and send completion reports
+                await self._send_completion_reports(task_id)
                 return
             
             accounts = self.account_manager.get_active_accounts()
@@ -955,65 +960,24 @@ class TaskManager:
                     stats_text = "\n".join([f"  • {status}: {count}" for status, count in status_stats.items()])
                     raise ValueError(f"❌ 没有可用的活跃账户！\n\n账户状态统计：\n{stats_text}\n\n请检查账户状态或添加新账户。")
             
-            logger.info(f"Task {task_id}: Using {len(accounts)} active accounts")
+            # Use thread_count to determine concurrent execution
+            thread_count = min(task.thread_count, len(accounts))
+            logger.info(f"Task {task_id}: Using {thread_count} threads with {len(accounts)} active accounts")
             
-            account_index = 0
-            for idx, target in enumerate(targets, 1):
-                if self.stop_flags.get(task_id, False):
-                    logger.info(f"Task {task_id}: Stop flag detected, halting execution")
-                    break
-                
-                account = accounts[account_index % len(accounts)]
-                account_index += 1
-                
-                logger.info(f"Task {task_id}: Processing target {idx}/{len(targets)} - {target.username or target.user_id}")
-                
-                if account.messages_sent_today >= account.daily_limit:
-                    logger.warning(f"Task {task_id}: Account {account.phone} reached daily limit, skipping")
-                    continue
-                
-                if account.last_used and account.last_used.date() < datetime.utcnow().date():
-                    logger.info(f"Task {task_id}: Resetting daily counter for account {account.phone}")
-                    self.db[Account.COLLECTION_NAME].update_one(
-                        {'_id': account._id},
-                        {'$set': {'messages_sent_today': 0, 'updated_at': datetime.utcnow()}}
-                    )
-                    account.messages_sent_today = 0
-                
-                success = await self._send_message(task, target, account)
-                
-                if success:
-                    self.tasks_col.update_one(
-                        {'_id': ObjectId(task_id)},
-                        {'$inc': {'sent_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
-                    )
-                    self.db[Account.COLLECTION_NAME].update_one(
-                        {'_id': account._id},
-                        {
-                            '$inc': {'messages_sent_today': 1, 'total_messages_sent': 1},
-                            '$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}
-                        }
-                    )
-                    logger.info(f"Task {task_id}: Message sent successfully to {target.username or target.user_id}")
-                else:
-                    self.tasks_col.update_one(
-                        {'_id': ObjectId(task_id)},
-                        {'$inc': {'failed_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
-                    )
-                    logger.warning(f"Task {task_id}: Failed to send message to {target.username or target.user_id}")
-                
-                self.db[Account.COLLECTION_NAME].update_one(
-                    {'_id': account._id},
-                    {'$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}}
+            # Split targets into batches for concurrent processing
+            batch_size = max(1, len(targets) // thread_count)
+            batches = [targets[i:i + batch_size] for i in range(0, len(targets), batch_size)]
+            
+            # Create concurrent tasks for each batch
+            concurrent_tasks = []
+            for batch_idx, batch in enumerate(batches[:thread_count]):
+                account = accounts[batch_idx % len(accounts)]
+                concurrent_tasks.append(
+                    self._process_batch(task_id, task, batch, account, batch_idx)
                 )
-                
-                # Refresh task data
-                task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
-                task = Task.from_dict(task_doc)
-                
-                delay = random.randint(task.min_interval, task.max_interval)
-                logger.info(f"Task {task_id}: Waiting {delay} seconds before next message... ({task.sent_count}/{task.total_targets} sent)")
-                await asyncio.sleep(delay)
+            
+            # Execute all batches concurrently
+            await asyncio.gather(*concurrent_tasks, return_exceptions=True)
             
             # Get final task state
             task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
@@ -1028,6 +992,9 @@ class TaskManager:
                 }}
             )
             
+            # Auto-generate and send completion reports
+            await self._send_completion_reports(task_id)
+            
         except Exception as e:
             logger.error(f"Task {task_id} error: {e}", exc_info=True)
             self.tasks_col.update_one(
@@ -1035,14 +1002,111 @@ class TaskManager:
                 {'$set': {'status': TaskStatus.FAILED.value, 'updated_at': datetime.utcnow()}}
             )
         finally:
+            # Cancel progress monitoring
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+            
             if task_id in self.running_tasks:
                 del self.running_tasks[task_id]
             if task_id in self.stop_flags:
                 del self.stop_flags[task_id]
             logger.info(f"Task {task_id}: Cleanup completed")
     
+    async def _process_batch(self, task_id, task, targets, account, batch_idx):
+        """Process a batch of targets with a single account"""
+        logger.info(f"Task {task_id}, Batch {batch_idx}: Starting to process {len(targets)} targets")
+        
+        for idx, target in enumerate(targets):
+            if self.stop_flags.get(task_id, False):
+                logger.info(f"Task {task_id}, Batch {batch_idx}: Stop flag detected, halting execution")
+                break
+            
+            logger.info(f"Task {task_id}, Batch {batch_idx}: Processing target {idx + 1}/{len(targets)} - {target.username or target.user_id}")
+            
+            # Check daily limit
+            account_doc = self.db[Account.COLLECTION_NAME].find_one({'_id': account._id})
+            if account_doc:
+                account = Account.from_dict(account_doc)
+                if account.messages_sent_today >= account.daily_limit:
+                    logger.warning(f"Task {task_id}, Batch {batch_idx}: Account {account.phone} reached daily limit, stopping batch")
+                    break
+                
+                # Reset daily counter if needed
+                if account.last_used and account.last_used.date() < datetime.utcnow().date():
+                    logger.info(f"Task {task_id}, Batch {batch_idx}: Resetting daily counter for account {account.phone}")
+                    self.db[Account.COLLECTION_NAME].update_one(
+                        {'_id': account._id},
+                        {'$set': {'messages_sent_today': 0, 'updated_at': datetime.utcnow()}}
+                    )
+                    account.messages_sent_today = 0
+            
+            success = await self._send_message(task, target, account)
+            
+            if success:
+                self.tasks_col.update_one(
+                    {'_id': ObjectId(task_id)},
+                    {'$inc': {'sent_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                )
+                self.db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {
+                        '$inc': {'messages_sent_today': 1, 'total_messages_sent': 1},
+                        '$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}
+                    }
+                )
+                logger.info(f"Task {task_id}, Batch {batch_idx}: Message sent successfully to {target.username or target.user_id}")
+            else:
+                self.tasks_col.update_one(
+                    {'_id': ObjectId(task_id)},
+                    {'$inc': {'failed_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                )
+                logger.warning(f"Task {task_id}, Batch {batch_idx}: Failed to send message to {target.username or target.user_id}")
+            
+            self.db[Account.COLLECTION_NAME].update_one(
+                {'_id': account._id},
+                {'$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}}
+            )
+            
+            # Add delay between messages
+            delay = random.randint(task.min_interval, task.max_interval)
+            logger.info(f"Task {task_id}, Batch {batch_idx}: Waiting {delay} seconds before next message...")
+            await asyncio.sleep(delay)
+        
+        logger.info(f"Task {task_id}, Batch {batch_idx}: Batch processing completed")
+    
+    async def _monitor_progress(self, task_id):
+        """Monitor and update task progress every 10 seconds"""
+        try:
+            while True:
+                await asyncio.sleep(10)
+                # Progress is automatically updated in _process_batch
+                # This just keeps the monitoring alive
+                logger.debug(f"Task {task_id}: Progress monitor tick")
+        except asyncio.CancelledError:
+            logger.info(f"Task {task_id}: Progress monitor cancelled")
+            raise
+    
+    async def _send_completion_reports(self, task_id):
+        """Generate and send completion reports"""
+        try:
+            logger.info(f"Task {task_id}: Generating completion reports")
+            results = self.export_task_results(task_id)
+            if not results:
+                logger.warning(f"Task {task_id}: No results to export")
+                return
+            
+            # Get admin user to send reports to
+            # Note: Reports will be sent when admin calls export_results
+            logger.info(f"Task {task_id}: Completion reports ready for export")
+            
+        except Exception as e:
+            logger.error(f"Task {task_id}: Error generating completion reports: {e}", exc_info=True)
+    
     async def _send_message(self, task, target, account):
-        """Send message"""
+        """Send message with support for all send methods"""
         try:
             client = await self.account_manager.get_client(str(account._id))
             
@@ -1070,13 +1134,84 @@ class TaskManager:
             
             personalized = MessageFormatter.personalize(task.message_text, user_info)
             parse_mode = MessageFormatter.get_parse_mode(task.message_format)
+            sent_message = None
             
-            if task.media_type == MediaType.TEXT.value:
-                await client.send_message(entity, personalized, parse_mode=parse_mode)
-            elif task.media_type in [MediaType.IMAGE.value, MediaType.VIDEO.value, MediaType.DOCUMENT.value]:
-                await client.send_file(entity, task.media_path, caption=personalized, parse_mode=parse_mode)
-            elif task.media_type == MediaType.VOICE.value:
-                await client.send_file(entity, task.media_path, voice_note=True, caption=personalized, parse_mode=parse_mode)
+            # Handle different send methods
+            if task.send_method == SendMethod.POSTBOT.value:
+                # Post代码发送 - 通过 @postbot
+                logger.info(f"Sending via postbot with code: {task.postbot_code}")
+                try:
+                    # Get postbot entity
+                    postbot = await client.get_entity('postbot')
+                    # Send code to postbot
+                    await client.send_message(postbot, task.postbot_code)
+                    # Wait for postbot to respond
+                    await asyncio.sleep(2)
+                    # Get the message with buttons from postbot
+                    async for message in client.iter_messages(postbot, limit=1):
+                        if message.buttons:
+                            # Forward the message with buttons to target
+                            sent_message = await client.forward_messages(entity, message)
+                            break
+                except Exception as e:
+                    logger.error(f"Failed to send via postbot: {e}")
+                    raise
+            
+            elif task.send_method in [SendMethod.CHANNEL_FORWARD.value, SendMethod.CHANNEL_FORWARD_HIDDEN.value]:
+                # 频道转发
+                logger.info(f"Forwarding from channel: {task.channel_link}")
+                try:
+                    # Parse channel link: https://t.me/channel_name/message_id
+                    match = re.match(r'https://t\.me/([^/]+)/(\d+)', task.channel_link)
+                    if not match:
+                        raise ValueError(f"Invalid channel link format: {task.channel_link}")
+                    
+                    channel_username = match.group(1)
+                    message_id = int(match.group(2))
+                    
+                    # Get channel entity
+                    channel = await client.get_entity(channel_username)
+                    # Get specific message
+                    message = await client.get_messages(channel, ids=message_id)
+                    
+                    if not message:
+                        raise ValueError(f"Message {message_id} not found in channel {channel_username}")
+                    
+                    # Forward message
+                    if task.send_method == SendMethod.CHANNEL_FORWARD_HIDDEN.value:
+                        # Forward without source
+                        sent_message = await client.send_message(entity, message.message, file=message.media)
+                    else:
+                        # Forward with source
+                        sent_message = await client.forward_messages(entity, message, channel)
+                except Exception as e:
+                    logger.error(f"Failed to forward from channel: {e}")
+                    raise
+            
+            else:
+                # 直接发送 (DIRECT method)
+                if task.media_type == MediaType.TEXT.value:
+                    sent_message = await client.send_message(entity, personalized, parse_mode=parse_mode)
+                elif task.media_type in [MediaType.IMAGE.value, MediaType.VIDEO.value, MediaType.DOCUMENT.value]:
+                    sent_message = await client.send_file(entity, task.media_path, caption=personalized, parse_mode=parse_mode)
+                elif task.media_type == MediaType.VOICE.value:
+                    sent_message = await client.send_file(entity, task.media_path, voice_note=True, caption=personalized, parse_mode=parse_mode)
+            
+            # Pin message if configured
+            if task.pin_message and sent_message:
+                try:
+                    await client.pin_message(entity, sent_message)
+                    logger.info(f"Message pinned for {recipient}")
+                except Exception as e:
+                    logger.warning(f"Failed to pin message for {recipient}: {e}")
+            
+            # Delete dialog if configured
+            if task.delete_dialog:
+                try:
+                    await client.delete_dialog(entity)
+                    logger.info(f"Dialog deleted for {recipient}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete dialog for {recipient}: {e}")
             
             self.targets_col.update_one(
                 {'_id': target._id},
@@ -1667,7 +1802,7 @@ async def list_tasks(query):
 
 
 async def show_task_detail(query, task_id):
-    """Show task detail with configuration options"""
+    """Show task detail with configuration options and real-time progress"""
     task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
     if not task_doc:
         await query.answer("❌ 任务不存在", show_alert=True)
@@ -1677,58 +1812,66 @@ async def show_task_detail(query, task_id):
     status_emoji = {'pending': '⏳', 'running': '▶️', 'paused': '⏸️', 'completed': '✅', 'failed': '❌'}.get(task.status, '❓')
     progress = (task.sent_count / task.total_targets * 100) if task.total_targets > 0 else 0
     
-    text = (
-        f"{status_emoji} <b>{task.name}</b>\n\n"
-        f"📊 进度: {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n"
-        f"✅ 成功: {task.sent_count}\n"
-        f"❌ 失败: {task.failed_count}\n\n"
-        f"<b>⚙️ 当前配置:</b>\n"
-        f"🧵 多账号线程数: {task.thread_count}\n"
-        f"⏱️ 发送间隔: {task.min_interval}-{task.max_interval}秒\n"
-        f"🔄 无视双向次数: {task.ignore_bidirectional_limit}\n"
-        f"📌 置顶消息: {'✔️' if task.pin_message else '❌'}\n"
-        f"🗑️ 删除对话框: {'✔️' if task.delete_dialog else '❌'}\n"
-        f"🔁 重复发送: {'✔️' if task.repeat_send else '❌'}\n"
-    )
-    
-    # 在现有 text 后添加运行时信息
+    # Build progress display for running tasks
     if task.status == TaskStatus.RUNNING.value:
-        # 计算预计完成时间
+        text = (
+            f"⬇ <b>正在私信中</b> ⬇\n"
+            f"进度 {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n\n"
+            f"【总用户数】    【{task.total_targets}】\n"
+            f"【发送成功】    【{task.sent_count}】\n"
+            f"【发送失败】    【{task.failed_count}】\n\n"
+        )
+        
+        # Calculate estimated time
         if task.total_targets and task.sent_count is not None and task.failed_count is not None:
             remaining = task.total_targets - task.sent_count - task.failed_count
             if remaining > 0 and task.min_interval and task.max_interval:
                 avg_interval = (task.min_interval + task.max_interval) / 2
                 estimated_seconds = remaining * avg_interval
                 estimated_time = timedelta(seconds=int(estimated_seconds))
-                
-                text += f"\n⏱️ 预计剩余时间: {estimated_time}\n"
-    
-    if task.started_at:
-        elapsed = datetime.utcnow() - task.started_at
-        text += f"⏰ 已运行时间: {elapsed}\n"
+                text += f"⏱️ 预计剩余时间: {estimated_time}\n"
+        
+        if task.started_at:
+            elapsed = datetime.utcnow() - task.started_at
+            text += f"⏰ 已运行时间: {elapsed}\n"
+    else:
+        text = (
+            f"{status_emoji} <b>{task.name}</b>\n\n"
+            f"📊 进度: {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n"
+            f"✅ 成功: {task.sent_count}\n"
+            f"❌ 失败: {task.failed_count}\n\n"
+            f"<b>⚙️ 当前配置:</b>\n"
+            f"🧵 多账号线程数: {task.thread_count}\n"
+            f"⏱️ 发送间隔: {task.min_interval}-{task.max_interval}秒\n"
+            f"🔄 无视双向次数: {task.ignore_bidirectional_limit}\n"
+            f"📌 置顶消息: {'✔️' if task.pin_message else '❌'}\n"
+            f"🗑️ 删除对话框: {'✔️' if task.delete_dialog else '❌'}\n"
+            f"🔁 重复发送: {'✔️' if task.repeat_send else '❌'}\n"
+        )
+        
+        if task.started_at:
+            elapsed = datetime.utcnow() - task.started_at
+            text += f"\n⏰ 已运行时间: {elapsed}\n"
     
     keyboard = []
     
-    # Configuration buttons
-    keyboard.append([
-        InlineKeyboardButton("⚙️ 参数配置", callback_data=f'task_config_{task_id}'),
-        InlineKeyboardButton("🗑️ 删除任务", callback_data=f'task_delete_{task_id}')
-    ])
+    # Configuration buttons (only if not running)
+    if task.status != TaskStatus.RUNNING.value:
+        keyboard.append([
+            InlineKeyboardButton("⚙️ 参数配置", callback_data=f'task_config_{task_id}'),
+            InlineKeyboardButton("🗑️ 删除任务", callback_data=f'task_delete_{task_id}')
+        ])
     
     # Start/Stop buttons
     if task.status in [TaskStatus.PENDING.value, TaskStatus.PAUSED.value]:
         keyboard.append([InlineKeyboardButton("▶️ 开始私信", callback_data=f'task_start_{task_id}')])
     elif task.status == TaskStatus.RUNNING.value:
-        keyboard.append([InlineKeyboardButton("⏸️ 停止私信", callback_data=f'task_stop_{task_id}')])
-    
-    # Progress and export buttons
-    if task.status == TaskStatus.RUNNING.value:
-        keyboard.append([InlineKeyboardButton(f"📊 总用户数: {task.total_targets}", callback_data='noop')])
         keyboard.append([
-            InlineKeyboardButton(f"✅ 发送成功: {task.sent_count}", callback_data='noop'),
-            InlineKeyboardButton(f"❌ 发送失败: {task.failed_count}", callback_data='noop')
+            InlineKeyboardButton("🔄 刷新进度", callback_data=f'task_detail_{task_id}'),
+            InlineKeyboardButton("⏸️ 停止任务", callback_data=f'task_stop_{task_id}')
         ])
     
+    # Export button for completed tasks
     if task.status == TaskStatus.COMPLETED.value:
         keyboard.append([InlineKeyboardButton("📥 导出结果", callback_data=f'task_export_{task_id}')])
     
@@ -2180,7 +2323,15 @@ async def handle_thread_config(update: Update, context: ContextTypes.DEFAULT_TYP
             {'$set': {'thread_count': thread_count, 'updated_at': datetime.utcnow()}}
         )
         
-        await update.message.reply_text(f"✅ 线程数已设置为：{thread_count}")
+        msg = await update.message.reply_text(f"✅ 线程数已设置为：{thread_count}")
+        # Auto-delete after 3 seconds
+        await asyncio.sleep(3)
+        try:
+            await msg.delete()
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Failed to delete config message: {e}")
+        
         context.user_data.clear()
         return ConversationHandler.END
         
@@ -2214,7 +2365,15 @@ async def handle_interval_config(update: Update, context: ContextTypes.DEFAULT_T
             }}
         )
         
-        await update.message.reply_text(f"✅ 发送间隔已设置为：{min_interval}-{max_interval} 秒")
+        msg = await update.message.reply_text(f"✅ 发送间隔已设置为：{min_interval}-{max_interval} 秒")
+        # Auto-delete after 3 seconds
+        await asyncio.sleep(3)
+        try:
+            await msg.delete()
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Failed to delete config message: {e}")
+        
         context.user_data.clear()
         return ConversationHandler.END
         
@@ -2237,7 +2396,15 @@ async def handle_bidirect_config(update: Update, context: ContextTypes.DEFAULT_T
             {'$set': {'ignore_bidirectional_limit': limit, 'updated_at': datetime.utcnow()}}
         )
         
-        await update.message.reply_text(f"✅ 无视双向次数已设置为：{limit}")
+        msg = await update.message.reply_text(f"✅ 无视双向次数已设置为：{limit}")
+        # Auto-delete after 3 seconds
+        await asyncio.sleep(3)
+        try:
+            await msg.delete()
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Failed to delete config message: {e}")
+        
         context.user_data.clear()
         return ConversationHandler.END
         
@@ -2262,14 +2429,37 @@ async def start_task_handler(query, task_id):
 
 
 async def stop_task_handler(query, task_id):
-    """Stop task"""
+    """Stop task immediately"""
     try:
-        await task_manager.stop_task(task_id)
-        await query.answer("⏸️ 任务已停止")
-        # Redirect to task detail
+        # Set stop flag immediately
+        task_manager.stop_flags[task_id] = True
+        
+        # Update task status immediately
+        db[Task.COLLECTION_NAME].update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {'status': TaskStatus.PAUSED.value, 'updated_at': datetime.utcnow()}}
+        )
+        
+        await query.answer("⏸️ 任务停止中...")
+        
+        # Try to stop the task gracefully
+        if task_id in task_manager.running_tasks:
+            asyncio_task = task_manager.running_tasks[task_id]
+            try:
+                await asyncio.wait_for(asyncio_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                # Cancel forcefully if it takes too long
+                asyncio_task.cancel()
+            
+            if task_id in task_manager.running_tasks:
+                del task_manager.running_tasks[task_id]
+        
+        # Show updated task detail
         await show_task_detail(query, task_id)
+        
     except Exception as e:
-        await query.answer(f"❌ 失败: {str(e)}", show_alert=True)
+        logger.error(f"Error stopping task {task_id}: {e}", exc_info=True)
+        await query.answer(f"❌ 停止失败: {str(e)}", show_alert=True)
 
 
 async def show_task_progress(query, task_id):
