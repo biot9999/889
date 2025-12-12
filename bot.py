@@ -1892,9 +1892,9 @@ async def handle_target_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             max_interval=Config.DEFAULT_MAX_INTERVAL
         )
         
-        logger.info(f"Adding {len(targets)} targets to task {task.id}")
-        added = task_manager.add_targets(task.id, targets)
-        logger.info(f"Successfully added {added} targets to task {task.id}")
+        logger.info(f"Adding {len(targets)} targets to task {task._id}")
+        added = task_manager.add_targets(task._id, targets)
+        logger.info(f"Successfully added {added} targets to task {task._id}")
         
         # Calculate deduplication stats
         duplicates = original_count - added
