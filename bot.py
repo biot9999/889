@@ -2324,15 +2324,150 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def check_all_accounts_status():
-    """Check all accounts using @spambot"""
+    """Check all accounts using @spambot with enhanced multi-language pattern matching"""
     accounts = list(db[Account.COLLECTION_NAME].find())
+    
+    # 增强版状态模式 - 支持多语言和更精确的分类
+    status_patterns = {
+        # 地理限制提示 - 判定为无限制（优先级最高）
+        # "some phone numbers may trigger a harsh response" 是地理限制，不是双向限制
+        "地理限制": [
+            "some phone numbers may trigger a harsh response",
+            "phone numbers may trigger",
+        ],
+        "无限制": [
+            "good news, no limits are currently applied",
+            "you're free as a bird",
+            "no limits",
+            "free as a bird",
+            "no restrictions",
+            # 新增英文关键词
+            "all good",
+            "account is free",
+            "working fine",
+            "not limited",
+            # 中文关键词
+            "正常",
+            "没有限制",
+            "一切正常",
+            "无限制"
+        ],
+        "临时限制": [
+            # 临时限制的关键指标（优先级最高）
+            "account is now limited until",
+            "limited until",
+            "account is limited until",
+            "moderators have confirmed the report",
+            "users found your messages annoying",
+            "will be automatically released",
+            "limitations will last longer next time",
+            "while the account is limited",
+            # 新增临时限制关键词
+            "temporarily limited",
+            "temporarily restricted",
+            "temporary ban",
+            # 中文关键词
+            "暂时限制",
+            "临时限制",
+            "暂时受限"
+        ],
+        "垃圾邮件": [
+            # 真正的限制 - "actions can trigger" 表示账号行为触发了限制
+            "actions can trigger a harsh response from our anti-spam systems",
+            "account was limited",
+            "you will not be able to send messages",
+            "limited by mistake",
+            "peer flood",
+            "you can only",
+            # 中文关键词
+            "违规",
+        ],
+        "冻结": [
+            # 永久限制的关键指标
+            "permanently banned",
+            "account has been frozen permanently",
+            "permanently restricted",
+            "account is permanently",
+            "banned permanently",
+            "permanent ban",
+            # 原有的patterns
+            "account was blocked for violations",
+            "telegram terms of service",
+            "blocked for violations",
+            "terms of service",
+            "violations of the telegram",
+            "banned",
+            "suspended",
+            # 中文关键词
+            "永久限制",
+            "永久封禁",
+            "永久受限"
+        ],
+        "等待验证": [
+            "wait",
+            "pending",
+            "verification",
+            # 中文关键词
+            "等待",
+            "审核中",
+            "验证"
+        ]
+    }
     
     status_results = {
         'unlimited': [],      # 无限制
-        'limited': [],        # 双向限制
+        'limited': [],        # 双向限制/临时限制
         'restricted': [],     # 受限/冻结
-        'banned': []          # 封禁
+        'banned': []          # 封禁/死亡账户
     }
+    
+    def classify_status(response_text):
+        """
+        Classify account status based on @spambot response with priority-based matching
+        Returns: (category, status_value)
+        """
+        # 转换为小写以便匹配（支持英文）
+        response_lower = response_text.lower()
+        
+        # 优先级1: 地理限制（判定为无限制）
+        for pattern in status_patterns["地理限制"]:
+            if pattern in response_lower:
+                logger.info(f"Detected geographical restriction (treated as unlimited): {pattern}")
+                return ('unlimited', AccountStatus.ACTIVE.value)
+        
+        # 优先级2: 临时限制
+        for pattern in status_patterns["临时限制"]:
+            if pattern in response_lower:
+                logger.info(f"Detected temporary limitation: {pattern}")
+                return ('limited', AccountStatus.LIMITED.value)
+        
+        # 优先级3: 冻结/永久封禁
+        for pattern in status_patterns["冻结"]:
+            if pattern in response_lower:
+                logger.info(f"Detected permanent ban/freeze: {pattern}")
+                return ('banned', AccountStatus.BANNED.value)
+        
+        # 优先级4: 垃圾邮件限制（双向限制）
+        for pattern in status_patterns["垃圾邮件"]:
+            if pattern in response_lower:
+                logger.info(f"Detected spam limitation: {pattern}")
+                return ('limited', AccountStatus.LIMITED.value)
+        
+        # 优先级5: 等待验证
+        for pattern in status_patterns["等待验证"]:
+            if pattern in response_lower:
+                logger.info(f"Detected pending verification: {pattern}")
+                return ('restricted', AccountStatus.LIMITED.value)
+        
+        # 优先级6: 无限制（最后检查）
+        for pattern in status_patterns["无限制"]:
+            if pattern in response_lower:
+                logger.info(f"Detected unlimited status: {pattern}")
+                return ('unlimited', AccountStatus.ACTIVE.value)
+        
+        # 默认：无法分类，归为无限制
+        logger.warning(f"Unable to classify response, defaulting to unlimited: {response_text[:100]}...")
+        return ('unlimited', AccountStatus.ACTIVE.value)
     
     for account_doc in accounts:
         account = Account.from_dict(account_doc)
@@ -2347,34 +2482,36 @@ async def check_all_accounts_status():
             # 获取 @spambot 的回复
             messages = await client.get_messages(spambot, limit=1)
             if messages:
-                response = messages[0].text.lower()
+                response = messages[0].text
+                logger.info(f"Account {account.phone} @spambot response: {response[:100]}...")
                 
-                # 解析状态
-                if 'good news' in response or 'no limits' in response:
-                    status_results['unlimited'].append(account)
-                    new_status = AccountStatus.ACTIVE.value
-                elif 'you can only' in response or 'peer flood' in response:
-                    status_results['limited'].append(account)
-                    new_status = AccountStatus.LIMITED.value
-                elif 'account is limited' in response or 'restricted' in response:
-                    status_results['restricted'].append(account)
-                    new_status = AccountStatus.LIMITED.value
-                elif 'banned' in response or 'spam' in response:
-                    status_results['banned'].append(account)
-                    new_status = AccountStatus.BANNED.value
-                else:
-                    status_results['unlimited'].append(account)
-                    new_status = AccountStatus.ACTIVE.value
+                # 使用增强的分类系统
+                category, new_status = classify_status(response)
+                
+                status_results[category].append(account)
                 
                 # 更新数据库
                 db[Account.COLLECTION_NAME].update_one(
                     {'_id': account._id},
                     {'$set': {'status': new_status, 'updated_at': datetime.utcnow()}}
                 )
+            else:
+                # 没有收到回复，可能是无法对话
+                logger.warning(f"Account {account.phone}: No response from @spambot")
+                status_results['banned'].append(account)
+                db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
+                )
                 
         except Exception as e:
+            # 无法连接或对话的账户认为是封禁/死亡账户
             logger.error(f"Failed to check account {account.phone}: {e}")
-            status_results['restricted'].append(account)
+            status_results['banned'].append(account)
+            db[Account.COLLECTION_NAME].update_one(
+                {'_id': account._id},
+                {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
+            )
     
     return status_results
 
