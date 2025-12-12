@@ -1182,16 +1182,124 @@ class TaskManager:
                 for t in results['failed_targets']:
                     f.write(f"{t.username or t.user_id}: {t.error_message or '未知错误'}\n")
             
-            # 写入运行日志
+            # 写入运行日志 - 详细版本
             logger.info(f"生成运行日志: {len(results['logs'])} 条记录")
             with open(log_file, 'w', encoding='utf-8') as f:
                 f.write(f"任务运行日志\n")
                 f.write(f"任务ID: {task_id}\n")
                 f.write(f"完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("=" * 50 + "\n\n")
+                
+                # 预先批量获取所有账户和目标信息（避免N+1查询）
+                unique_account_ids = list(set([log.account_id for log in results['logs'] if log.account_id]))
+                unique_target_ids = list(set([log.target_id for log in results['logs'] if log.target_id]))
+                
+                # 批量查询账户信息 - 安全转换ObjectId
+                valid_account_ids = []
+                for aid in unique_account_ids:
+                    if aid and isinstance(aid, str) and len(aid) == 24:  # MongoDB ObjectId是24位十六进制字符串
+                        try:
+                            valid_account_ids.append(ObjectId(aid))
+                        except Exception:
+                            pass
+                
+                account_docs = self.db[Account.COLLECTION_NAME].find({
+                    '_id': {'$in': valid_account_ids}
+                })
+                accounts_map = {str(doc['_id']): Account.from_dict(doc) for doc in account_docs}
+                
+                # 批量查询目标信息 - 安全转换ObjectId
+                valid_target_ids = []
+                for tid in unique_target_ids:
+                    if tid and isinstance(tid, str) and len(tid) == 24:
+                        try:
+                            valid_target_ids.append(ObjectId(tid))
+                        except Exception:
+                            pass
+                
+                target_docs = self.targets_col.find({
+                    '_id': {'$in': valid_target_ids}
+                })
+                targets_map = {str(doc['_id']): Target.from_dict(doc) for doc in target_docs}
+                
+                # 统计每个账户的发送情况
+                account_stats = {}
                 for log in results['logs']:
+                    account_id = log.account_id
+                    if account_id not in account_stats:
+                        # 从预加载的账户信息中获取
+                        account = accounts_map.get(account_id)
+                        if account:
+                            account_stats[account_id] = {
+                                'phone': account.phone,
+                                'success': 0,
+                                'failed': 0,
+                                'errors': {}
+                            }
+                        else:
+                            account_stats[account_id] = {
+                                'phone': 'Unknown',
+                                'success': 0,
+                                'failed': 0,
+                                'errors': {}
+                            }
+                    
+                    if log.success:
+                        account_stats[account_id]['success'] += 1
+                    else:
+                        account_stats[account_id]['failed'] += 1
+                        # 分类错误原因
+                        error_type = self._categorize_error(log.error_message)
+                        if error_type not in account_stats[account_id]['errors']:
+                            account_stats[account_id]['errors'][error_type] = 0
+                        account_stats[account_id]['errors'][error_type] += 1
+                
+                # 写入账户统计
+                f.write("📊 账户统计:\n")
+                f.write("-" * 50 + "\n")
+                for account_id, stats in account_stats.items():
+                    f.write(f"\n📱 账户: {stats['phone']}\n")
+                    f.write(f"   ✅ 已成功发送: {stats['success']}条\n")
+                    f.write(f"   ❌ 发送失败: {stats['failed']}条\n")
+                    if stats['errors']:
+                        f.write(f"   失败原因统计:\n")
+                        for error_type, count in stats['errors'].items():
+                            f.write(f"      • {error_type}: {count}次\n")
+                f.write("\n" + "=" * 50 + "\n\n")
+                
+                # 写入详细日志
+                f.write("📝 详细发送记录:\n")
+                f.write("-" * 50 + "\n\n")
+                for log in results['logs']:
+                    # 从预加载的数据中获取账户信息
+                    account_id = log.account_id
+                    phone = account_stats.get(account_id, {}).get('phone', 'Unknown')
+                    
+                    # 从预加载的数据中获取目标用户信息
+                    target = targets_map.get(log.target_id)
+                    target_name = "Unknown"
+                    if target:
+                        target_name = target.username or target.user_id or "Unknown"
+                    
                     status = "✅ 成功" if log.success else "❌ 失败"
-                    f.write(f"[{log.sent_at}] {status}: {log.error_message or 'OK'}\n")
+                    
+                    # 格式化消息内容预览（最多50个字符），处理None情况
+                    message_text = log.message_text or ""
+                    message_preview = (message_text[:50] + "...") if len(message_text) > 50 else message_text
+                    
+                    f.write(f"[{log.sent_at}]\n")
+                    f.write(f"账户: {phone}\n")
+                    f.write(f"目标: {target_name}\n")
+                    f.write(f"状态: {status}\n")
+                    
+                    if log.success:
+                        f.write(f"私信内容: {message_preview}\n")
+                    else:
+                        error_category = self._categorize_error(log.error_message)
+                        f.write(f"失败原因: {error_category}\n")
+                        f.write(f"详细错误: {log.error_message}\n")
+                    
+                    f.write("\n")
             
             # 如果有bot_application，自动发送报告给管理员
             if self.bot_application and Config.ADMIN_USER_ID:
@@ -1296,33 +1404,25 @@ class TaskManager:
             
             # 根据不同的发送方式处理
             if task.send_method == SendMethod.POSTBOT.value:
-                # Post代码发送 - 通过 @postbot
+                # Post代码发送 - 通过 @postbot 的内联模式
                 logger.info(f"使用Post代码发送，代码: {task.postbot_code}")
                 try:
-                    # 获取 @postbot
+                    # 获取 @postbot 实体
                     logger.info("正在连接 @postbot...")
                     postbot = await client.get_entity('postbot')
                     
-                    # 发送代码到 @postbot
-                    logger.info(f"发送代码到 @postbot: {task.postbot_code}")
-                    await client.send_message(postbot, task.postbot_code)
+                    # 使用内联查询获取 post 内容
+                    logger.info(f"查询 @postbot 内联结果: {task.postbot_code}")
+                    results = await client.inline_query(postbot, task.postbot_code)
                     
-                    # 等待 @postbot 响应
-                    logger.info(f"等待 @postbot 响应 ({POSTBOT_RESPONSE_WAIT_SECONDS}秒)...")
-                    await asyncio.sleep(POSTBOT_RESPONSE_WAIT_SECONDS)
+                    if not results:
+                        logger.error("@postbot 内联查询无结果")
+                        raise ValueError(f"Post代码 {task.postbot_code} 无效或已过期")
                     
-                    # 获取带按钮的消息
-                    logger.info("正在获取 @postbot 的按钮消息...")
-                    async for message in client.iter_messages(postbot, limit=1):
-                        if message.buttons:
-                            # 转发按钮消息给目标用户
-                            logger.info("找到按钮消息，正在转发...")
-                            sent_message = await client.forward_messages(entity, message)
-                            logger.info("按钮消息转发成功")
-                            break
-                    
-                    if not sent_message:
-                        logger.warning("未找到 @postbot 的按钮消息")
+                    # 发送第一个内联结果给目标用户
+                    logger.info(f"找到 {len(results)} 个内联结果，发送第一个...")
+                    sent_message = await results[0].click(entity)
+                    logger.info("Post 内容发送成功")
                         
                 except Exception as e:
                     logger.error(f"通过 @postbot 发送失败: {e}")
@@ -1442,6 +1542,59 @@ class TaskManager:
             error_message=error_message
         )
         self.logs_col.insert_one(log.to_dict())
+    
+    def _categorize_error(self, error_message):
+        """将错误消息分类为友好的中文描述"""
+        if not error_message:
+            return "未知错误"
+        
+        error_lower = error_message.lower()
+        
+        # 隐私和权限相关错误
+        if 'privacy' in error_lower or 'userprivacyrestricted' in error_lower:
+            return "账户隐私限制（对方设置了隐私保护）"
+        if 'blocked' in error_lower or 'userisblocked' in error_lower:
+            return "已被对方屏蔽"
+        if 'chatwriteforbidden' in error_lower:
+            return "无权限发送消息"
+        if 'notmutualcontact' in error_lower or 'usernotmutualcontact' in error_lower:
+            return "非双向联系人（需要互相添加好友）"
+        
+        # 限流相关错误
+        if 'flood' in error_lower:
+            if 'peerflood' in error_lower:
+                return "账户已被限流（发送过多消息）"
+            return "操作过于频繁，已被限流"
+        
+        # 账户状态相关
+        if 'banned' in error_lower:
+            return "账户已封禁"
+        if 'restricted' in error_lower:
+            return "账户已受限"
+        if 'deactivated' in error_lower:
+            return "账户已停用"
+        
+        # 用户不存在或无效
+        if 'notfound' in error_lower or 'invalid' in error_lower:
+            return "用户不存在或已失效"
+        if 'deleted' in error_lower:
+            return "用户已删除账号"
+        
+        # 网络和连接错误
+        if 'timeout' in error_lower or 'connection' in error_lower:
+            return "网络连接超时"
+        if 'network' in error_lower:
+            return "网络错误"
+        
+        # Postbot 相关错误
+        if 'postbot' in error_lower:
+            return "Post代码无效或已过期"
+        
+        # 其他 - 安全处理可能的None情况
+        if error_message:
+            error_preview = error_message[:50] if len(error_message) > 50 else error_message
+            return f"其他错误：{error_preview}"
+        return "未知错误"
     
     def get_task_progress(self, task_id):
         """Get task progress"""
@@ -1995,9 +2148,9 @@ async def show_task_detail(query, task_id):
         text = (
             f"⬇ <b>正在私信中</b> ⬇\n"
             f"进度 {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n\n"
-            f"【总用户数】    【{task.total_targets}】\n"
-            f"【发送成功】    【{task.sent_count}】\n"
-            f"【发送失败】    【{task.failed_count}】\n\n"
+            f"👥 总用户数    {task.total_targets}\n"
+            f"✅ 发送成功    {task.sent_count}\n"
+            f"❌ 发送失败    {task.failed_count}\n\n"
         )
         
         # Calculate estimated time
@@ -2609,16 +2762,16 @@ async def start_task_handler(query, task_id):
         
         keyboard = [
             [
-                InlineKeyboardButton("【总用户数】", callback_data='noop'),
-                InlineKeyboardButton(f"【{task.total_targets}】", callback_data='noop')
+                InlineKeyboardButton("👥 总用户数", callback_data='noop'),
+                InlineKeyboardButton(f"{task.total_targets}", callback_data='noop')
             ],
             [
-                InlineKeyboardButton("【发送成功】", callback_data='noop'),
-                InlineKeyboardButton("【0】", callback_data='noop')
+                InlineKeyboardButton("✅ 发送成功", callback_data='noop'),
+                InlineKeyboardButton("0", callback_data='noop')
             ],
             [
-                InlineKeyboardButton("【发送失败】", callback_data='noop'),
-                InlineKeyboardButton("【0】", callback_data='noop')
+                InlineKeyboardButton("❌ 发送失败", callback_data='noop'),
+                InlineKeyboardButton("0", callback_data='noop')
             ],
             [
                 InlineKeyboardButton("🔄 刷新进度", callback_data=f'task_progress_refresh_{task_id}'),
@@ -2728,16 +2881,16 @@ async def refresh_task_progress(query, task_id):
     # 创建内联按钮 - 左侧标签，右侧数值
     keyboard = [
         [
-            InlineKeyboardButton("【总用户数】", callback_data='noop'),
-            InlineKeyboardButton(f"【{task.total_targets}】", callback_data='noop')
+            InlineKeyboardButton("👥 总用户数", callback_data='noop'),
+            InlineKeyboardButton(f"{task.total_targets}", callback_data='noop')
         ],
         [
-            InlineKeyboardButton("【发送成功】", callback_data='noop'),
-            InlineKeyboardButton(f"【{task.sent_count}】", callback_data='noop')
+            InlineKeyboardButton("✅ 发送成功", callback_data='noop'),
+            InlineKeyboardButton(f"{task.sent_count}", callback_data='noop')
         ],
         [
-            InlineKeyboardButton("【发送失败】", callback_data='noop'),
-            InlineKeyboardButton(f"【{task.failed_count}】", callback_data='noop')
+            InlineKeyboardButton("❌ 发送失败", callback_data='noop'),
+            InlineKeyboardButton(f"{task.failed_count}", callback_data='noop')
         ],
         [
             InlineKeyboardButton("🔄 刷新进度", callback_data=f'task_progress_refresh_{task_id}'),
