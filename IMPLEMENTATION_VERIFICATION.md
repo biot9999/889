@@ -142,13 +142,38 @@
 - ✅ 账户状态在数据库中更新
 - ✅ 显示导出按钮
 
-**@spambot 响应解析**:
+**@spambot 响应解析（增强版）**:
+
+**优先级分类系统**:
 ```
-"good news" / "no limits" → ACTIVE (无限制)
-"you can only" / "peer flood" → LIMITED (双向限制)
-"account is limited" / "restricted" → LIMITED (冻结)
-"banned" / "spam" → BANNED (封禁)
+优先级1: 地理限制
+  "some phone numbers may trigger a harsh response" → ACTIVE (地理限制，非双向限制)
+
+优先级2: 临时限制
+  "account is now limited until" / "temporarily limited" → LIMITED (临时限制)
+  "暂时限制" (中文支持)
+
+优先级3: 永久封禁
+  "permanently banned" / "banned permanently" → BANNED (永久封禁)
+  "永久封禁" (中文支持)
+
+优先级4: 垃圾邮件限制
+  "actions can trigger a harsh response" / "peer flood" → LIMITED (垃圾邮件)
+  "you can only" → LIMITED (双向限制)
+
+优先级5: 等待验证
+  "wait" / "pending" / "verification" → RESTRICTED (等待验证)
+  "审核中" (中文支持)
+
+优先级6: 无限制
+  "good news, no limits" / "no restrictions" → ACTIVE (无限制)
+  "正常" (中文支持)
+
+特殊情况:
+  无响应 / 连接失败 → BANNED (死亡账户)
 ```
+
+**多语言支持**: 自动支持中文和英文关键词匹配
 
 ---
 
