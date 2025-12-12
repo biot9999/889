@@ -1335,6 +1335,13 @@ class TaskManager:
             logger.info(f"任务ID: {task_id}")
             logger.info(f"========================================")
             
+            # Get task info for message count
+            task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+            if not task_doc:
+                logger.warning(f"任务 {task_id}: 任务不存在")
+                return
+            task = Task.from_dict(task_doc)
+            
             results = self.export_task_results(task_id)
             if not results:
                 logger.warning(f"任务 {task_id}: 无结果可导出")
@@ -1494,10 +1501,15 @@ class TaskManager:
                 logger.info(f"========================================")
                 
                 # 发送完成消息
+                # Calculate unique users who received messages
+                unique_users = len(results['success_targets'])
+                total_messages = task.sent_count  # Total messages sent (including repeat sends)
+                
                 completion_text = (
                     f"🎉 <b>任务完成，用户名已用完！</b>\n\n"
                     f"📊 任务统计：\n"
-                    f"✅ 发送成功: {len(results['success_targets'])}\n"
+                    f"✅ 发送成功: {total_messages} 条消息\n"
+                    f"📧 成功用户: {unique_users} 人\n"
                     f"❌ 发送失败: {len(results['failed_targets'])}\n\n"
                     f"📁 正在发送日志报告..."
                 )
@@ -1963,11 +1975,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_document(
                     document=f,
                     filename=os.path.basename(zip_path),
-                    caption=f"📥 <b>所有账户导出</b>\n\n共 {len(account_ids)} 个账户",
+                    caption=f"📥 <b>所有账户导出</b>\n\n共 {len(account_ids)} 个账户\n\n⚠️ 导出后将自动清空本地数据",
                     parse_mode='HTML'
                 )
             
+            # Delete all accounts from database
+            delete_result = db[Account.COLLECTION_NAME].delete_many({})
+            logger.info(f"Deleted {delete_result.deleted_count} accounts from database")
+            
+            # Delete all session files
+            deleted_files = 0
+            for account in all_accounts:
+                session_name = account.get('session_name')
+                if session_name:
+                    session_path = os.path.join(Config.SESSIONS_DIR, f"{session_name}.session")
+                    json_path = f"{session_path}.json"
+                    
+                    if os.path.exists(session_path):
+                        os.remove(session_path)
+                        deleted_files += 1
+                        logger.info(f"Deleted session file: {session_path}")
+                    
+                    if os.path.exists(json_path):
+                        os.remove(json_path)
+                        logger.info(f"Deleted json file: {json_path}")
+            
             os.remove(zip_path)
+            
+            # Notify user
+            await query.message.reply_text(
+                f"✅ <b>导出完成并已清空</b>\n\n"
+                f"已导出 {len(account_ids)} 个账户\n"
+                f"数据库已删除 {delete_result.deleted_count} 条记录\n"
+                f"本地已删除 {deleted_files} 个会话文件",
+                parse_mode='HTML'
+            )
         except Exception as e:
             logger.error(f"Error exporting all accounts: {e}", exc_info=True)
             await query.answer(f"❌ 导出失败：{str(e)}", show_alert=True)
@@ -1992,11 +2034,48 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_document(
                     document=f,
                     filename=os.path.basename(zip_path),
-                    caption=f"⚠️ <b>受限账户导出</b>\n\n共 {len(account_ids)} 个账户",
+                    caption=f"⚠️ <b>受限账户导出</b>\n\n共 {len(account_ids)} 个账户\n\n⚠️ 导出后将自动删除这些受限账户",
                     parse_mode='HTML'
                 )
             
+            # Delete limited accounts from database
+            limited_ids = [acc['_id'] for acc in limited_accounts]
+            delete_result = db[Account.COLLECTION_NAME].delete_many({
+                '_id': {'$in': limited_ids}
+            })
+            logger.info(f"Deleted {delete_result.deleted_count} limited accounts from database")
+            
+            # Delete session files for limited accounts
+            deleted_files = 0
+            for account in limited_accounts:
+                session_name = account.get('session_name')
+                if session_name:
+                    session_path = os.path.join(Config.SESSIONS_DIR, f"{session_name}.session")
+                    json_path = f"{session_path}.json"
+                    
+                    if os.path.exists(session_path):
+                        os.remove(session_path)
+                        deleted_files += 1
+                        logger.info(f"Deleted session file: {session_path}")
+                    
+                    if os.path.exists(json_path):
+                        os.remove(json_path)
+                        logger.info(f"Deleted json file: {json_path}")
+            
             os.remove(zip_path)
+            
+            # Get remaining accounts count
+            remaining_accounts = db[Account.COLLECTION_NAME].count_documents({})
+            
+            # Notify user
+            await query.message.reply_text(
+                f"✅ <b>受限账户导出完成并已删除</b>\n\n"
+                f"已导出并删除 {len(account_ids)} 个受限账户\n"
+                f"数据库已删除 {delete_result.deleted_count} 条记录\n"
+                f"本地已删除 {deleted_files} 个会话文件\n"
+                f"剩余账户数量: {remaining_accounts} 个",
+                parse_mode='HTML'
+            )
         except Exception as e:
             logger.error(f"Error exporting limited accounts: {e}", exc_info=True)
             await query.answer(f"❌ 导出失败：{str(e)}", show_alert=True)
@@ -2659,11 +2738,18 @@ async def show_task_detail(query, task_id):
     
     # Build progress display for running tasks
     if task.status == TaskStatus.RUNNING.value:
+        # Calculate unique users who received messages (targets with sent_at set)
+        unique_users_sent = db[Target.COLLECTION_NAME].count_documents({
+            'task_id': str(task_id),
+            'sent_at': {'$ne': None}
+        })
+        
         text = (
             f"⬇ <b>正在私信中</b> ⬇\n"
-            f"进度 {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n\n"
+            f"进度 {task.sent_count}/{task.total_targets}\n\n"
             f"👥 总用户数    {task.total_targets}\n"
-            f"✅ 发送成功    {task.sent_count}\n"
+            f"✅ 发送成功    {task.sent_count} 条消息\n"
+            f"📧 成功用户    {unique_users_sent} 人\n"
             f"❌ 发送失败    {task.failed_count}\n\n"
         )
         
@@ -2680,10 +2766,17 @@ async def show_task_detail(query, task_id):
             elapsed = datetime.utcnow() - task.started_at
             text += f"⏰ 已运行时间: {elapsed}\n"
     else:
+        # Calculate unique users who received messages for completed/paused tasks
+        unique_users_sent = db[Target.COLLECTION_NAME].count_documents({
+            'task_id': str(task_id),
+            'sent_at': {'$ne': None}
+        })
+        
         text = (
             f"{status_emoji} <b>{task.name}</b>\n\n"
             f"📊 进度: {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n"
-            f"✅ 成功: {task.sent_count}\n"
+            f"✅ 成功: {task.sent_count} 条消息\n"
+            f"📧 用户: {unique_users_sent} 人\n"
             f"❌ 失败: {task.failed_count}\n\n"
             f"<b>⚙️ 当前配置:</b>\n"
             f"🧵 多账号线程数: {task.thread_count}\n"
