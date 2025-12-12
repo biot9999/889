@@ -18,8 +18,9 @@ ADMIN_USER_ID=123456789
 API_ID=12345678
 API_HASH=abcdef1234567890abcdef1234567890
 
-# 数据库
-DATABASE_URL=sqlite:///telegram_bot.db
+# MongoDB 数据库配置
+MONGODB_URI=mongodb://localhost:27017/
+MONGODB_DATABASE=telegram_bot
 
 # 任务配置
 DEFAULT_MIN_INTERVAL=30    # 最小发送间隔（秒）

@@ -61,6 +61,7 @@
 
 ### 环境要求
 - Python 3.8+
+- MongoDB 4.0+ (推荐使用 MongoDB 5.0+)
 - CentOS Stream 9 x86_64 (Py3.12.3) 或其他 Linux 发行版
 - 宝塔面板（可选）
 
@@ -68,9 +69,9 @@
 ```
 889/
 ├── bot.py              # 主程序（所有功能集成在一个文件中）
-├── init_db.py          # 数据库初始化脚本
-├── migrate_db.py       # 数据库迁移脚本（添加新列）
-├── fix_enum_values.py  # 修复枚举值脚本（修复数据格式问题）
+├── init_db.py          # MongoDB 数据库初始化脚本
+├── migrate_db.py       # 从 SQLite 迁移到 MongoDB 的脚本
+├── fix_enum_values.py  # MongoDB 不需要此脚本（保留用于说明）
 ├── start.sh            # 快速启动脚本
 ├── requirements.txt    # Python 依赖
 ├── .env.example        # 环境变量模板
@@ -80,6 +81,50 @@
 ```
 
 ### 安装步骤
+
+#### 前置要求：安装 MongoDB
+
+**Ubuntu/Debian:**
+```bash
+# 导入 MongoDB 公钥
+wget -qO - https://www.mongodb.org/static/pgp/server-6.0.asc | sudo apt-key add -
+
+# 添加 MongoDB 仓库
+echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/6.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-6.0.list
+
+# 安装 MongoDB
+sudo apt-get update
+sudo apt-get install -y mongodb-org
+
+# 启动 MongoDB
+sudo systemctl start mongod
+sudo systemctl enable mongod
+```
+
+**CentOS/RHEL:**
+```bash
+# 创建 MongoDB 仓库文件
+sudo tee /etc/yum.repos.d/mongodb-org-6.0.repo << EOF
+[mongodb-org-6.0]
+name=MongoDB Repository
+baseurl=https://repo.mongodb.org/yum/redhat/\$releasever/mongodb-org/6.0/x86_64/
+gpgcheck=1
+enabled=1
+gpgkey=https://www.mongodb.org/static/pgp/server-6.0.asc
+EOF
+
+# 安装 MongoDB
+sudo yum install -y mongodb-org
+
+# 启动 MongoDB
+sudo systemctl start mongod
+sudo systemctl enable mongod
+```
+
+**Docker (推荐用于开发):**
+```bash
+docker run -d --name mongodb -p 27017:27017 mongo:6.0
+```
 
 #### 方法 1: 使用快速启动脚本（推荐）
 
@@ -125,20 +170,18 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 # 编辑 .env 文件，填入你的配置
+# 重要：设置 MONGODB_URI 和 MONGODB_DATABASE
 ```
 
-5. 初始化数据库：
+5. 初始化 MongoDB 数据库：
 ```bash
 python3 init_db.py
 ```
 
-**⚠️ 如果是升级现有数据库**：如果你已经在使用旧版本，运行以下命令迁移数据库（保留现有数据）：
+**⚠️ 从 SQLite 迁移**：如果你之前使用的是 SQLite 版本，可以使用迁移脚本：
 ```bash
-# 步骤 1: 添加新列
+# 迁移现有 SQLite 数据到 MongoDB
 python3 migrate_db.py
-
-# 步骤 2: 修复枚举值（如果遇到 KeyError 错误）
-python3 fix_enum_values.py
 ```
 详细说明请查看 [MIGRATION.md](MIGRATION.md)
 
@@ -264,13 +307,17 @@ PROXY_PASSWORD=your_password  # 可选
    - 尊重用户隐私
 
 4. **数据备份**：
-   - 定期备份数据库
+   - 定期备份 MongoDB 数据库
+   - 使用 `mongodump` 命令：`mongodump --db telegram_bot --out /path/to/backup`
    - 保存重要的任务日志
    - 安全存储账户文件
 
 ## 🐛 故障排除
 
 ### 常见问题
+
+**Q: 无法连接到 MongoDB？**
+A: 检查 MongoDB 服务是否运行 (`sudo systemctl status mongod`)，确保 MONGODB_URI 配置正确。
 
 **Q: 账户登录失败？**
 A: 检查网络连接，确保 API_ID 和 API_HASH 正确，如有需要配置代理。
@@ -284,13 +331,16 @@ A: 检查日志文件，可能是网络问题或账户受限。
 **Q: 无法上传文件？**
 A: 确保文件格式正确，大小不超过限制（通常为 50MB）。
 
+**Q: 从 SQLite 迁移后数据丢失？**
+A: 使用 `migrate_db.py` 脚本确保所有数据都已迁移。检查原 SQLite 文件是否完整。
+
 ## 🏗️ 技术架构
 
 ### 单文件架构
 本项目采用单文件架构设计，所有功能集成在 `bot.py` 中，包括：
 
 - **配置管理**：环境变量加载和配置验证
-- **数据库模型**：SQLAlchemy ORM 模型定义
+- **数据库模型**：MongoDB 文档模型定义（使用 pymongo）
 - **账户管理**：Telethon 客户端管理，支持多种登录方式
 - **任务管理**：任务创建、执行、监控和结果导出
 - **消息格式化**：消息个性化和格式化处理
@@ -299,10 +349,12 @@ A: 确保文件格式正确，大小不超过限制（通常为 50MB）。
 ### 核心依赖
 - **python-telegram-bot**: Bot 控制界面
 - **Telethon**: Telegram 客户端操作
-- **SQLAlchemy**: 数据库 ORM
+- **pymongo**: MongoDB 数据库驱动
+- **motor**: 异步 MongoDB 驱动（用于高级功能）
 - **python-dotenv**: 环境变量管理
 
 ### 数据库设计
+使用 MongoDB 存储以下集合（Collections）：
 - **accounts**: 账户信息和状态
 - **tasks**: 任务配置和统计
 - **targets**: 目标用户列表
