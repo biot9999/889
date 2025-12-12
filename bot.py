@@ -678,16 +678,22 @@ class AccountManager:
             shutil.copy2(session_path, new_path)
             logger.info(f"Session file copied to: {new_path}")
             
+            # 确保状态设置为 ACTIVE
             account = Account(
                 phone=phone,
                 session_name=session_name,
                 api_id=str(api_id),
                 api_hash=api_hash,
-                status=AccountStatus.ACTIVE.value
+                status=AccountStatus.ACTIVE.value  # 明确设置为 ACTIVE
             )
             result = self.accounts_col.insert_one(account.to_dict())
             account._id = result.inserted_id
-            logger.info(f"Account saved to database: {phone}")
+            logger.info(f"Account saved to database: {phone} with status: {account.status}")
+            
+            # 验证状态
+            saved_account = self.accounts_col.find_one({'_id': result.inserted_id})
+            if saved_account['status'] != AccountStatus.ACTIVE.value:
+                logger.warning(f"Account {phone} status is not active after save: {saved_account['status']}")
             
             await client.disconnect()
             
@@ -927,8 +933,27 @@ class TaskManager:
             
             accounts = self.account_manager.get_active_accounts()
             if not accounts:
-                logger.error(f"Task {task_id}: No active accounts available")
-                raise ValueError("No active accounts")
+                # 检查是否有任何账户
+                all_accounts_count = self.db[Account.COLLECTION_NAME].count_documents({})
+                if all_accounts_count == 0:
+                    error_msg = "No accounts found. Please add accounts first."
+                    logger.error(f"Task {task_id}: {error_msg}")
+                    raise ValueError("❌ 没有找到任何账户！\n\n请先在【账户管理】中添加账户。")
+                else:
+                    # 有账户但都不是 active 状态
+                    inactive_accounts = self.db[Account.COLLECTION_NAME].count_documents({'status': {'$ne': AccountStatus.ACTIVE.value}})
+                    error_msg = f"Found {all_accounts_count} accounts, but none are active. {inactive_accounts} accounts are inactive/banned/limited."
+                    logger.error(f"Task {task_id}: {error_msg}")
+                    
+                    # 获取账户状态统计
+                    status_stats = {}
+                    for status in AccountStatus:
+                        count = self.db[Account.COLLECTION_NAME].count_documents({'status': status.value})
+                        if count > 0:
+                            status_stats[status.value] = count
+                    
+                    stats_text = "\n".join([f"  • {status}: {count}" for status, count in status_stats.items()])
+                    raise ValueError(f"❌ 没有可用的活跃账户！\n\n账户状态统计：\n{stats_text}\n\n请检查账户状态或添加新账户。")
             
             logger.info(f"Task {task_id}: Using {len(accounts)} active accounts")
             
@@ -1163,7 +1188,8 @@ class TaskManager:
 (PHONE_INPUT, CODE_INPUT, PASSWORD_INPUT, 
  MESSAGE_INPUT, FORMAT_SELECT, SEND_METHOD_SELECT, MEDIA_SELECT, MEDIA_UPLOAD,
  TARGET_INPUT, TASK_NAME_INPUT, SESSION_UPLOAD, TDATA_UPLOAD, POSTBOT_CODE_INPUT,
- CHANNEL_LINK_INPUT, PREVIEW_CONFIG) = range(15)
+ CHANNEL_LINK_INPUT, PREVIEW_CONFIG,
+ CONFIG_THREAD_INPUT, CONFIG_INTERVAL_MIN_INPUT, CONFIG_BIDIRECT_INPUT) = range(18)
 
 # Global managers
 account_manager = None
@@ -1665,6 +1691,22 @@ async def show_task_detail(query, task_id):
         f"🔁 重复发送: {'✔️' if task.repeat_send else '❌'}\n"
     )
     
+    # 在现有 text 后添加运行时信息
+    if task.status == TaskStatus.RUNNING.value:
+        # 计算预计完成时间
+        if task.total_targets and task.sent_count is not None and task.failed_count is not None:
+            remaining = task.total_targets - task.sent_count - task.failed_count
+            if remaining > 0 and task.min_interval and task.max_interval:
+                avg_interval = (task.min_interval + task.max_interval) / 2
+                estimated_seconds = remaining * avg_interval
+                estimated_time = timedelta(seconds=int(estimated_seconds))
+                
+                text += f"\n⏱️ 预计剩余时间: {estimated_time}\n"
+    
+    if task.started_at:
+        elapsed = datetime.utcnow() - task.started_at
+        text += f"⏰ 已运行时间: {elapsed}\n"
+    
     keyboard = []
     
     # Configuration buttons
@@ -1727,6 +1769,56 @@ async def show_task_config(query, task_id):
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def request_thread_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request thread count configuration"""
+    query = update.callback_query
+    await query.answer()
+    task_id = query.data.split('_')[2]
+    context.user_data['config_task_id'] = task_id
+    await query.message.reply_text(
+        "🧵 <b>配置线程数</b>\n\n"
+        "请输入要使用的账号数量（线程数）：\n\n"
+        "💡 建议：1-10\n"
+        "⚠️ 线程数越多，发送速度越快，但风险也越高",
+        parse_mode='HTML'
+    )
+    return CONFIG_THREAD_INPUT
+
+
+async def request_interval_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request interval configuration"""
+    query = update.callback_query
+    await query.answer()
+    task_id = query.data.split('_')[2]
+    context.user_data['config_task_id'] = task_id
+    await query.message.reply_text(
+        "⏱️ <b>配置发送间隔</b>\n\n"
+        "请输入最小间隔和最大间隔（秒），用空格分隔：\n\n"
+        "💡 格式：最小值 最大值\n"
+        "💡 例如：30 120\n"
+        "⚠️ 间隔越短，风险越高",
+        parse_mode='HTML'
+    )
+    return CONFIG_INTERVAL_MIN_INPUT
+
+
+async def request_bidirect_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request bidirectional limit configuration"""
+    query = update.callback_query
+    await query.answer()
+    task_id = query.data.split('_')[2]
+    context.user_data['config_task_id'] = task_id
+    await query.message.reply_text(
+        "🔄 <b>配置无视双向次数</b>\n\n"
+        "请输入无视双向联系人限制的次数：\n\n"
+        "💡 0 = 不忽略限制\n"
+        "💡 1-999 = 忽略次数\n"
+        "⚠️ 设置过高可能导致封号",
+        parse_mode='HTML'
+    )
+    return CONFIG_BIDIRECT_INPUT
 
 
 async def start_create_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2074,6 +2166,86 @@ async def handle_target_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         return TARGET_INPUT
 
 
+async def handle_thread_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle thread count configuration"""
+    try:
+        thread_count = int(update.message.text.strip())
+        if thread_count < 1 or thread_count > 50:
+            await update.message.reply_text("❌ 线程数必须在 1-50 之间，请重新输入：")
+            return CONFIG_THREAD_INPUT
+        
+        task_id = context.user_data.get('config_task_id')
+        db[Task.COLLECTION_NAME].update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {'thread_count': thread_count, 'updated_at': datetime.utcnow()}}
+        )
+        
+        await update.message.reply_text(f"✅ 线程数已设置为：{thread_count}")
+        context.user_data.clear()
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text("❌ 请输入有效的数字：")
+        return CONFIG_THREAD_INPUT
+
+
+async def handle_interval_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle interval configuration"""
+    try:
+        parts = update.message.text.strip().split()
+        if len(parts) != 2:
+            await update.message.reply_text("❌ 格式错误，请输入两个数字（用空格分隔）：")
+            return CONFIG_INTERVAL_MIN_INPUT
+        
+        min_interval = int(parts[0])
+        max_interval = int(parts[1])
+        
+        if min_interval < 1 or max_interval < min_interval or max_interval > 3600:
+            await update.message.reply_text("❌ 间隔设置不合理，请重新输入：\n最小值 ≥ 1，最大值 ≥ 最小值，最大值 ≤ 3600")
+            return CONFIG_INTERVAL_MIN_INPUT
+        
+        task_id = context.user_data.get('config_task_id')
+        db[Task.COLLECTION_NAME].update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {
+                'min_interval': min_interval,
+                'max_interval': max_interval,
+                'updated_at': datetime.utcnow()
+            }}
+        )
+        
+        await update.message.reply_text(f"✅ 发送间隔已设置为：{min_interval}-{max_interval} 秒")
+        context.user_data.clear()
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text("❌ 请输入有效的数字：")
+        return CONFIG_INTERVAL_MIN_INPUT
+
+
+async def handle_bidirect_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle bidirectional limit configuration"""
+    try:
+        limit = int(update.message.text.strip())
+        if limit < 0 or limit > 999:
+            await update.message.reply_text("❌ 次数必须在 0-999 之间，请重新输入：")
+            return CONFIG_BIDIRECT_INPUT
+        
+        task_id = context.user_data.get('config_task_id')
+        db[Task.COLLECTION_NAME].update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {'ignore_bidirectional_limit': limit, 'updated_at': datetime.utcnow()}}
+        )
+        
+        await update.message.reply_text(f"✅ 无视双向次数已设置为：{limit}")
+        context.user_data.clear()
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text("❌ 请输入有效的数字：")
+        return CONFIG_BIDIRECT_INPUT
+
+
 async def start_task_handler(query, task_id):
     """Start task"""
     try:
@@ -2081,8 +2253,12 @@ async def start_task_handler(query, task_id):
         await query.answer("✅ 任务已开始")
         # Redirect to task detail to show progress
         await show_task_detail(query, task_id)
+    except ValueError as e:
+        # ValueError 通常包含用户友好的错误消息
+        await query.message.reply_text(str(e), parse_mode='HTML')
     except Exception as e:
-        await query.answer(f"❌ 失败: {str(e)}", show_alert=True)
+        logger.error(f"Unexpected error starting task {task_id}: {e}", exc_info=True)
+        await query.answer(f"❌ 启动失败: {str(e)}", show_alert=True)
 
 
 async def stop_task_handler(query, task_id):
@@ -2371,6 +2547,23 @@ def main():
     )
     
     application.add_handler(task_conv)
+    
+    # Task configuration conversation handler
+    logger.info("Registering task configuration conversation handler...")
+    config_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(request_thread_config, pattern='^cfg_thread_'),
+            CallbackQueryHandler(request_interval_config, pattern='^cfg_interval_'),
+            CallbackQueryHandler(request_bidirect_config, pattern='^cfg_bidirect_')
+        ],
+        states={
+            CONFIG_THREAD_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_thread_config)],
+            CONFIG_INTERVAL_MIN_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_interval_config)],
+            CONFIG_BIDIRECT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bidirect_config)]
+        },
+        fallbacks=[CommandHandler("start", start)]
+    )
+    application.add_handler(config_conv)
     
     # General button handler (registered AFTER conversation handlers)
     logger.info("Registering general button handler...")
