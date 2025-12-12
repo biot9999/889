@@ -70,14 +70,14 @@
 889/
 ├── bot.py              # 主程序（所有功能集成在一个文件中）
 ├── init_db.py          # MongoDB 数据库初始化脚本
-├── migrate_db.py       # 从 SQLite 迁移到 MongoDB 的脚本
+├── migrate_db.py       # 说明文件（不支持自动迁移）
 ├── fix_enum_values.py  # MongoDB 不需要此脚本（保留用于说明）
 ├── start.sh            # 快速启动脚本
 ├── requirements.txt    # Python 依赖
 ├── .env.example        # 环境变量模板
 ├── .gitignore          # Git 忽略文件
 ├── README.md           # 项目文档
-└── MIGRATION.md        # 数据库迁移指南
+└── MIGRATION.md        # MongoDB 使用指南
 ```
 
 ### 安装步骤
@@ -178,12 +178,11 @@ cp .env.example .env
 python3 init_db.py
 ```
 
-**⚠️ 从 SQLite 迁移**：如果你之前使用的是 SQLite 版本，可以使用迁移脚本：
-```bash
-# 迁移现有 SQLite 数据到 MongoDB
-python3 migrate_db.py
-```
-详细说明请查看 [MIGRATION.md](MIGRATION.md)
+**⚠️ 从旧版本升级**：如果你之前使用的是 SQLite 版本：
+- 不支持自动数据迁移
+- 建议重新开始使用 MongoDB
+- 账户信息需要重新添加
+- 详细说明请查看 [MIGRATION.md](MIGRATION.md)
 
 6. 启动机器人：
 ```bash
@@ -331,8 +330,8 @@ A: 检查日志文件，可能是网络问题或账户受限。
 **Q: 无法上传文件？**
 A: 确保文件格式正确，大小不超过限制（通常为 50MB）。
 
-**Q: 从 SQLite 迁移后数据丢失？**
-A: 使用 `migrate_db.py` 脚本确保所有数据都已迁移。检查原 SQLite 文件是否完整。
+**Q: 从旧版本升级？**
+A: 不支持自动数据迁移。建议重新开始使用 MongoDB，账户信息需要重新添加。
 
 ## 🏗️ 技术架构
 

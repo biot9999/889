@@ -1,8 +1,11 @@
-# 数据库迁移指南 / Database Migration Guide
+# MongoDB 数据库使用指南 / MongoDB Database Usage Guide
 
-## 从 SQLite 迁移到 MongoDB / Migrating from SQLite to MongoDB
+## MongoDB 数据库 / MongoDB Database
 
-### 为什么迁移到 MongoDB？/ Why Migrate to MongoDB?
+本项目已完全切换到 MongoDB，不再使用 SQLite。
+This project has completely switched to MongoDB and no longer uses SQLite.
+
+### 为什么使用 MongoDB？/ Why Use MongoDB?
 
 MongoDB 提供以下优势：
 MongoDB provides these advantages:
@@ -12,7 +15,7 @@ MongoDB provides these advantages:
 3. **更容易扩展** / Easy Scalability - 支持水平扩展和分片
 4. **更简单的部署** / Simpler Deployment - 无需复杂的迁移脚本
 
-## 迁移步骤 / Migration Steps
+## 安装步骤 / Installation Steps
 
 ### 步骤 1：安装 MongoDB / Step 1: Install MongoDB
 
@@ -48,25 +51,18 @@ docker run -d --name mongodb -p 27017:27017 mongo:6.0
 
 ### 步骤 2：更新配置文件 / Step 2: Update Configuration
 
-编辑 `.env` 文件，替换数据库配置：
-Edit `.env` file and replace database configuration:
+编辑 `.env` 文件：
+Edit `.env` file:
 
-**旧配置 / Old Configuration:**
 ```env
-DATABASE_URL=sqlite:///telegram_bot.db
-```
-
-**新配置 / New Configuration:**
-```env
+# MongoDB 数据库配置
 MONGODB_URI=mongodb://localhost:27017/
 MONGODB_DATABASE=telegram_bot
 ```
 
-### 步骤 3：更新 Python 依赖 / Step 3: Update Python Dependencies
+### 步骤 3：安装 Python 依赖 / Step 3: Install Python Dependencies
 
 ```bash
-# 确保使用最新的 requirements.txt
-# Ensure using latest requirements.txt
 pip install -r requirements.txt
 ```
 
@@ -78,49 +74,12 @@ pip install -r requirements.txt
 python3 init_db.py
 ```
 
-### 步骤 5：迁移现有数据（可选）/ Step 5: Migrate Existing Data (Optional)
-
-如果你有现有的 SQLite 数据需要迁移：
-If you have existing SQLite data to migrate:
-
-```bash
-# 运行迁移脚本
-# Run migration script
-python3 migrate_db.py
-```
-
-该脚本将：
-This script will:
-- 从 SQLite 读取所有数据
-- 转换数据格式
-- 导入到 MongoDB
-- 保留所有账户、任务、目标和日志
-
-### 步骤 6：验证迁移 / Step 6: Verify Migration
+### 步骤 5：启动机器人 / Step 5: Start the Bot
 
 ```bash
 # 启动机器人
 # Start the bot
 python3 bot.py
-```
-
-检查：
-Check:
-1. ✅ 机器人启动无错误 / Bot starts without errors
-2. ✅ 可以查看账户列表 / Can view account list
-3. ✅ 可以查看任务列表 / Can view task list
-4. ✅ 统计数据正确 / Statistics are correct
-
-### 步骤 7：备份 SQLite 数据库（可选）/ Step 7: Backup SQLite Database (Optional)
-
-迁移成功后，建议备份原 SQLite 数据库：
-After successful migration, backup the original SQLite database:
-
-```bash
-# 移动到备份目录
-# Move to backup directory
-mkdir -p backups
-mv telegram_bot.db backups/telegram_bot.db.$(date +%Y%m%d)
 ```
 
 ## 验证 MongoDB 连接 / Verify MongoDB Connection
@@ -147,11 +106,6 @@ db.accounts.countDocuments()
 db.tasks.countDocuments()
 db.targets.countDocuments()
 db.message_logs.countDocuments()
-
-# 查看示例文档
-# View sample documents
-db.accounts.findOne()
-db.tasks.findOne()
 ```
 
 ## 故障排除 / Troubleshooting
@@ -168,45 +122,34 @@ sudo systemctl status mongod
 sudo tail -f /var/log/mongodb/mongod.log
 ```
 
-### 问题 2: 迁移脚本失败 / Migration Script Fails
+### 问题 2: 初始化失败 / Initialization Failed
 
 ```bash
-# 检查 SQLite 文件是否存在
-# Check if SQLite file exists
-ls -lh telegram_bot.db
+# 确保 MongoDB 正在运行
+# Ensure MongoDB is running
+sudo systemctl restart mongod
 
-# 手动测试 SQLite 连接
-# Manually test SQLite connection
-sqlite3 telegram_bot.db "SELECT COUNT(*) FROM accounts;"
+# 检查配置
+# Check configuration
+cat .env | grep MONGODB
 ```
 
-### 问题 3: 数据不完整 / Data Incomplete
+### 问题 3: 权限问题 / Permission Issues
 
 ```bash
-# 重新运行迁移脚本（会跳过已存在的数据）
-# Re-run migration script (will skip existing data)
-python3 migrate_db.py
+# MongoDB 默认不需要认证
+# MongoDB does not require authentication by default
 
-# 或清空 MongoDB 重新迁移
-# Or clear MongoDB and re-migrate
-mongosh
-use telegram_bot
-db.dropDatabase()
-exit
-python3 init_db.py
-python3 migrate_db.py
+# 如果启用了认证，在 .env 中配置：
+# If authentication is enabled, configure in .env:
+MONGODB_URI=mongodb://username:password@localhost:27017/
 ```
 
 ## 性能优化建议 / Performance Optimization Tips
 
-1. **创建索引** / Create Indexes
-   ```javascript
-   // 在 MongoDB Shell 中
-   use telegram_bot
-   db.accounts.createIndex({"phone": 1})
-   db.tasks.createIndex({"status": 1})
-   db.targets.createIndex({"task_id": 1, "is_sent": 1})
-   ```
+1. **索引已自动创建** / Indexes Are Automatically Created
+   - init_db.py 已经创建了所有必要的索引
+   - init_db.py has created all necessary indexes
 
 2. **定期备份** / Regular Backups
    ```bash
@@ -224,15 +167,43 @@ python3 migrate_db.py
    db.system.profile.find().pretty()
    ```
 
-## 新功能 / New Features
+## 数据管理 / Data Management
 
-迁移到 MongoDB 后，你的机器人将享有：
-After migrating to MongoDB, your bot will benefit from:
+### 清空数据库 / Clear Database
 
-1. **更快的查询速度** / Faster Query Speed
-2. **更好的并发处理** / Better Concurrency
-3. **更灵活的数据结构** / More Flexible Data Structure
-4. **更简单的扩展** / Easier Scaling
+如果需要重新开始：
+If you need to start fresh:
+
+```bash
+mongosh
+use telegram_bot
+db.dropDatabase()
+exit
+python3 init_db.py
+```
+
+### 查看数据 / View Data
+
+```bash
+mongosh
+use telegram_bot
+
+# 查看账户
+db.accounts.find().pretty()
+
+# 查看任务
+db.tasks.find().pretty()
+```
+
+## 从旧版本升级 / Upgrading from Old Version
+
+如果您之前使用 SQLite 版本：
+If you previously used the SQLite version:
+
+- ⚠️ **不支持自动数据迁移** / Automatic data migration is not supported
+- 💡 建议：重新开始使用 MongoDB / Recommended: Start fresh with MongoDB
+- 📝 账户信息需要重新添加 / Account information needs to be re-added
+- 🔄 任务需要重新创建 / Tasks need to be recreated
 
 ## 需要帮助？/ Need Help?
 
