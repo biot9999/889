@@ -72,3 +72,7 @@ Thumbs.db
 tmp/
 temp/
 *.tmp
+
+# Test files
+test_*.py
+validate_*.py
