@@ -721,46 +721,45 @@ async def test_proxy(db, proxy_id):
                 )
                 return True, "Connection successful"
             else:
-                db[Proxy.COLLECTION_NAME].update_one(
-                    {'_id': ObjectId(proxy_id)},
-                    {
-                        '$inc': {'fail_count': 1},
-                        '$set': {'updated_at': datetime.utcnow()}
-                    }
+                # Connection failed - automatically delete the proxy
+                logger.warning(f"❌ Proxy {proxy.host}:{proxy.port} failed test, deleting...")
+                
+                # Remove proxy from accounts that are using it
+                proxy_oid = ObjectId(proxy_id)
+                db[Account.COLLECTION_NAME].update_many(
+                    {'$or': [{'proxy_id': proxy_oid}, {'proxy_id': str(proxy_id)}]},
+                    {'$set': {'proxy_id': None}}
                 )
                 
-                # Auto-disable after 3 failures
-                updated_proxy = db[Proxy.COLLECTION_NAME].find_one({'_id': ObjectId(proxy_id)})
-                if updated_proxy and updated_proxy.get('fail_count', 0) >= 3:
-                    db[Proxy.COLLECTION_NAME].update_one(
-                        {'_id': ObjectId(proxy_id)},
-                        {'$set': {'is_active': False, 'updated_at': datetime.utcnow()}}
-                    )
+                # Delete the proxy
+                db[Proxy.COLLECTION_NAME].delete_one({'_id': proxy_oid})
+                logger.info(f"🗑️ Deleted unavailable proxy: {proxy.host}:{proxy.port}")
                 
-                return False, "Connection failed"
+                return False, "Connection failed - proxy deleted"
+                
         except Exception as e:
             logger.error(f"Proxy test error: {e}")
-            # Update fail count
-            db[Proxy.COLLECTION_NAME].update_one(
-                {'_id': ObjectId(proxy_id)},
-                {
-                    '$inc': {'fail_count': 1},
-                    '$set': {'updated_at': datetime.utcnow()}
-                }
+            
+            # Test failed - automatically delete the proxy
+            logger.warning(f"❌ Proxy {proxy.host}:{proxy.port} test error, deleting...")
+            
+            # Remove proxy from accounts that are using it
+            proxy_oid = ObjectId(proxy_id)
+            db[Account.COLLECTION_NAME].update_many(
+                {'$or': [{'proxy_id': proxy_oid}, {'proxy_id': str(proxy_id)}]},
+                {'$set': {'proxy_id': None}}
             )
             
-            # Auto-disable after 3 failures
-            updated_proxy = db[Proxy.COLLECTION_NAME].find_one({'_id': ObjectId(proxy_id)})
-            if updated_proxy and updated_proxy.get('fail_count', 0) >= 3:
-                db[Proxy.COLLECTION_NAME].update_one(
-                    {'_id': ObjectId(proxy_id)},
-                    {'$set': {'is_active': False, 'updated_at': datetime.utcnow()}}
-                )
+            # Delete the proxy
+            db[Proxy.COLLECTION_NAME].delete_one({'_id': proxy_oid})
+            logger.info(f"🗑️ Deleted unavailable proxy: {proxy.host}:{proxy.port}")
             
-            return False, f"Error: {str(e)}"
+            return False, f"Error: {str(e)} - proxy deleted"
+            
     except Exception as e:
         logger.error(f"Proxy test failed: {e}", exc_info=True)
         return False, str(e)
+
 
 
 def get_next_available_proxy(db):
@@ -1088,14 +1087,17 @@ class AccountManager:
                         {'_id': proxy_obj._id},
                         {'$inc': {'fail_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
                     )
-                    # Check if should auto-disable
+                    # Check if should auto-delete after 3 failures
                     updated_proxy = self.db[Proxy.COLLECTION_NAME].find_one({'_id': proxy_obj._id})
                     if updated_proxy and updated_proxy.get('fail_count', 0) >= 3:
-                        self.db[Proxy.COLLECTION_NAME].update_one(
-                            {'_id': proxy_obj._id},
-                            {'$set': {'is_active': False, 'updated_at': datetime.utcnow()}}
+                        # Remove proxy from all accounts using it
+                        self.db[Account.COLLECTION_NAME].update_many(
+                            {'$or': [{'proxy_id': proxy_obj._id}, {'proxy_id': str(proxy_obj._id)}]},
+                            {'$set': {'proxy_id': None}}
                         )
-                        logger.warning(f"❌ Proxy {proxy_obj.host}:{proxy_obj.port} auto-disabled after 3 failures")
+                        # Delete the proxy
+                        self.db[Proxy.COLLECTION_NAME].delete_one({'_id': proxy_obj._id})
+                        logger.warning(f"🗑️ Proxy {proxy_obj.host}:{proxy_obj.port} auto-deleted after 3 failures")
                 if client and client.is_connected():
                     await client.disconnect()
                 client = None
@@ -1107,6 +1109,17 @@ class AccountManager:
                         {'_id': proxy_obj._id},
                         {'$inc': {'fail_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
                     )
+                    # Check if should auto-delete after 3 failures
+                    updated_proxy = self.db[Proxy.COLLECTION_NAME].find_one({'_id': proxy_obj._id})
+                    if updated_proxy and updated_proxy.get('fail_count', 0) >= 3:
+                        # Remove proxy from all accounts using it
+                        self.db[Account.COLLECTION_NAME].update_many(
+                            {'$or': [{'proxy_id': proxy_obj._id}, {'proxy_id': str(proxy_obj._id)}]},
+                            {'$set': {'proxy_id': None}}
+                        )
+                        # Delete the proxy
+                        self.db[Proxy.COLLECTION_NAME].delete_one({'_id': proxy_obj._id})
+                        logger.warning(f"🗑️ Proxy {proxy_obj.host}:{proxy_obj.port} auto-deleted after 3 failures")
                 if client and client.is_connected():
                     await client.disconnect()
                 client = None

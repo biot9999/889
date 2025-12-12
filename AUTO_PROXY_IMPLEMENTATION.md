@@ -20,6 +20,36 @@
 
 ## 实现细节 (Implementation Details)
 
+### 0. 代理测试与自动删除 🆕
+
+**新需求**：测试代理可用性时，自动删除不可用的代理（而非仅禁用）
+
+**功能**：
+- 测试代理失败时立即删除该代理
+- 从所有使用该代理的账户中移除 `proxy_id`
+- 记录删除日志
+
+**实现**：
+```python
+# 测试失败或错误时
+logger.warning(f"❌ Proxy {proxy.host}:{proxy.port} failed test, deleting...")
+
+# 从账户移除代理引用
+db[Account.COLLECTION_NAME].update_many(
+    {'$or': [{'proxy_id': proxy_oid}, {'proxy_id': str(proxy_id)}]},
+    {'$set': {'proxy_id': None}}
+)
+
+# 删除代理
+db[Proxy.COLLECTION_NAME].delete_one({'_id': proxy_oid})
+logger.info(f"🗑️ Deleted unavailable proxy: {proxy.host}:{proxy.port}")
+```
+
+**自动删除触发条件**：
+1. **手动测试失败**：用户点击"测试"按钮，代理无法连接
+2. **自动使用失败**：账户连接时使用代理失败 >= 3次
+3. **超时**：代理连接超时 >= 3次
+
 ### 1. 新增函数：`get_next_available_proxy()`
 
 **功能**：从代理池中获取下一个可用代理
@@ -146,12 +176,22 @@ await client.connect()
 3. 活跃 → 使用该代理
 4. 不活跃 → 清除 `proxy_id`，重新获取
 
-### 场景 3：代理失败处理
+### 场景 3：代理失败处理（自动删除）🆕
 
 1. 代理连接失败 → `fail_count += 1`
 2. 检查 `fail_count >= 3`
-3. 是 → 设置 `is_active=False`（自动禁用）
-4. 记录日志：`❌ Proxy {host}:{port} auto-disabled after 3 failures`
+3. 是 → **删除代理**（不再是禁用）
+   - 从所有账户移除该 `proxy_id`
+   - 删除代理记录
+4. 记录日志：`🗑️ Proxy {host}:{port} auto-deleted after 3 failures`
+
+### 场景 3.1：手动测试失败（立即删除）🆕
+
+1. 用户点击"测试"按钮
+2. 代理连接失败或错误
+3. 立即删除代理（无需等待3次）
+4. 从所有账户移除该 `proxy_id`
+5. 返回消息："Connection failed - proxy deleted"
 
 ### 场景 4：无可用代理
 
@@ -167,6 +207,7 @@ await client.connect()
 - 无需手动分配
 - 无需管理员干预
 - 系统智能选择最佳代理
+- **自动清理失败代理** 🆕
 
 ### ✅ 负载均衡
 - 按使用次数分配（`success_count` 升序）
@@ -174,13 +215,18 @@ await client.connect()
 
 ### ✅ 容错机制
 - 超时自动退回本地
-- 失败自动禁用代理
+- **失败自动删除代理** 🆕
 - 不影响正常业务
 
 ### ✅ 透明性
 - 详细日志记录
 - 成功/失败计数
 - 便于监控和调试
+
+### ✅ 存储优化 🆕
+- 自动删除无效代理
+- 保持代理池清洁
+- 减少数据库空间占用
 
 ---
 
@@ -199,10 +245,16 @@ WARNING: ⏱️ Proxy connection timeout after 30s, falling back to local
 INFO: 🏠 Connecting locally (no proxy) for account +1234567890
 ```
 
-### 代理自动禁用
+### 代理自动删除（3次失败后）🆕
 ```
 WARNING: Proxy connection failed: TimeoutError
-WARNING: ❌ Proxy 192.168.1.1:1080 auto-disabled after 3 failures
+WARNING: 🗑️ Proxy 192.168.1.1:1080 auto-deleted after 3 failures
+```
+
+### 手动测试失败立即删除 🆕
+```
+WARNING: ❌ Proxy 192.168.1.1:1080 failed test, deleting...
+INFO: 🗑️ Deleted unavailable proxy: 192.168.1.1:1080
 ```
 
 ### 无可用代理
@@ -238,7 +290,8 @@ INFO: 🏠 Connecting locally (no proxy) for account +1234567890
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `connection_timeout` | 30秒 | 代理连接超时时间 |
-| `auto_disable_threshold` | 3次 | 自动禁用代理的失败次数 |
+| `auto_delete_threshold` | 3次 | 自动删除代理的失败次数 🆕 |
+| `manual_test_delete` | 立即 | 手动测试失败立即删除 🆕 |
 | `proxy_selection_strategy` | 最少使用 | 代理选择策略（按success_count升序） |
 
 ---
@@ -291,6 +344,10 @@ def assign_proxies_to_accounts(db):
 - ✅ 更可靠：超时和失败处理
 - ✅ 更简单：无需手动操作
 - ✅ 更灵活：动态调整和恢复
+- ✅ **更干净：自动删除失败代理** 🆕
 
-实现完全满足新需求：
-> "上传代理后，机器人登录账户之前需要提前获取代理，连接代理后，操作账户时必须连接代理，如果超时则退回本地"
+实现完全满足所有需求：
+1. ✅ "上传代理后，机器人登录账户之前需要提前获取代理"
+2. ✅ "连接代理后，操作账户时必须连接代理"
+3. ✅ "如果超时则退回本地"
+4. ✅ **"测试代理可用性时自动删除不可用的代理"** 🆕
