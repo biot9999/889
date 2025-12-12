@@ -1,95 +1,169 @@
 #!/usr/bin/env python3
 """
-数据库迁移脚本 - 添加新列到现有数据库
-Migration script to add new columns to existing database
+MongoDB 数据库迁移脚本 - 从 SQLite 迁移到 MongoDB
+Migration script from SQLite to MongoDB
+
+注意：本脚本用于将数据从旧的 SQLite 数据库迁移到 MongoDB
+Note: This script is used to migrate data from old SQLite database to MongoDB
+
+使用方法：
+1. 确保已安装 MongoDB 并正在运行
+2. 配置 .env 文件中的 MONGODB_URI 和 MONGODB_DATABASE
+3. 运行此脚本
+
+Usage:
+1. Ensure MongoDB is installed and running
+2. Configure MONGODB_URI and MONGODB_DATABASE in .env file
+3. Run this script
 """
 import os
 import sqlite3
 from dotenv import load_dotenv
+from pymongo import MongoClient
+from datetime import datetime
 
 # 加载环境变量
 load_dotenv()
 
-def migrate_database():
-    """迁移数据库，添加缺失的列"""
-    print("🔧 开始数据库迁移...")
+def migrate_sqlite_to_mongodb():
+    """从 SQLite 迁移数据到 MongoDB"""
+    print("🔧 开始从 SQLite 迁移到 MongoDB...")
     
-    # 获取数据库路径
-    database_url = os.getenv('DATABASE_URL', 'sqlite:///telegram_bot.db')
-    db_path = database_url.replace('sqlite:///', '')
+    # SQLite 数据库路径
+    sqlite_db = os.getenv('DATABASE_URL', 'sqlite:///telegram_bot.db').replace('sqlite:///', '')
     
-    if not os.path.exists(db_path):
-        print(f"❌ 数据库文件不存在: {db_path}")
-        print("💡 请先运行 python3 init_db.py 初始化数据库")
-        return
+    if not os.path.exists(sqlite_db):
+        print("❌ SQLite 数据库文件不存在")
+        print("💡 如果您是新安装，请直接使用 init_db.py 初始化 MongoDB")
+        return False
     
-    print(f"📊 数据库位置: {db_path}")
+    # MongoDB 配置
+    mongodb_uri = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
+    database_name = os.getenv('MONGODB_DATABASE', 'telegram_bot')
     
-    # 连接数据库
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+    print(f"📊 从 SQLite 迁移: {sqlite_db}")
+    print(f"📊 到 MongoDB: {mongodb_uri}/{database_name}")
     
     try:
-        # 检查 tasks 表是否存在
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'")
-        if not cursor.fetchone():
-            print("❌ tasks 表不存在，请先运行 init_db.py")
-            return
+        # 连接 SQLite
+        sqlite_conn = sqlite3.connect(sqlite_db)
+        sqlite_conn.row_factory = sqlite3.Row
+        sqlite_cursor = sqlite_conn.cursor()
         
-        # 获取现有列
-        cursor.execute("PRAGMA table_info(tasks)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
-        print(f"📋 现有列: {existing_columns}")
+        # 连接 MongoDB
+        mongo_client = MongoClient(mongodb_uri)
+        mongo_db = mongo_client[database_name]
         
-        # 需要添加的列
-        new_columns = [
-            ("send_method", "VARCHAR(50)"),
-            ("postbot_code", "TEXT"),
-            ("channel_link", "VARCHAR(500)")
-        ]
+        # 迁移 accounts
+        print("\n🔄 迁移 accounts...")
+        sqlite_cursor.execute("SELECT * FROM accounts")
+        accounts = sqlite_cursor.fetchall()
+        if accounts:
+            accounts_data = []
+            for row in accounts:
+                accounts_data.append({
+                    'phone': row['phone'],
+                    'session_name': row['session_name'],
+                    'status': row['status'],
+                    'api_id': row['api_id'],
+                    'api_hash': row['api_hash'],
+                    'messages_sent_today': row['messages_sent_today'],
+                    'total_messages_sent': row['total_messages_sent'],
+                    'last_used': datetime.fromisoformat(row['last_used']) if row['last_used'] else None,
+                    'daily_limit': row['daily_limit'],
+                    'created_at': datetime.fromisoformat(row['created_at']) if row['created_at'] else datetime.utcnow(),
+                    'updated_at': datetime.fromisoformat(row['updated_at']) if row['updated_at'] else datetime.utcnow()
+                })
+            mongo_db.accounts.insert_many(accounts_data)
+            print(f"✅ 迁移 {len(accounts)} 个账户")
         
-        # 添加缺失的列
-        added_count = 0
-        for col_name, col_type in new_columns:
-            if col_name not in existing_columns:
-                try:
-                    cursor.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_type}")
-                    print(f"✅ 已添加列: {col_name}")
-                    added_count += 1
-                except sqlite3.OperationalError as e:
-                    print(f"⚠️  添加列 {col_name} 时出错: {e}")
-            else:
-                print(f"ℹ️  列已存在: {col_name}")
+        # 迁移 tasks
+        print("\n🔄 迁移 tasks...")
+        sqlite_cursor.execute("SELECT * FROM tasks")
+        tasks = sqlite_cursor.fetchall()
+        if tasks:
+            tasks_data = []
+            for row in tasks:
+                tasks_data.append({
+                    'name': row['name'],
+                    'status': row['status'],
+                    'message_text': row['message_text'],
+                    'message_format': row['message_format'],
+                    'media_type': row['media_type'],
+                    'media_path': row['media_path'],
+                    'send_method': row.get('send_method', 'direct'),
+                    'postbot_code': row.get('postbot_code'),
+                    'channel_link': row.get('channel_link'),
+                    'min_interval': row['min_interval'],
+                    'max_interval': row['max_interval'],
+                    'account_id': str(row['account_id']) if row['account_id'] else None,
+                    'total_targets': row['total_targets'],
+                    'sent_count': row['sent_count'],
+                    'failed_count': row['failed_count'],
+                    'created_at': datetime.fromisoformat(row['created_at']) if row['created_at'] else datetime.utcnow(),
+                    'started_at': datetime.fromisoformat(row['started_at']) if row['started_at'] else None,
+                    'completed_at': datetime.fromisoformat(row['completed_at']) if row['completed_at'] else None,
+                    'updated_at': datetime.fromisoformat(row['updated_at']) if row['updated_at'] else datetime.utcnow()
+                })
+            mongo_db.tasks.insert_many(tasks_data)
+            print(f"✅ 迁移 {len(tasks)} 个任务")
         
-        # 设置默认值 - 为所有 NULL 的 send_method 设置默认值
-        if 'send_method' in existing_columns or added_count > 0:
-            try:
-                cursor.execute("UPDATE tasks SET send_method = 'direct' WHERE send_method IS NULL")
-                updated_count = cursor.rowcount
-                if updated_count > 0:
-                    print(f"✅ 已为 {updated_count} 个任务设置默认发送方式")
-            except sqlite3.OperationalError as e:
-                print(f"⚠️  设置默认值时出错: {e}")
+        # 迁移 targets  
+        print("\n🔄 迁移 targets...")
+        sqlite_cursor.execute("SELECT * FROM targets")
+        targets = sqlite_cursor.fetchall()
+        if targets:
+            targets_data = []
+            for row in targets:
+                targets_data.append({
+                    'task_id': str(row['task_id']),
+                    'username': row['username'],
+                    'user_id': row['user_id'],
+                    'first_name': row['first_name'],
+                    'last_name': row['last_name'],
+                    'is_sent': bool(row['is_sent']),
+                    'is_valid': bool(row['is_valid']),
+                    'error_message': row['error_message'],
+                    'created_at': datetime.fromisoformat(row['created_at']) if row['created_at'] else datetime.utcnow(),
+                    'sent_at': datetime.fromisoformat(row['sent_at']) if row['sent_at'] else None
+                })
+            mongo_db.targets.insert_many(targets_data)
+            print(f"✅ 迁移 {len(targets)} 个目标")
         
-        # 提交更改
-        conn.commit()
+        # 迁移 message_logs
+        print("\n🔄 迁移 message_logs...")
+        sqlite_cursor.execute("SELECT * FROM message_logs")
+        logs = sqlite_cursor.fetchall()
+        if logs:
+            logs_data = []
+            for row in logs:
+                logs_data.append({
+                    'task_id': str(row['task_id']),
+                    'account_id': str(row['account_id']),
+                    'target_id': str(row['target_id']),
+                    'message_text': row['message_text'],
+                    'success': bool(row['success']),
+                    'error_message': row['error_message'],
+                    'sent_at': datetime.fromisoformat(row['sent_at']) if row['sent_at'] else datetime.utcnow()
+                })
+            mongo_db.message_logs.insert_many(logs_data)
+            print(f"✅ 迁移 {len(logs)} 条消息日志")
         
-        if added_count > 0:
-            print(f"\n✅ 迁移完成！成功添加 {added_count} 个新列")
-        else:
-            print("\n✅ 数据库已是最新版本，无需迁移")
+        sqlite_conn.close()
         
-        # 验证
-        cursor.execute("PRAGMA table_info(tasks)")
-        all_columns = [row[1] for row in cursor.fetchall()]
-        print(f"\n📋 迁移后的列: {', '.join(all_columns)}")
+        print("\n✅ 数据迁移完成！")
+        print("💡 建议：验证数据后，可以备份并删除旧的 SQLite 数据库文件")
+        
+        return True
         
     except Exception as e:
         print(f"❌ 迁移失败: {e}")
-        conn.rollback()
-    finally:
-        conn.close()
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 if __name__ == '__main__':
-    migrate_database()
+    success = migrate_sqlite_to_mongodb()
+    exit(0 if success else 1)
+

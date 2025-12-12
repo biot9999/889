@@ -542,8 +542,9 @@ class MessageFormatter:
 class AccountManager:
     """Manage Telegram accounts"""
     
-    def __init__(self, db_session):
-        self.db_session = db_session
+    def __init__(self, db):
+        self.db = db
+        self.accounts_col = db[Account.COLLECTION_NAME]
         self.clients = {}
     
     async def send_code_request(self, phone, api_id=None, api_hash=None):
@@ -589,11 +590,11 @@ class AccountManager:
             session_name=session_name,
             api_id=Config.API_ID,
             api_hash=Config.API_HASH,
-            status=AccountStatus.ACTIVE
+            status=AccountStatus.ACTIVE.value
         )
-        self.db_session.add(account)
-        self.db_session.commit()
-        self.clients[account.id] = client
+        result = self.accounts_col.insert_one(account.to_dict())
+        account._id = result.inserted_id
+        self.clients[str(account._id)] = client
         
         return {'status': 'success', 'account': account, 'user': me}
     
@@ -664,10 +665,10 @@ class AccountManager:
                 session_name=session_name,
                 api_id=str(api_id),
                 api_hash=api_hash,
-                status=AccountStatus.ACTIVE
+                status=AccountStatus.ACTIVE.value
             )
-            self.db_session.add(account)
-            self.db_session.commit()
+            result = self.accounts_col.insert_one(account.to_dict())
+            account._id = result.inserted_id
             logger.info(f"Account saved to database: {phone}")
             
             await client.disconnect()
@@ -681,24 +682,28 @@ class AccountManager:
     
     async def get_client(self, account_id):
         """Get client for account"""
-        if account_id in self.clients and self.clients[account_id].is_connected():
-            return self.clients[account_id]
+        account_id_str = str(account_id)
+        if account_id_str in self.clients and self.clients[account_id_str].is_connected():
+            return self.clients[account_id_str]
         
-        account = self.db_session.query(Account).filter_by(id=account_id).first()
-        if not account:
+        account_doc = self.accounts_col.find_one({'_id': ObjectId(account_id)})
+        if not account_doc:
             raise ValueError(f"Account {account_id} not found")
         
+        account = Account.from_dict(account_doc)
         session_path = os.path.join(Config.SESSIONS_DIR, account.session_name)
         proxy = Config.get_proxy_dict()
         client = TelegramClient(session_path, int(account.api_id), account.api_hash, proxy=proxy)
         
         await client.connect()
         if not await client.is_user_authorized():
-            account.status = AccountStatus.INACTIVE
-            self.db_session.commit()
+            self.accounts_col.update_one(
+                {'_id': ObjectId(account_id)},
+                {'$set': {'status': AccountStatus.INACTIVE.value, 'updated_at': datetime.utcnow()}}
+            )
             raise ValueError(f"Account {account_id} not authorized")
         
-        self.clients[account_id] = client
+        self.clients[account_id_str] = client
         return client
     
     async def check_account_status(self, account_id):
@@ -706,21 +711,23 @@ class AccountManager:
         try:
             client = await self.get_client(account_id)
             await client.get_me()
-            account = self.db_session.query(Account).filter_by(id=account_id).first()
-            account.status = AccountStatus.ACTIVE
-            self.db_session.commit()
+            self.accounts_col.update_one(
+                {'_id': ObjectId(account_id)},
+                {'$set': {'status': AccountStatus.ACTIVE.value, 'updated_at': datetime.utcnow()}}
+            )
             return True
         except Exception as e:
             logger.error(f"Error checking account: {e}")
-            account = self.db_session.query(Account).filter_by(id=account_id).first()
-            if account:
-                account.status = AccountStatus.INACTIVE
-                self.db_session.commit()
+            self.accounts_col.update_one(
+                {'_id': ObjectId(account_id)},
+                {'$set': {'status': AccountStatus.INACTIVE.value, 'updated_at': datetime.utcnow()}}
+            )
             return False
     
     def get_active_accounts(self):
         """Get active accounts"""
-        return self.db_session.query(Account).filter_by(status=AccountStatus.ACTIVE).all()
+        docs = self.accounts_col.find({'status': AccountStatus.ACTIVE.value})
+        return [Account.from_dict(doc) for doc in docs]
     
     async def disconnect_all(self):
         """Disconnect all clients"""
@@ -736,8 +743,11 @@ class AccountManager:
 class TaskManager:
     """Manage tasks"""
     
-    def __init__(self, db_session, account_manager):
-        self.db_session = db_session
+    def __init__(self, db, account_manager):
+        self.db = db
+        self.tasks_col = db[Task.COLLECTION_NAME]
+        self.targets_col = db[Target.COLLECTION_NAME]
+        self.logs_col = db[MessageLog.COLLECTION_NAME]
         self.account_manager = account_manager
         self.running_tasks = {}
         self.stop_flags = {}
@@ -749,24 +759,24 @@ class TaskManager:
         task = Task(
             name=name,
             message_text=message_text,
-            message_format=message_format,
-            media_type=media_type,
+            message_format=message_format.value if isinstance(message_format, enum.Enum) else message_format,
+            media_type=media_type.value if isinstance(media_type, enum.Enum) else media_type,
             media_path=media_path,
-            send_method=send_method,
+            send_method=send_method.value if isinstance(send_method, enum.Enum) else send_method,
             postbot_code=postbot_code,
             channel_link=channel_link,
             min_interval=min_interval,
             max_interval=max_interval,
-            status=TaskStatus.PENDING
+            status=TaskStatus.PENDING.value
         )
-        self.db_session.add(task)
-        self.db_session.commit()
+        result = self.tasks_col.insert_one(task.to_dict())
+        task._id = result.inserted_id
         return task
     
     def add_targets(self, task_id, target_list):
         """Add targets to task"""
-        task = self.db_session.query(Task).filter_by(id=task_id).first()
-        if not task:
+        task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+        if not task_doc:
             raise ValueError(f"Task {task_id} not found")
         
         unique_targets = set()
@@ -779,14 +789,16 @@ class TaskManager:
         added_count = 0
         for target_str in unique_targets:
             if target_str.isdigit():
-                target = Target(task_id=task_id, user_id=target_str)
+                target = Target(task_id=str(task_id), user_id=target_str)
             else:
-                target = Target(task_id=task_id, username=target_str)
-            self.db_session.add(target)
+                target = Target(task_id=str(task_id), username=target_str)
+            self.targets_col.insert_one(target.to_dict())
             added_count += 1
         
-        task.total_targets = added_count
-        self.db_session.commit()
+        self.tasks_col.update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {'total_targets': added_count, 'updated_at': datetime.utcnow()}}
+        )
         return added_count
     
     def parse_target_file(self, file_content):
@@ -801,58 +813,75 @@ class TaskManager:
     
     async def start_task(self, task_id):
         """Start task"""
-        task = self.db_session.query(Task).filter_by(id=task_id).first()
-        if not task:
+        task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+        if not task_doc:
             raise ValueError(f"Task {task_id} not found")
-        if task.status == TaskStatus.RUNNING:
+        
+        task = Task.from_dict(task_doc)
+        if task.status == TaskStatus.RUNNING.value:
             raise ValueError("Task already running")
         
-        task.status = TaskStatus.RUNNING
-        task.started_at = datetime.utcnow()
-        self.db_session.commit()
+        self.tasks_col.update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {
+                'status': TaskStatus.RUNNING.value,
+                'started_at': datetime.utcnow(),
+                'updated_at': datetime.utcnow()
+            }}
+        )
         
-        self.stop_flags[task_id] = False
-        asyncio_task = asyncio.create_task(self._execute_task(task_id))
-        self.running_tasks[task_id] = asyncio_task
+        self.stop_flags[str(task_id)] = False
+        asyncio_task = asyncio.create_task(self._execute_task(str(task_id)))
+        self.running_tasks[str(task_id)] = asyncio_task
         return asyncio_task
     
     async def stop_task(self, task_id):
         """Stop task"""
-        if task_id not in self.running_tasks:
+        task_id_str = str(task_id)
+        if task_id_str not in self.running_tasks:
             raise ValueError("Task not running")
         
-        self.stop_flags[task_id] = True
-        asyncio_task = self.running_tasks[task_id]
+        self.stop_flags[task_id_str] = True
+        asyncio_task = self.running_tasks[task_id_str]
         try:
             await asyncio.wait_for(asyncio_task, timeout=10.0)
         except asyncio.TimeoutError:
             asyncio_task.cancel()
         
-        task = self.db_session.query(Task).filter_by(id=task_id).first()
-        if task:
-            task.status = TaskStatus.PAUSED
-            self.db_session.commit()
+        self.tasks_col.update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {'status': TaskStatus.PAUSED.value, 'updated_at': datetime.utcnow()}}
+        )
         
-        del self.running_tasks[task_id]
-        del self.stop_flags[task_id]
+        del self.running_tasks[task_id_str]
+        del self.stop_flags[task_id_str]
     
     async def _execute_task(self, task_id):
         """Execute task"""
-        task = self.db_session.query(Task).filter_by(id=task_id).first()
+        task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+        task = Task.from_dict(task_doc)
         logger.info(f"Starting task execution: Task ID={task_id}, Name={task.name}")
         
         try:
-            targets = self.db_session.query(Target).filter_by(
-                task_id=task_id, is_sent=False, is_valid=True
-            ).all()
+            target_docs = self.targets_col.find({
+                'task_id': task_id,
+                'is_sent': False,
+                'is_valid': True
+            })
+            targets = [Target.from_dict(doc) for doc in target_docs]
             
             logger.info(f"Task {task_id}: Found {len(targets)} targets to process")
             
             if not targets:
                 logger.info(f"Task {task_id}: No targets to process, marking as completed")
-                task.status = TaskStatus.COMPLETED
-                task.completed_at = datetime.utcnow()
-                self.db_session.commit()
+                self.tasks_col.update_one(
+                    {'_id': ObjectId(task_id)},
+                    {'$set': {
+                        'status': TaskStatus.COMPLETED.value,
+                        'completed_at': datetime.utcnow(),
+                        'updated_at': datetime.utcnow()
+                    }}
+                )
                 return
             
             accounts = self.account_manager.get_active_accounts()
@@ -879,35 +908,66 @@ class TaskManager:
                 
                 if account.last_used and account.last_used.date() < datetime.utcnow().date():
                     logger.info(f"Task {task_id}: Resetting daily counter for account {account.phone}")
+                    self.db[Account.COLLECTION_NAME].update_one(
+                        {'_id': account._id},
+                        {'$set': {'messages_sent_today': 0, 'updated_at': datetime.utcnow()}}
+                    )
                     account.messages_sent_today = 0
                 
                 success = await self._send_message(task, target, account)
                 
                 if success:
-                    task.sent_count += 1
-                    account.messages_sent_today += 1
-                    account.total_messages_sent += 1
+                    self.tasks_col.update_one(
+                        {'_id': ObjectId(task_id)},
+                        {'$inc': {'sent_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                    )
+                    self.db[Account.COLLECTION_NAME].update_one(
+                        {'_id': account._id},
+                        {
+                            '$inc': {'messages_sent_today': 1, 'total_messages_sent': 1},
+                            '$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}
+                        }
+                    )
                     logger.info(f"Task {task_id}: Message sent successfully to {target.username or target.user_id}")
                 else:
-                    task.failed_count += 1
+                    self.tasks_col.update_one(
+                        {'_id': ObjectId(task_id)},
+                        {'$inc': {'failed_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                    )
                     logger.warning(f"Task {task_id}: Failed to send message to {target.username or target.user_id}")
                 
-                account.last_used = datetime.utcnow()
-                self.db_session.commit()
+                self.db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}}
+                )
+                
+                # Refresh task data
+                task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+                task = Task.from_dict(task_doc)
                 
                 delay = random.randint(task.min_interval, task.max_interval)
                 logger.info(f"Task {task_id}: Waiting {delay} seconds before next message... ({task.sent_count}/{task.total_targets} sent)")
                 await asyncio.sleep(delay)
             
+            # Get final task state
+            task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+            task = Task.from_dict(task_doc)
             logger.info(f"Task {task_id}: Execution completed - Sent: {task.sent_count}, Failed: {task.failed_count}")
-            task.status = TaskStatus.COMPLETED
-            task.completed_at = datetime.utcnow()
-            self.db_session.commit()
+            self.tasks_col.update_one(
+                {'_id': ObjectId(task_id)},
+                {'$set': {
+                    'status': TaskStatus.COMPLETED.value,
+                    'completed_at': datetime.utcnow(),
+                    'updated_at': datetime.utcnow()
+                }}
+            )
             
         except Exception as e:
             logger.error(f"Task {task_id} error: {e}", exc_info=True)
-            task.status = TaskStatus.FAILED
-            self.db_session.commit()
+            self.tasks_col.update_one(
+                {'_id': ObjectId(task_id)},
+                {'$set': {'status': TaskStatus.FAILED.value, 'updated_at': datetime.utcnow()}}
+            )
         finally:
             if task_id in self.running_tasks:
                 del self.running_tasks[task_id]
@@ -918,7 +978,7 @@ class TaskManager:
     async def _send_message(self, task, target, account):
         """Send message"""
         try:
-            client = await self.account_manager.get_client(account.id)
+            client = await self.account_manager.get_client(str(account._id))
             
             recipient = int(target.user_id) if target.user_id else target.username
             
@@ -926,61 +986,76 @@ class TaskManager:
                 entity = await client.get_entity(recipient)
             except Exception as e:
                 logger.error(f"Failed to get entity {recipient}: {e}")
-                target.is_valid = False
-                target.error_message = str(e)
-                self.db_session.commit()
-                self._log_message(task.id, account.id, target.id, task.message_text, False, str(e))
+                self.targets_col.update_one(
+                    {'_id': target._id},
+                    {'$set': {'is_valid': False, 'error_message': str(e)}}
+                )
+                self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, str(e))
                 return False
             
             user_info = MessageFormatter.extract_user_info(entity)
-            target.first_name = user_info.get('first_name', '')
-            target.last_name = user_info.get('last_name', '')
+            self.targets_col.update_one(
+                {'_id': target._id},
+                {'$set': {
+                    'first_name': user_info.get('first_name', ''),
+                    'last_name': user_info.get('last_name', '')
+                }}
+            )
             
             personalized = MessageFormatter.personalize(task.message_text, user_info)
             parse_mode = MessageFormatter.get_parse_mode(task.message_format)
             
-            if task.media_type == MediaType.TEXT:
+            if task.media_type == MediaType.TEXT.value:
                 await client.send_message(entity, personalized, parse_mode=parse_mode)
-            elif task.media_type in [MediaType.IMAGE, MediaType.VIDEO, MediaType.DOCUMENT]:
+            elif task.media_type in [MediaType.IMAGE.value, MediaType.VIDEO.value, MediaType.DOCUMENT.value]:
                 await client.send_file(entity, task.media_path, caption=personalized, parse_mode=parse_mode)
-            elif task.media_type == MediaType.VOICE:
+            elif task.media_type == MediaType.VOICE.value:
                 await client.send_file(entity, task.media_path, voice_note=True, caption=personalized, parse_mode=parse_mode)
             
-            target.is_sent = True
-            target.sent_at = datetime.utcnow()
-            self.db_session.commit()
+            self.targets_col.update_one(
+                {'_id': target._id},
+                {'$set': {'is_sent': True, 'sent_at': datetime.utcnow()}}
+            )
             
-            self._log_message(task.id, account.id, target.id, personalized, True, None)
+            self._log_message(str(task._id), str(account._id), str(target._id), personalized, True, None)
             logger.info(f"Message sent to {recipient}")
             return True
             
         except (UserPrivacyRestrictedError, UserIsBlockedError, ChatWriteForbiddenError, UserNotMutualContactError) as e:
             error_msg = f"Privacy error: {type(e).__name__}"
-            target.error_message = error_msg
-            self.db_session.commit()
-            self._log_message(task.id, account.id, target.id, task.message_text, False, error_msg)
+            self.targets_col.update_one(
+                {'_id': target._id},
+                {'$set': {'error_message': error_msg}}
+            )
+            self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, error_msg)
             return False
             
         except FloodWaitError as e:
             error_msg = f"FloodWait: {e.seconds}s"
-            account.status = AccountStatus.LIMITED
-            self.db_session.commit()
-            self._log_message(task.id, account.id, target.id, task.message_text, False, error_msg)
+            self.db[Account.COLLECTION_NAME].update_one(
+                {'_id': account._id},
+                {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.utcnow()}}
+            )
+            self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, error_msg)
             await asyncio.sleep(e.seconds)
             return False
             
         except PeerFloodError:
             error_msg = "PeerFlood"
-            account.status = AccountStatus.LIMITED
-            self.db_session.commit()
-            self._log_message(task.id, account.id, target.id, task.message_text, False, error_msg)
+            self.db[Account.COLLECTION_NAME].update_one(
+                {'_id': account._id},
+                {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.utcnow()}}
+            )
+            self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, error_msg)
             return False
             
         except Exception as e:
             error_msg = str(e)
-            target.error_message = error_msg
-            self.db_session.commit()
-            self._log_message(task.id, account.id, target.id, task.message_text, False, error_msg)
+            self.targets_col.update_one(
+                {'_id': target._id},
+                {'$set': {'error_message': error_msg}}
+            )
+            self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, error_msg)
             return False
     
     def _log_message(self, task_id, account_id, target_id, message_text, success, error_message):
@@ -993,19 +1068,19 @@ class TaskManager:
             success=success,
             error_message=error_message
         )
-        self.db_session.add(log)
-        self.db_session.commit()
+        self.logs_col.insert_one(log.to_dict())
     
     def get_task_progress(self, task_id):
         """Get task progress"""
-        task = self.db_session.query(Task).filter_by(id=task_id).first()
-        if not task:
+        task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+        if not task_doc:
             return None
         
+        task = Task.from_dict(task_doc)
         return {
-            'task_id': task.id,
+            'task_id': str(task._id),
             'name': task.name,
-            'status': task.status.value,
+            'status': task.status,
             'total_targets': task.total_targets,
             'sent_count': task.sent_count,
             'failed_count': task.failed_count,
@@ -1015,13 +1090,22 @@ class TaskManager:
     
     def export_task_results(self, task_id):
         """Export results"""
-        task = self.db_session.query(Task).filter_by(id=task_id).first()
-        if not task:
+        task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+        if not task_doc:
             return None
         
-        success_targets = self.db_session.query(Target).filter_by(task_id=task_id, is_sent=True).all()
-        failed_targets = self.db_session.query(Target).filter_by(task_id=task_id, is_sent=False).filter(Target.error_message.isnot(None)).all()
-        logs = self.db_session.query(MessageLog).filter_by(task_id=task_id).all()
+        success_docs = self.targets_col.find({'task_id': task_id, 'is_sent': True})
+        success_targets = [Target.from_dict(doc) for doc in success_docs]
+        
+        failed_docs = self.targets_col.find({
+            'task_id': task_id,
+            'is_sent': False,
+            'error_message': {'$ne': None}
+        })
+        failed_targets = [Target.from_dict(doc) for doc in failed_docs]
+        
+        log_docs = self.logs_col.find({'task_id': task_id})
+        logs = [MessageLog.from_dict(doc) for doc in log_docs]
         
         return {
             'success_targets': success_targets,
@@ -1043,7 +1127,7 @@ class TaskManager:
 # Global managers
 account_manager = None
 task_manager = None
-db_session = None
+db = None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1407,7 +1491,8 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def list_accounts(query):
     """List accounts"""
-    accounts = db_session.query(Account).all()
+    account_docs = db[Account.COLLECTION_NAME].find()
+    accounts = [Account.from_dict(doc) for doc in account_docs]
     
     if not accounts:
         text = "📱 <b>账户列表</b>\n\n暂无账户"
@@ -1420,13 +1505,13 @@ async def list_accounts(query):
         keyboard = []
         
         for account in accounts:
-            status_emoji = {'active': '✅', 'banned': '🚫', 'limited': '⚠️', 'inactive': '❌'}.get(account.status.value, '❓')
+            status_emoji = {'active': '✅', 'banned': '🚫', 'limited': '⚠️', 'inactive': '❌'}.get(account.status, '❓')
             text += (
                 f"{status_emoji} <b>{account.phone}</b>\n"
-                f"   状态: {account.status.value}\n"
+                f"   状态: {account.status}\n"
                 f"   今日: {account.messages_sent_today}/{account.daily_limit}\n\n"
             )
-            keyboard.append([InlineKeyboardButton(f"检查 {account.phone}", callback_data=f'account_check_{account.id}')])
+            keyboard.append([InlineKeyboardButton(f"检查 {account.phone}", callback_data=f'account_check_{str(account._id)}')])
         
         keyboard.append([InlineKeyboardButton("🔙 返回", callback_data='menu_accounts')])
     
@@ -1457,7 +1542,8 @@ async def show_tasks_menu(query):
 
 async def list_tasks(query):
     """List tasks"""
-    tasks = db_session.query(Task).all()
+    task_docs = db[Task.COLLECTION_NAME].find()
+    tasks = [Task.from_dict(doc) for doc in task_docs]
     
     if not tasks:
         text = "📝 <b>任务列表</b>\n\n暂无任务"
@@ -1470,7 +1556,7 @@ async def list_tasks(query):
         keyboard = []
         
         for task in tasks:
-            status_emoji = {'pending': '⏳', 'running': '▶️', 'paused': '⏸️', 'completed': '✅', 'failed': '❌'}.get(task.status.value, '❓')
+            status_emoji = {'pending': '⏳', 'running': '▶️', 'paused': '⏸️', 'completed': '✅', 'failed': '❌'}.get(task.status, '❓')
             progress = (task.sent_count / task.total_targets * 100) if task.total_targets > 0 else 0
             
             text += (
@@ -1479,13 +1565,13 @@ async def list_tasks(query):
             )
             
             buttons = []
-            if task.status in [TaskStatus.PENDING, TaskStatus.PAUSED]:
-                buttons.append(InlineKeyboardButton("▶️ 开始", callback_data=f'task_start_{task.id}'))
-            elif task.status == TaskStatus.RUNNING:
-                buttons.append(InlineKeyboardButton("⏸️ 停止", callback_data=f'task_stop_{task.id}'))
-            buttons.append(InlineKeyboardButton("📊 进度", callback_data=f'task_progress_{task.id}'))
-            if task.status == TaskStatus.COMPLETED:
-                buttons.append(InlineKeyboardButton("📥 导出", callback_data=f'task_export_{task.id}'))
+            if task.status in [TaskStatus.PENDING.value, TaskStatus.PAUSED.value]:
+                buttons.append(InlineKeyboardButton("▶️ 开始", callback_data=f'task_start_{str(task._id)}'))
+            elif task.status == TaskStatus.RUNNING.value:
+                buttons.append(InlineKeyboardButton("⏸️ 停止", callback_data=f'task_stop_{str(task._id)}'))
+            buttons.append(InlineKeyboardButton("📊 进度", callback_data=f'task_progress_{str(task._id)}'))
+            if task.status == TaskStatus.COMPLETED.value:
+                buttons.append(InlineKeyboardButton("📥 导出", callback_data=f'task_export_{str(task._id)}'))
             keyboard.append(buttons)
         
         keyboard.append([InlineKeyboardButton("🔙 返回", callback_data='menu_tasks')])
@@ -1943,12 +2029,12 @@ async def show_config(query):
 
 async def show_stats(query):
     """Show stats"""
-    total_accounts = db_session.query(Account).count()
-    active_accounts = db_session.query(Account).filter_by(status=AccountStatus.ACTIVE).count()
-    total_tasks = db_session.query(Task).count()
-    completed_tasks = db_session.query(Task).filter_by(status=TaskStatus.COMPLETED).count()
-    total_msgs = db_session.query(MessageLog).count()
-    success_msgs = db_session.query(MessageLog).filter_by(success=True).count()
+    total_accounts = db[Account.COLLECTION_NAME].count_documents({})
+    active_accounts = db[Account.COLLECTION_NAME].count_documents({'status': AccountStatus.ACTIVE.value})
+    total_tasks = db[Task.COLLECTION_NAME].count_documents({})
+    completed_tasks = db[Task.COLLECTION_NAME].count_documents({'status': TaskStatus.COMPLETED.value})
+    total_msgs = db[MessageLog.COLLECTION_NAME].count_documents({})
+    success_msgs = db[MessageLog.COLLECTION_NAME].count_documents({'success': True})
     
     text = (
         "📊 <b>统计信息</b>\n\n"
@@ -1998,7 +2084,7 @@ async def back_to_main(query):
 # ============================================================================
 def main():
     """Main function"""
-    global account_manager, task_manager, db_session
+    global account_manager, task_manager, db
     
     logger.info("=" * 80)
     logger.info("Starting Telegram Bot")
@@ -2016,17 +2102,16 @@ def main():
         logger.error(f"Config error: {e}")
         return
     
-    logger.info(f"Initializing database: {Config.DATABASE_URL}")
-    engine = init_db(Config.DATABASE_URL)
-    db_session = get_session(engine)
+    logger.info(f"Initializing database: {Config.MONGODB_URI}")
+    db = init_db(Config.MONGODB_URI, Config.MONGODB_DATABASE)
     logger.info("Database initialized successfully")
     
     logger.info("Initializing account manager...")
-    account_manager = AccountManager(db_session)
+    account_manager = AccountManager(db)
     logger.info("Account manager initialized")
     
     logger.info("Initializing task manager...")
-    task_manager = TaskManager(db_session, account_manager)
+    task_manager = TaskManager(db, account_manager)
     logger.info("Task manager initialized")
     
     logger.info("Building bot application...")
