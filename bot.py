@@ -1916,6 +1916,90 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'accounts_add_session':
         logger.info(f"User {user_id} selecting session upload option")
         await show_upload_type_menu(query)
+    elif data == 'accounts_check_status':
+        logger.info(f"User {user_id} checking all accounts status")
+        await query.answer("🔍 正在检查账户状态，请稍候...", show_alert=False)
+        await query.message.reply_text("⏳ 正在调用 @spambot 检查所有账户...\n这可能需要几分钟时间。")
+        
+        try:
+            status_results = await check_all_accounts_status()
+            
+            text = (
+                f"✅ <b>账户状态检查完成！</b>\n\n"
+                f"📊 <b>统计结果：</b>\n"
+                f"✅ 无限制账号：{len(status_results['unlimited'])} 个\n"
+                f"⚠️ 双向限制账号：{len(status_results['limited'])} 个\n"
+                f"❄️ 冻结账号：{len(status_results['restricted'])} 个\n"
+                f"🚫 封禁账号：{len(status_results['banned'])} 个\n\n"
+                f"使用下方按钮导出账户文件："
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("📥 全部账户提取", callback_data='accounts_export_all')],
+                [InlineKeyboardButton("⚠️ 受限账户提取", callback_data='accounts_export_limited')],
+                [InlineKeyboardButton("🔙 返回", callback_data='menu_accounts')]
+            ]
+            
+            await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"Error checking accounts status: {e}", exc_info=True)
+            await query.message.reply_text(f"❌ 检查失败：{str(e)}")
+    
+    elif data == 'accounts_export_all':
+        logger.info(f"User {user_id} exporting all accounts")
+        await query.answer("📥 正在导出所有账户...", show_alert=False)
+        
+        try:
+            all_accounts = list(db[Account.COLLECTION_NAME].find())
+            account_ids = [str(acc['_id']) for acc in all_accounts]
+            
+            if not account_ids:
+                await query.answer("❌ 没有账户可导出", show_alert=True)
+                return
+            
+            zip_path = await export_accounts(account_ids, 'all')
+            
+            with open(zip_path, 'rb') as f:
+                await query.message.reply_document(
+                    document=f,
+                    filename=os.path.basename(zip_path),
+                    caption=f"📥 <b>所有账户导出</b>\n\n共 {len(account_ids)} 个账户",
+                    parse_mode='HTML'
+                )
+            
+            os.remove(zip_path)
+        except Exception as e:
+            logger.error(f"Error exporting all accounts: {e}", exc_info=True)
+            await query.answer(f"❌ 导出失败：{str(e)}", show_alert=True)
+    
+    elif data == 'accounts_export_limited':
+        logger.info(f"User {user_id} exporting limited accounts")
+        await query.answer("⚠️ 正在导出受限账户...", show_alert=False)
+        
+        try:
+            limited_accounts = list(db[Account.COLLECTION_NAME].find({
+                'status': {'$in': [AccountStatus.LIMITED.value, AccountStatus.BANNED.value, AccountStatus.INACTIVE.value]}
+            }))
+            account_ids = [str(acc['_id']) for acc in limited_accounts]
+            
+            if not account_ids:
+                await query.answer("✅ 没有受限账户", show_alert=True)
+                return
+            
+            zip_path = await export_accounts(account_ids, 'limited')
+            
+            with open(zip_path, 'rb') as f:
+                await query.message.reply_document(
+                    document=f,
+                    filename=os.path.basename(zip_path),
+                    caption=f"⚠️ <b>受限账户导出</b>\n\n共 {len(account_ids)} 个账户",
+                    parse_mode='HTML'
+                )
+            
+            os.remove(zip_path)
+        except Exception as e:
+            logger.error(f"Error exporting limited accounts: {e}", exc_info=True)
+            await query.answer(f"❌ 导出失败：{str(e)}", show_alert=True)
     # Note: upload_session_file and upload_tdata_file are handled by ConversationHandler
     elif data.startswith('account_check_'):
         account_id = data.split('_')[2]
@@ -2051,14 +2135,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_accounts_menu(query):
-    """Show accounts menu"""
+    """Show enhanced accounts menu with statistics"""
+    # 统计账户数量
+    total_accounts = db[Account.COLLECTION_NAME].count_documents({})
+    active_accounts = db[Account.COLLECTION_NAME].count_documents({'status': AccountStatus.ACTIVE.value})
+    
     keyboard = [
-        [InlineKeyboardButton("📋 查看账户列表", callback_data='accounts_list')],
-        [InlineKeyboardButton("➕ 添加账户", callback_data='accounts_add')],
+        [InlineKeyboardButton("📋 账号列表", callback_data='accounts_list')],
+        [InlineKeyboardButton("➕ 添加账号", callback_data='accounts_add')],
+        [InlineKeyboardButton("🔍 检查账户状态", callback_data='accounts_check_status')],
         [InlineKeyboardButton("🔙 返回主菜单", callback_data='back_main')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    text = "📱 <b>账户管理</b>\n\n请选择操作："
+    
+    text = (
+        f"📱 <b>账户管理</b>\n\n"
+        f"当前状态：可用 {active_accounts}/{total_accounts} 个账号\n\n"
+        f"请选择操作："
+    )
+    
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
 
 
@@ -2226,6 +2321,103 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode='HTML'
         )
         return current_state
+
+
+async def check_all_accounts_status():
+    """Check all accounts using @spambot"""
+    accounts = list(db[Account.COLLECTION_NAME].find())
+    
+    status_results = {
+        'unlimited': [],      # 无限制
+        'limited': [],        # 双向限制
+        'restricted': [],     # 受限/冻结
+        'banned': []          # 封禁
+    }
+    
+    for account_doc in accounts:
+        account = Account.from_dict(account_doc)
+        try:
+            client = await account_manager.get_client(str(account._id))
+            
+            # 向 @spambot 发送消息
+            spambot = await client.get_entity('spambot')
+            await client.send_message(spambot, '/start')
+            await asyncio.sleep(2)
+            
+            # 获取 @spambot 的回复
+            messages = await client.get_messages(spambot, limit=1)
+            if messages:
+                response = messages[0].text.lower()
+                
+                # 解析状态
+                if 'good news' in response or 'no limits' in response:
+                    status_results['unlimited'].append(account)
+                    new_status = AccountStatus.ACTIVE.value
+                elif 'you can only' in response or 'peer flood' in response:
+                    status_results['limited'].append(account)
+                    new_status = AccountStatus.LIMITED.value
+                elif 'account is limited' in response or 'restricted' in response:
+                    status_results['restricted'].append(account)
+                    new_status = AccountStatus.LIMITED.value
+                elif 'banned' in response or 'spam' in response:
+                    status_results['banned'].append(account)
+                    new_status = AccountStatus.BANNED.value
+                else:
+                    status_results['unlimited'].append(account)
+                    new_status = AccountStatus.ACTIVE.value
+                
+                # 更新数据库
+                db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': new_status, 'updated_at': datetime.utcnow()}}
+                )
+                
+        except Exception as e:
+            logger.error(f"Failed to check account {account.phone}: {e}")
+            status_results['restricted'].append(account)
+    
+    return status_results
+
+
+async def export_accounts(account_ids, export_type='all'):
+    """Export accounts as zip file"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    export_dir = os.path.join(Config.RESULTS_DIR, f"export_{timestamp}")
+    os.makedirs(export_dir, exist_ok=True)
+    
+    for account_id in account_ids:
+        account_doc = db[Account.COLLECTION_NAME].find_one({'_id': ObjectId(account_id)})
+        if not account_doc:
+            continue
+        
+        account = Account.from_dict(account_doc)
+        session_name = account.session_name
+        session_path = os.path.join(Config.SESSIONS_DIR, f"{session_name}.session")
+        
+        if os.path.exists(session_path):
+            # 复制 session 文件
+            shutil.copy2(session_path, export_dir)
+            
+            # 如果有对应的 json 文件也复制
+            json_path = f"{session_path}.json"
+            if os.path.exists(json_path):
+                shutil.copy2(json_path, export_dir)
+    
+    # 打包为 zip
+    zip_filename = f"accounts_{export_type}_{timestamp}.zip"
+    zip_path = os.path.join(Config.RESULTS_DIR, zip_filename)
+    
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
+        for root, dirs, files in os.walk(export_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                arcname = os.path.basename(file_path)
+                zipf.write(file_path, arcname)
+    
+    # 清理临时目录
+    shutil.rmtree(export_dir)
+    
+    return zip_path
 
 
 async def list_accounts(query):
