@@ -43,18 +43,13 @@ from telethon.errors import (
 )
 
 # Database
-from sqlalchemy import (
-    Column, Integer, String, DateTime, Boolean, Text, 
-    ForeignKey, Enum as SQLEnum, create_engine
-)
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, sessionmaker
+from pymongo import MongoClient
+from bson import ObjectId
 
 # ============================================================================
 # 配置加载
 # ============================================================================
 load_dotenv()
-Base = declarative_base()
 
 # Setup logging
 logging.basicConfig(
@@ -75,7 +70,8 @@ class Config:
     """Bot configuration"""
     BOT_TOKEN = os.getenv('BOT_TOKEN', '')
     ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', 0))
-    DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///telegram_bot.db')
+    MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
+    MONGODB_DATABASE = os.getenv('MONGODB_DATABASE', 'telegram_bot')
     
     # Proxy
     PROXY_ENABLED = os.getenv('PROXY_ENABLED', 'false').lower() == 'true'
@@ -206,105 +202,284 @@ MEDIA_TYPE_LABELS = {
 # ============================================================================
 # 数据库模型
 # ============================================================================
-class Account(Base):
-    """Telegram account model"""
-    __tablename__ = 'accounts'
+class Account:
+    """Telegram account model - MongoDB document"""
+    COLLECTION_NAME = 'accounts'
     
-    id = Column(Integer, primary_key=True)
-    phone = Column(String(20), unique=True, nullable=False)
-    session_name = Column(String(100), unique=True, nullable=False)
-    status = Column(SQLEnum(AccountStatus, native_enum=False), default=AccountStatus.ACTIVE)
-    api_id = Column(String(50))
-    api_hash = Column(String(100))
-    messages_sent_today = Column(Integer, default=0)
-    total_messages_sent = Column(Integer, default=0)
-    last_used = Column(DateTime, nullable=True)
-    daily_limit = Column(Integer, default=50)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    def __init__(self, phone, session_name, status=None, api_id=None, api_hash=None,
+                 messages_sent_today=0, total_messages_sent=0, last_used=None,
+                 daily_limit=50, created_at=None, updated_at=None, _id=None):
+        self._id = _id
+        self.phone = phone
+        self.session_name = session_name
+        self.status = status or AccountStatus.ACTIVE.value
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.messages_sent_today = messages_sent_today
+        self.total_messages_sent = total_messages_sent
+        self.last_used = last_used
+        self.daily_limit = daily_limit
+        self.created_at = created_at or datetime.utcnow()
+        self.updated_at = updated_at or datetime.utcnow()
     
-    tasks = relationship("Task", back_populates="account")
-    message_logs = relationship("MessageLog", back_populates="account")
-
-
-class Task(Base):
-    """Task model"""
-    __tablename__ = 'tasks'
+    def to_dict(self):
+        """Convert to dictionary for MongoDB"""
+        doc = {
+            'phone': self.phone,
+            'session_name': self.session_name,
+            'status': self.status,
+            'api_id': self.api_id,
+            'api_hash': self.api_hash,
+            'messages_sent_today': self.messages_sent_today,
+            'total_messages_sent': self.total_messages_sent,
+            'last_used': self.last_used,
+            'daily_limit': self.daily_limit,
+            'created_at': self.created_at,
+            'updated_at': self.updated_at
+        }
+        if self._id:
+            doc['_id'] = self._id
+        return doc
     
-    id = Column(Integer, primary_key=True)
-    name = Column(String(200), nullable=False)
-    status = Column(SQLEnum(TaskStatus, native_enum=False), default=TaskStatus.PENDING)
-    message_text = Column(Text, nullable=False)
-    message_format = Column(SQLEnum(MessageFormat, native_enum=False), default=MessageFormat.PLAIN)
-    media_type = Column(SQLEnum(MediaType, native_enum=False), default=MediaType.TEXT)
-    media_path = Column(String(500), nullable=True)
-    send_method = Column(SQLEnum(SendMethod, native_enum=False), default=SendMethod.DIRECT)
-    postbot_code = Column(Text, nullable=True)  # post代码内容
-    channel_link = Column(String(500), nullable=True)  # 频道链接
-    min_interval = Column(Integer, default=30)
-    max_interval = Column(Integer, default=120)
-    account_id = Column(Integer, ForeignKey('accounts.id'), nullable=True)
-    total_targets = Column(Integer, default=0)
-    sent_count = Column(Integer, default=0)
-    failed_count = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    started_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    @classmethod
+    def from_dict(cls, doc):
+        """Create instance from MongoDB document"""
+        if not doc:
+            return None
+        return cls(
+            phone=doc.get('phone'),
+            session_name=doc.get('session_name'),
+            status=doc.get('status'),
+            api_id=doc.get('api_id'),
+            api_hash=doc.get('api_hash'),
+            messages_sent_today=doc.get('messages_sent_today', 0),
+            total_messages_sent=doc.get('total_messages_sent', 0),
+            last_used=doc.get('last_used'),
+            daily_limit=doc.get('daily_limit', 50),
+            created_at=doc.get('created_at'),
+            updated_at=doc.get('updated_at'),
+            _id=doc.get('_id')
+        )
+
+
+class Task:
+    """Task model - MongoDB document"""
+    COLLECTION_NAME = 'tasks'
     
-    account = relationship("Account", back_populates="tasks")
-    targets = relationship("Target", back_populates="task", cascade="all, delete-orphan")
-    message_logs = relationship("MessageLog", back_populates="task", cascade="all, delete-orphan")
-
-
-class Target(Base):
-    """Target user model"""
-    __tablename__ = 'targets'
+    def __init__(self, name, message_text, status=None, message_format=None, 
+                 media_type=None, media_path=None, send_method=None, postbot_code=None,
+                 channel_link=None, min_interval=30, max_interval=120, account_id=None,
+                 total_targets=0, sent_count=0, failed_count=0, created_at=None,
+                 started_at=None, completed_at=None, updated_at=None, _id=None):
+        self._id = _id
+        self.name = name
+        self.status = status or TaskStatus.PENDING.value
+        self.message_text = message_text
+        self.message_format = message_format or MessageFormat.PLAIN.value
+        self.media_type = media_type or MediaType.TEXT.value
+        self.media_path = media_path
+        self.send_method = send_method or SendMethod.DIRECT.value
+        self.postbot_code = postbot_code
+        self.channel_link = channel_link
+        self.min_interval = min_interval
+        self.max_interval = max_interval
+        self.account_id = account_id
+        self.total_targets = total_targets
+        self.sent_count = sent_count
+        self.failed_count = failed_count
+        self.created_at = created_at or datetime.utcnow()
+        self.started_at = started_at
+        self.completed_at = completed_at
+        self.updated_at = updated_at or datetime.utcnow()
     
-    id = Column(Integer, primary_key=True)
-    task_id = Column(Integer, ForeignKey('tasks.id'), nullable=False)
-    username = Column(String(100), nullable=True)
-    user_id = Column(String(50), nullable=True)
-    first_name = Column(String(100), nullable=True)
-    last_name = Column(String(100), nullable=True)
-    is_sent = Column(Boolean, default=False)
-    is_valid = Column(Boolean, default=True)
-    error_message = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    sent_at = Column(DateTime, nullable=True)
+    def to_dict(self):
+        """Convert to dictionary for MongoDB"""
+        doc = {
+            'name': self.name,
+            'status': self.status,
+            'message_text': self.message_text,
+            'message_format': self.message_format,
+            'media_type': self.media_type,
+            'media_path': self.media_path,
+            'send_method': self.send_method,
+            'postbot_code': self.postbot_code,
+            'channel_link': self.channel_link,
+            'min_interval': self.min_interval,
+            'max_interval': self.max_interval,
+            'account_id': self.account_id,
+            'total_targets': self.total_targets,
+            'sent_count': self.sent_count,
+            'failed_count': self.failed_count,
+            'created_at': self.created_at,
+            'started_at': self.started_at,
+            'completed_at': self.completed_at,
+            'updated_at': self.updated_at
+        }
+        if self._id:
+            doc['_id'] = self._id
+        return doc
     
-    task = relationship("Task", back_populates="targets")
+    @classmethod
+    def from_dict(cls, doc):
+        """Create instance from MongoDB document"""
+        if not doc:
+            return None
+        return cls(
+            name=doc.get('name'),
+            message_text=doc.get('message_text'),
+            status=doc.get('status'),
+            message_format=doc.get('message_format'),
+            media_type=doc.get('media_type'),
+            media_path=doc.get('media_path'),
+            send_method=doc.get('send_method'),
+            postbot_code=doc.get('postbot_code'),
+            channel_link=doc.get('channel_link'),
+            min_interval=doc.get('min_interval', 30),
+            max_interval=doc.get('max_interval', 120),
+            account_id=doc.get('account_id'),
+            total_targets=doc.get('total_targets', 0),
+            sent_count=doc.get('sent_count', 0),
+            failed_count=doc.get('failed_count', 0),
+            created_at=doc.get('created_at'),
+            started_at=doc.get('started_at'),
+            completed_at=doc.get('completed_at'),
+            updated_at=doc.get('updated_at'),
+            _id=doc.get('_id')
+        )
 
 
-class MessageLog(Base):
-    """Message log model"""
-    __tablename__ = 'message_logs'
+class Target:
+    """Target user model - MongoDB document"""
+    COLLECTION_NAME = 'targets'
     
-    id = Column(Integer, primary_key=True)
-    task_id = Column(Integer, ForeignKey('tasks.id'), nullable=False)
-    account_id = Column(Integer, ForeignKey('accounts.id'), nullable=False)
-    target_id = Column(Integer, ForeignKey('targets.id'), nullable=False)
-    message_text = Column(Text, nullable=False)
-    success = Column(Boolean, default=False)
-    error_message = Column(Text, nullable=True)
-    sent_at = Column(DateTime, default=datetime.utcnow)
+    def __init__(self, task_id, username=None, user_id=None, first_name=None,
+                 last_name=None, is_sent=False, is_valid=True, error_message=None,
+                 created_at=None, sent_at=None, _id=None):
+        self._id = _id
+        self.task_id = task_id
+        self.username = username
+        self.user_id = user_id
+        self.first_name = first_name
+        self.last_name = last_name
+        self.is_sent = is_sent
+        self.is_valid = is_valid
+        self.error_message = error_message
+        self.created_at = created_at or datetime.utcnow()
+        self.sent_at = sent_at
     
-    task = relationship("Task", back_populates="message_logs")
-    account = relationship("Account", back_populates="message_logs")
-    target = relationship("Target")
+    def to_dict(self):
+        """Convert to dictionary for MongoDB"""
+        doc = {
+            'task_id': self.task_id,
+            'username': self.username,
+            'user_id': self.user_id,
+            'first_name': self.first_name,
+            'last_name': self.last_name,
+            'is_sent': self.is_sent,
+            'is_valid': self.is_valid,
+            'error_message': self.error_message,
+            'created_at': self.created_at,
+            'sent_at': self.sent_at
+        }
+        if self._id:
+            doc['_id'] = self._id
+        return doc
+    
+    @classmethod
+    def from_dict(cls, doc):
+        """Create instance from MongoDB document"""
+        if not doc:
+            return None
+        return cls(
+            task_id=doc.get('task_id'),
+            username=doc.get('username'),
+            user_id=doc.get('user_id'),
+            first_name=doc.get('first_name'),
+            last_name=doc.get('last_name'),
+            is_sent=doc.get('is_sent', False),
+            is_valid=doc.get('is_valid', True),
+            error_message=doc.get('error_message'),
+            created_at=doc.get('created_at'),
+            sent_at=doc.get('sent_at'),
+            _id=doc.get('_id')
+        )
 
 
-def init_db(database_url):
-    """Initialize database"""
-    engine = create_engine(database_url)
-    Base.metadata.create_all(engine)
-    return engine
+class MessageLog:
+    """Message log model - MongoDB document"""
+    COLLECTION_NAME = 'message_logs'
+    
+    def __init__(self, task_id, account_id, target_id, message_text,
+                 success=False, error_message=None, sent_at=None, _id=None):
+        self._id = _id
+        self.task_id = task_id
+        self.account_id = account_id
+        self.target_id = target_id
+        self.message_text = message_text
+        self.success = success
+        self.error_message = error_message
+        self.sent_at = sent_at or datetime.utcnow()
+    
+    def to_dict(self):
+        """Convert to dictionary for MongoDB"""
+        doc = {
+            'task_id': self.task_id,
+            'account_id': self.account_id,
+            'target_id': self.target_id,
+            'message_text': self.message_text,
+            'success': self.success,
+            'error_message': self.error_message,
+            'sent_at': self.sent_at
+        }
+        if self._id:
+            doc['_id'] = self._id
+        return doc
+    
+    @classmethod
+    def from_dict(cls, doc):
+        """Create instance from MongoDB document"""
+        if not doc:
+            return None
+        return cls(
+            task_id=doc.get('task_id'),
+            account_id=doc.get('account_id'),
+            target_id=doc.get('target_id'),
+            message_text=doc.get('message_text'),
+            success=doc.get('success', False),
+            error_message=doc.get('error_message'),
+            sent_at=doc.get('sent_at'),
+            _id=doc.get('_id')
+        )
 
 
-def get_session(engine):
-    """Get database session"""
-    Session = sessionmaker(bind=engine)
-    return Session()
+def init_db(mongodb_uri, database_name):
+    """Initialize MongoDB database"""
+    client = MongoClient(mongodb_uri)
+    db = client[database_name]
+    
+    # Create indexes for better performance
+    db[Account.COLLECTION_NAME].create_index('phone', unique=True)
+    db[Account.COLLECTION_NAME].create_index('session_name', unique=True)
+    db[Account.COLLECTION_NAME].create_index('status')
+    
+    db[Task.COLLECTION_NAME].create_index('status')
+    db[Task.COLLECTION_NAME].create_index('account_id')
+    
+    db[Target.COLLECTION_NAME].create_index('task_id')
+    db[Target.COLLECTION_NAME].create_index('is_sent')
+    db[Target.COLLECTION_NAME].create_index([('task_id', 1), ('is_sent', 1)])
+    
+    db[MessageLog.COLLECTION_NAME].create_index('task_id')
+    db[MessageLog.COLLECTION_NAME].create_index('account_id')
+    db[MessageLog.COLLECTION_NAME].create_index('sent_at')
+    
+    return db
+
+
+def get_db_client(mongodb_uri, database_name):
+    """Get MongoDB database client"""
+    client = MongoClient(mongodb_uri)
+    return client[database_name]
 
 
 # ============================================================================
