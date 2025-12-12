@@ -270,7 +270,9 @@ class Task:
                  media_type=None, media_path=None, send_method=None, postbot_code=None,
                  channel_link=None, min_interval=30, max_interval=120, account_id=None,
                  total_targets=0, sent_count=0, failed_count=0, created_at=None,
-                 started_at=None, completed_at=None, updated_at=None, _id=None):
+                 started_at=None, completed_at=None, updated_at=None, _id=None,
+                 thread_count=1, pin_message=False, delete_dialog=False, 
+                 repeat_send=False, ignore_bidirectional_limit=0):
         self._id = _id
         self.name = name
         self.status = status or TaskStatus.PENDING.value
@@ -291,6 +293,12 @@ class Task:
         self.started_at = started_at
         self.completed_at = completed_at
         self.updated_at = updated_at or datetime.utcnow()
+        # New configuration options
+        self.thread_count = thread_count
+        self.pin_message = pin_message
+        self.delete_dialog = delete_dialog
+        self.repeat_send = repeat_send
+        self.ignore_bidirectional_limit = ignore_bidirectional_limit
     
     def to_dict(self):
         """Convert to dictionary for MongoDB"""
@@ -313,7 +321,12 @@ class Task:
             'created_at': self.created_at,
             'started_at': self.started_at,
             'completed_at': self.completed_at,
-            'updated_at': self.updated_at
+            'updated_at': self.updated_at,
+            'thread_count': self.thread_count,
+            'pin_message': self.pin_message,
+            'delete_dialog': self.delete_dialog,
+            'repeat_send': self.repeat_send,
+            'ignore_bidirectional_limit': self.ignore_bidirectional_limit
         }
         if self._id:
             doc['_id'] = self._id
@@ -344,7 +357,12 @@ class Task:
             started_at=doc.get('started_at'),
             completed_at=doc.get('completed_at'),
             updated_at=doc.get('updated_at'),
-            _id=doc.get('_id')
+            _id=doc.get('_id'),
+            thread_count=doc.get('thread_count', 1),
+            pin_message=doc.get('pin_message', False),
+            delete_dialog=doc.get('delete_dialog', False),
+            repeat_send=doc.get('repeat_send', False),
+            ignore_bidirectional_limit=doc.get('ignore_bidirectional_limit', 0)
         )
 
 
@@ -1238,6 +1256,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"User {user_id} viewing tasks list")
         await list_tasks(query)
     # Note: tasks_create is handled by ConversationHandler
+    elif data.startswith('task_detail_'):
+        task_id = int(data.split('_')[2])
+        logger.info(f"User {user_id} viewing task {task_id} detail")
+        await show_task_detail(query, task_id)
+    elif data.startswith('task_config_'):
+        task_id = int(data.split('_')[2])
+        logger.info(f"User {user_id} configuring task {task_id}")
+        await show_task_config(query, task_id)
+    elif data.startswith('cfg_toggle_'):
+        # Handle toggle buttons for pin_message, delete_dialog, repeat_send
+        parts = data.split('_')
+        toggle_type = parts[2]  # pin, delete, repeat
+        task_id = int(parts[3])
+        await toggle_task_config(query, task_id, toggle_type)
+    elif data == 'noop':
+        # No operation for info-only buttons
+        await query.answer()
     elif data.startswith('task_start_'):
         task_id = int(data.split('_')[2])
         logger.info(f"User {user_id} starting task {task_id}")
@@ -1582,29 +1617,113 @@ async def list_tasks(query):
         text = f"📝 <b>任务列表</b>\n\n共 {len(tasks)} 个任务：\n\n"
         keyboard = []
         
-        for task in tasks:
+        # Show tasks in a 2-column grid
+        row = []
+        for idx, task in enumerate(tasks):
             status_emoji = {'pending': '⏳', 'running': '▶️', 'paused': '⏸️', 'completed': '✅', 'failed': '❌'}.get(task.status, '❓')
-            progress = (task.sent_count / task.total_targets * 100) if task.total_targets > 0 else 0
+            button_text = f"{status_emoji} {task.name}"
+            row.append(InlineKeyboardButton(button_text, callback_data=f'task_detail_{str(task._id)}'))
             
-            text += (
-                f"{status_emoji} <b>{task.name}</b>\n"
-                f"   进度: {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n\n"
-            )
-            
-            buttons = []
-            if task.status in [TaskStatus.PENDING.value, TaskStatus.PAUSED.value]:
-                buttons.append(InlineKeyboardButton("▶️ 开始", callback_data=f'task_start_{str(task._id)}'))
-            elif task.status == TaskStatus.RUNNING.value:
-                buttons.append(InlineKeyboardButton("⏸️ 停止", callback_data=f'task_stop_{str(task._id)}'))
-            buttons.append(InlineKeyboardButton("📊 进度", callback_data=f'task_progress_{str(task._id)}'))
-            if task.status == TaskStatus.COMPLETED.value:
-                buttons.append(InlineKeyboardButton("📥 导出", callback_data=f'task_export_{str(task._id)}'))
-            # Add delete button (only for non-running tasks)
-            if task.status != TaskStatus.RUNNING.value:
-                buttons.append(InlineKeyboardButton("🗑️ 删除", callback_data=f'task_delete_{str(task._id)}'))
-            keyboard.append(buttons)
+            # Create a new row after every 2 tasks
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
         
+        # Add remaining task if odd number
+        if row:
+            keyboard.append(row)
+        
+        keyboard.append([InlineKeyboardButton("➕ 创建新任务", callback_data='tasks_create')])
         keyboard.append([InlineKeyboardButton("🔙 返回", callback_data='menu_tasks')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_task_detail(query, task_id):
+    """Show task detail with configuration options"""
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    if not task_doc:
+        await query.answer("❌ 任务不存在", show_alert=True)
+        return
+    
+    task = Task.from_dict(task_doc)
+    status_emoji = {'pending': '⏳', 'running': '▶️', 'paused': '⏸️', 'completed': '✅', 'failed': '❌'}.get(task.status, '❓')
+    progress = (task.sent_count / task.total_targets * 100) if task.total_targets > 0 else 0
+    
+    text = (
+        f"{status_emoji} <b>{task.name}</b>\n\n"
+        f"📊 进度: {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n"
+        f"✅ 成功: {task.sent_count}\n"
+        f"❌ 失败: {task.failed_count}\n\n"
+        f"<b>⚙️ 当前配置:</b>\n"
+        f"🧵 多账号线程数: {task.thread_count}\n"
+        f"⏱️ 发送间隔: {task.min_interval}-{task.max_interval}秒\n"
+        f"🔄 无视双向次数: {task.ignore_bidirectional_limit}\n"
+        f"📌 置顶消息: {'✔️' if task.pin_message else '❌'}\n"
+        f"🗑️ 删除对话框: {'✔️' if task.delete_dialog else '❌'}\n"
+        f"🔁 重复发送: {'✔️' if task.repeat_send else '❌'}\n"
+    )
+    
+    keyboard = []
+    
+    # Configuration buttons
+    keyboard.append([
+        InlineKeyboardButton("⚙️ 参数配置", callback_data=f'task_config_{task_id}'),
+        InlineKeyboardButton("🗑️ 删除任务", callback_data=f'task_delete_{task_id}')
+    ])
+    
+    # Start/Stop buttons
+    if task.status in [TaskStatus.PENDING.value, TaskStatus.PAUSED.value]:
+        keyboard.append([InlineKeyboardButton("▶️ 开始私信", callback_data=f'task_start_{task_id}')])
+    elif task.status == TaskStatus.RUNNING.value:
+        keyboard.append([InlineKeyboardButton("⏸️ 停止私信", callback_data=f'task_stop_{task_id}')])
+    
+    # Progress and export buttons
+    if task.status == TaskStatus.RUNNING.value:
+        keyboard.append([InlineKeyboardButton(f"📊 总用户数: {task.total_targets}", callback_data='noop')])
+        keyboard.append([
+            InlineKeyboardButton(f"✅ 发送成功: {task.sent_count}", callback_data='noop'),
+            InlineKeyboardButton(f"❌ 发送失败: {task.failed_count}", callback_data='noop')
+        ])
+    
+    if task.status == TaskStatus.COMPLETED.value:
+        keyboard.append([InlineKeyboardButton("📥 导出结果", callback_data=f'task_export_{task_id}')])
+    
+    keyboard.append([InlineKeyboardButton("🔙 返回任务列表", callback_data='tasks_list')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_task_config(query, task_id):
+    """Show task configuration options"""
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    if not task_doc:
+        await query.answer("❌ 任务不存在", show_alert=True)
+        return
+    
+    task = Task.from_dict(task_doc)
+    
+    text = (
+        f"⚙️ <b>配置 - {task.name}</b>\n\n"
+        f"当前配置如下，点击按钮进行调整："
+    )
+    
+    keyboard = [
+        [
+            InlineKeyboardButton(f"🧵 线程数: {task.thread_count}", callback_data=f'cfg_thread_{task_id}'),
+            InlineKeyboardButton(f"⏱️ 间隔: {task.min_interval}-{task.max_interval}s", callback_data=f'cfg_interval_{task_id}')
+        ],
+        [InlineKeyboardButton(f"🔄 无视双向: {task.ignore_bidirectional_limit}次", callback_data=f'cfg_bidirect_{task_id}')],
+        [
+            InlineKeyboardButton(f"{'✔️' if task.pin_message else '❌'} 置顶消息", callback_data=f'cfg_toggle_pin_{task_id}'),
+            InlineKeyboardButton(f"{'✔️' if task.delete_dialog else '❌'} 删除对话", callback_data=f'cfg_toggle_delete_{task_id}')
+        ],
+        [InlineKeyboardButton(f"{'✔️' if task.repeat_send else '❌'} 重复发送", callback_data=f'cfg_toggle_repeat_{task_id}')],
+        [InlineKeyboardButton("✅ 配置完成", callback_data=f'task_detail_{task_id}')],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'task_detail_{task_id}')]
+    ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
@@ -1959,18 +2078,22 @@ async def start_task_handler(query, task_id):
     """Start task"""
     try:
         await task_manager.start_task(task_id)
-        await query.message.reply_text("✅ 任务已开始")
+        await query.answer("✅ 任务已开始")
+        # Redirect to task detail to show progress
+        await show_task_detail(query, task_id)
     except Exception as e:
-        await query.message.reply_text(f"❌ 失败: {str(e)}")
+        await query.answer(f"❌ 失败: {str(e)}", show_alert=True)
 
 
 async def stop_task_handler(query, task_id):
     """Stop task"""
     try:
         await task_manager.stop_task(task_id)
-        await query.message.reply_text("⏸️ 任务已停止")
+        await query.answer("⏸️ 任务已停止")
+        # Redirect to task detail
+        await show_task_detail(query, task_id)
     except Exception as e:
-        await query.message.reply_text(f"❌ 失败: {str(e)}")
+        await query.answer(f"❌ 失败: {str(e)}", show_alert=True)
 
 
 async def show_task_progress(query, task_id):
@@ -2041,6 +2164,42 @@ async def export_results(query, task_id):
         logger.warning(f"Failed to send log file: {e}")
     
     await query.message.reply_text("✅ 结果已导出")
+
+
+async def toggle_task_config(query, task_id, toggle_type):
+    """Toggle task configuration options"""
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    if not task_doc:
+        await query.answer("❌ 任务不存在", show_alert=True)
+        return
+    
+    task = Task.from_dict(task_doc)
+    
+    # Toggle the appropriate field
+    if toggle_type == 'pin':
+        task.pin_message = not task.pin_message
+        db[Task.COLLECTION_NAME].update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {'pin_message': task.pin_message, 'updated_at': datetime.utcnow()}}
+        )
+        await query.answer(f"{'✔️ 已启用' if task.pin_message else '❌ 已禁用'} 置顶消息")
+    elif toggle_type == 'delete':
+        task.delete_dialog = not task.delete_dialog
+        db[Task.COLLECTION_NAME].update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {'delete_dialog': task.delete_dialog, 'updated_at': datetime.utcnow()}}
+        )
+        await query.answer(f"{'✔️ 已启用' if task.delete_dialog else '❌ 已禁用'} 删除对话框")
+    elif toggle_type == 'repeat':
+        task.repeat_send = not task.repeat_send
+        db[Task.COLLECTION_NAME].update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {'repeat_send': task.repeat_send, 'updated_at': datetime.utcnow()}}
+        )
+        await query.answer(f"{'✔️ 已启用' if task.repeat_send else '❌ 已禁用'} 重复发送")
+    
+    # Refresh the config page
+    await show_task_config(query, task_id)
 
 
 async def delete_task_handler(query, task_id):
