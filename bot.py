@@ -1404,34 +1404,25 @@ class TaskManager:
             
             # 根据不同的发送方式处理
             if task.send_method == SendMethod.POSTBOT.value:
-                # Post代码发送 - 通过 @postbot
+                # Post代码发送 - 通过 @postbot 的内联模式
                 logger.info(f"使用Post代码发送，代码: {task.postbot_code}")
                 try:
-                    # 获取 @postbot
+                    # 获取 @postbot 实体
                     logger.info("正在连接 @postbot...")
                     postbot = await client.get_entity('postbot')
                     
-                    # 发送代码到 @postbot
-                    logger.info(f"发送代码到 @postbot: {task.postbot_code}")
-                    await client.send_message(postbot, task.postbot_code)
+                    # 使用内联查询获取 post 内容
+                    logger.info(f"查询 @postbot 内联结果: {task.postbot_code}")
+                    results = await client.inline_query(postbot, task.postbot_code)
                     
-                    # 等待 @postbot 响应
-                    logger.info(f"等待 @postbot 响应 ({POSTBOT_RESPONSE_WAIT_SECONDS}秒)...")
-                    await asyncio.sleep(POSTBOT_RESPONSE_WAIT_SECONDS)
+                    if not results:
+                        logger.error("@postbot 内联查询无结果")
+                        raise ValueError(f"Post代码 {task.postbot_code} 无效或已过期")
                     
-                    # 获取带按钮的消息 - 检查最近5条消息（因为postbot可能先发确认消息）
-                    logger.info("正在获取 @postbot 的按钮消息...")
-                    async for message in client.iter_messages(postbot, limit=5):
-                        if message.buttons:
-                            # 转发按钮消息给目标用户
-                            logger.info("找到按钮消息，正在转发...")
-                            sent_message = await client.forward_messages(entity, message)
-                            logger.info("按钮消息转发成功")
-                            break
-                    
-                    if not sent_message:
-                        logger.error("未找到 @postbot 的按钮消息（检查了最近5条消息）")
-                        raise ValueError("未找到 @postbot 的按钮消息，代码可能无效或已过期，或需要更长等待时间")
+                    # 发送第一个内联结果给目标用户
+                    logger.info(f"找到 {len(results)} 个内联结果，发送第一个...")
+                    sent_message = await results[0].click(entity)
+                    logger.info("Post 内容发送成功")
                         
                 except Exception as e:
                     logger.error(f"通过 @postbot 发送失败: {e}")
