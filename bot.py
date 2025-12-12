@@ -763,36 +763,36 @@ async def test_proxy(db, proxy_id):
         return False, str(e)
 
 
-def assign_proxies_to_accounts(db):
-    """Assign proxies to accounts in round-robin fashion"""
+def get_next_available_proxy(db):
+    """
+    Get next available proxy from pool using round-robin strategy.
+    Returns Proxy object or None if no proxies available.
+    """
     try:
-        # Get all active proxies
-        active_proxies = list(db[Proxy.COLLECTION_NAME].find({'is_active': True}))
+        # Get all active proxies, sorted by usage count (least used first)
+        active_proxies = list(db[Proxy.COLLECTION_NAME].find(
+            {'is_active': True}
+        ).sort('success_count', 1).limit(1))
+        
         if not active_proxies:
-            logger.warning("No active proxies available for assignment")
-            return 0
+            logger.warning("No active proxies available in pool")
+            return None
         
-        # Get all accounts
-        accounts = list(db[Account.COLLECTION_NAME].find())
-        if not accounts:
-            logger.warning("No accounts to assign proxies to")
-            return 0
-        
-        # Assign proxies in round-robin
-        assigned_count = 0
-        for i, account in enumerate(accounts):
-            proxy = active_proxies[i % len(active_proxies)]
-            db[Account.COLLECTION_NAME].update_one(
-                {'_id': account['_id']},
-                {'$set': {'proxy_id': proxy['_id'], 'updated_at': datetime.utcnow()}}
-            )
-            assigned_count += 1
-            logger.info(f"Assigned proxy {proxy['host']}:{proxy['port']} to account {account['phone']}")
-        
-        return assigned_count
+        # Return the least used proxy
+        return Proxy.from_dict(active_proxies[0])
     except Exception as e:
-        logger.error(f"Failed to assign proxies: {e}", exc_info=True)
-        return 0
+        logger.error(f"Failed to get proxy from pool: {e}", exc_info=True)
+        return None
+
+
+def assign_proxies_to_accounts(db):
+    """
+    DEPRECATED: Manual proxy assignment is no longer used.
+    Proxies are now automatically assigned during account operations.
+    This function is kept for backward compatibility but does nothing.
+    """
+    logger.warning("Manual proxy assignment is deprecated. Proxies are auto-assigned during operations.")
+    return 0
 
 
 # ============================================================================
@@ -1000,7 +1000,7 @@ class AccountManager:
             return None
     
     async def get_client(self, account_id):
-        """Get client for account"""
+        """Get client for account with automatic proxy assignment"""
         account_id_str = str(account_id)
         if account_id_str in self.clients and self.clients[account_id_str].is_connected():
             return self.clients[account_id_str]
@@ -1012,12 +1012,13 @@ class AccountManager:
         account = Account.from_dict(account_doc)
         session_path = os.path.join(Config.SESSIONS_DIR, account.session_name)
         
-        # Get proxy: prioritize account-specific proxy, then fall back to global config
+        # Auto-assign proxy from pool if not already assigned
         proxy = None
+        proxy_obj = None
+        
         if account.proxy_id:
-            # Use account-specific proxy
+            # Account already has a proxy assigned, verify it's still active
             try:
-                # Handle both ObjectId and string formats
                 proxy_id = account.proxy_id if isinstance(account.proxy_id, ObjectId) else ObjectId(account.proxy_id)
                 proxy_doc = self.db[Proxy.COLLECTION_NAME].find_one({
                     '_id': proxy_id,
@@ -1026,26 +1027,102 @@ class AccountManager:
                 if proxy_doc:
                     proxy_obj = Proxy.from_dict(proxy_doc)
                     proxy = proxy_obj.get_proxy_dict()
-                    logger.info(f"Using account-specific proxy: {proxy_obj.host}:{proxy_obj.port}")
+                    logger.info(f"Using assigned proxy for account {account.phone}: {proxy_obj.host}:{proxy_obj.port}")
                 else:
-                    logger.warning(f"Account proxy {account.proxy_id} not found or inactive, using global config")
-                    proxy = Config.get_proxy_dict()
+                    logger.warning(f"Assigned proxy {account.proxy_id} not active, will get new one")
+                    account.proxy_id = None  # Clear inactive proxy
             except Exception as e:
-                logger.warning(f"Failed to load account proxy: {e}, using global config")
-                proxy = Config.get_proxy_dict()
-        else:
-            # Use global proxy config
-            proxy = Config.get_proxy_dict()
+                logger.warning(f"Failed to load assigned proxy: {e}")
+                account.proxy_id = None
         
-        client = TelegramClient(session_path, int(account.api_id), account.api_hash, proxy=proxy)
+        # If no valid proxy assigned, get one from pool
+        if not proxy:
+            proxy_obj = get_next_available_proxy(self.db)
+            if proxy_obj:
+                proxy = proxy_obj.get_proxy_dict()
+                # Save proxy assignment to account
+                self.accounts_col.update_one(
+                    {'_id': ObjectId(account_id)},
+                    {'$set': {'proxy_id': proxy_obj._id, 'updated_at': datetime.utcnow()}}
+                )
+                logger.info(f"Auto-assigned proxy to account {account.phone}: {proxy_obj.host}:{proxy_obj.port}")
+            else:
+                logger.warning(f"No proxies available in pool, will try without proxy")
         
-        await client.connect()
-        if not await client.is_user_authorized():
-            self.accounts_col.update_one(
-                {'_id': ObjectId(account_id)},
-                {'$set': {'status': AccountStatus.INACTIVE.value, 'updated_at': datetime.utcnow()}}
-            )
-            raise ValueError(f"Account {account_id} not authorized")
+        # Try to connect with proxy (if available)
+        client = None
+        connection_timeout = 30  # 30 seconds timeout
+        
+        if proxy:
+            try:
+                logger.info(f"Attempting connection with proxy for account {account.phone}")
+                client = TelegramClient(session_path, int(account.api_id), account.api_hash, proxy=proxy)
+                
+                # Connect with timeout
+                await asyncio.wait_for(client.connect(), timeout=connection_timeout)
+                
+                if await client.is_user_authorized():
+                    logger.info(f"✅ Successfully connected with proxy: {proxy_obj.host}:{proxy_obj.port}")
+                    # Update proxy success count
+                    if proxy_obj:
+                        self.db[Proxy.COLLECTION_NAME].update_one(
+                            {'_id': proxy_obj._id},
+                            {
+                                '$inc': {'success_count': 1},
+                                '$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}
+                            }
+                        )
+                    self.clients[account_id_str] = client
+                    return client
+                else:
+                    logger.warning(f"Account not authorized with proxy, will try without proxy")
+                    if client.is_connected():
+                        await client.disconnect()
+                    client = None
+                    
+            except asyncio.TimeoutError:
+                logger.warning(f"⏱️ Proxy connection timeout after {connection_timeout}s, falling back to local")
+                if proxy_obj:
+                    # Update proxy fail count
+                    self.db[Proxy.COLLECTION_NAME].update_one(
+                        {'_id': proxy_obj._id},
+                        {'$inc': {'fail_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                    )
+                    # Check if should auto-disable
+                    updated_proxy = self.db[Proxy.COLLECTION_NAME].find_one({'_id': proxy_obj._id})
+                    if updated_proxy and updated_proxy.get('fail_count', 0) >= 3:
+                        self.db[Proxy.COLLECTION_NAME].update_one(
+                            {'_id': proxy_obj._id},
+                            {'$set': {'is_active': False, 'updated_at': datetime.utcnow()}}
+                        )
+                        logger.warning(f"❌ Proxy {proxy_obj.host}:{proxy_obj.port} auto-disabled after 3 failures")
+                if client and client.is_connected():
+                    await client.disconnect()
+                client = None
+                
+            except Exception as e:
+                logger.warning(f"Proxy connection failed: {e}, falling back to local")
+                if proxy_obj:
+                    self.db[Proxy.COLLECTION_NAME].update_one(
+                        {'_id': proxy_obj._id},
+                        {'$inc': {'fail_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                    )
+                if client and client.is_connected():
+                    await client.disconnect()
+                client = None
+        
+        # Fallback: Connect without proxy (local)
+        if not client:
+            logger.info(f"🏠 Connecting locally (no proxy) for account {account.phone}")
+            client = TelegramClient(session_path, int(account.api_id), account.api_hash, proxy=None)
+            await client.connect()
+            
+            if not await client.is_user_authorized():
+                self.accounts_col.update_one(
+                    {'_id': ObjectId(account_id)},
+                    {'$set': {'status': AccountStatus.INACTIVE.value, 'updated_at': datetime.utcnow()}}
+                )
+                raise ValueError(f"Account {account_id} not authorized")
         
         self.clients[account_id_str] = client
         return client
@@ -2247,14 +2324,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         # Set context for file upload handler
         context.user_data['waiting_for'] = 'proxy_file'
-    elif data == 'proxy_assign':
-        logger.info(f"User {user_id} assigning proxies to accounts")
-        await query.answer("⏳ 正在分配代理...", show_alert=False)
-        assigned_count = assign_proxies_to_accounts(db)
-        await query.message.reply_text(
-            f"✅ 代理分配完成！\n\n已为 {assigned_count} 个账户分配代理",
-            parse_mode='HTML'
-        )
+    # Removed manual proxy assignment - proxies are now auto-assigned during account operations
     elif data == 'proxy_clear':
         logger.info(f"User {user_id} clearing all proxies")
         # Delete all proxies
@@ -4172,13 +4242,15 @@ async def show_proxy_menu(query):
         "🌐 <b>代理管理</b>\n\n"
         f"代理总数: {total_proxies}\n"
         f"可用代理: {active_proxies}\n\n"
+        f"💡 <b>自动分配模式</b>\n"
+        f"账户登录时自动从代理池获取代理\n"
+        f"连接超时则自动退回本地连接\n\n"
         "选择操作："
     )
     
     keyboard = [
         [InlineKeyboardButton("📋 代理列表", callback_data='proxy_list')],
         [InlineKeyboardButton("📤 上传代理文件", callback_data='proxy_upload')],
-        [InlineKeyboardButton("🔄 分配代理到账户", callback_data='proxy_assign')],
         [InlineKeyboardButton("🗑️ 清空所有代理", callback_data='proxy_clear')],
         [InlineKeyboardButton("🔙 返回", callback_data='menu_config')]
     ]
@@ -4258,14 +4330,11 @@ async def handle_proxy_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         os.remove(file_path)
         context.user_data['waiting_for'] = None
         
-        # Auto-assign proxies to accounts
-        assigned_count = assign_proxies_to_accounts(db)
-        
         await update.message.reply_text(
             f"✅ <b>代理导入完成</b>\n\n"
             f"成功导入: {imported_count} 个\n"
-            f"导入失败: {failed_count} 个\n"
-            f"自动分配: {assigned_count} 个账户",
+            f"导入失败: {failed_count} 个\n\n"
+            f"💡 代理将在账户连接时自动分配使用",
             parse_mode='HTML'
         )
         
