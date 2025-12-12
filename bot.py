@@ -1194,15 +1194,31 @@ class TaskManager:
                 unique_account_ids = list(set([log.account_id for log in results['logs'] if log.account_id]))
                 unique_target_ids = list(set([log.target_id for log in results['logs'] if log.target_id]))
                 
-                # 批量查询账户信息
+                # 批量查询账户信息 - 安全转换ObjectId
+                valid_account_ids = []
+                for aid in unique_account_ids:
+                    if aid and isinstance(aid, str) and len(aid) == 24:  # MongoDB ObjectId是24位十六进制字符串
+                        try:
+                            valid_account_ids.append(ObjectId(aid))
+                        except Exception:
+                            pass
+                
                 account_docs = self.db[Account.COLLECTION_NAME].find({
-                    '_id': {'$in': [ObjectId(aid) for aid in unique_account_ids if aid]}
+                    '_id': {'$in': valid_account_ids}
                 })
                 accounts_map = {str(doc['_id']): Account.from_dict(doc) for doc in account_docs}
                 
-                # 批量查询目标信息
+                # 批量查询目标信息 - 安全转换ObjectId
+                valid_target_ids = []
+                for tid in unique_target_ids:
+                    if tid and isinstance(tid, str) and len(tid) == 24:
+                        try:
+                            valid_target_ids.append(ObjectId(tid))
+                        except Exception:
+                            pass
+                
                 target_docs = self.targets_col.find({
-                    '_id': {'$in': [ObjectId(tid) for tid in unique_target_ids if tid]}
+                    '_id': {'$in': valid_target_ids}
                 })
                 targets_map = {str(doc['_id']): Target.from_dict(doc) for doc in target_docs}
                 
@@ -1269,7 +1285,7 @@ class TaskManager:
                     
                     # 格式化消息内容预览（最多50个字符），处理None情况
                     message_text = log.message_text or ""
-                    message_preview = message_text[:50] + "..." if len(message_text) > 50 else message_text
+                    message_preview = (message_text[:50] + "...") if len(message_text) > 50 else message_text
                     
                     f.write(f"[{log.sent_at}]\n")
                     f.write(f"账户: {phone}\n")
@@ -1583,8 +1599,11 @@ class TaskManager:
         if 'postbot' in error_lower:
             return "Post代码无效或已过期"
         
-        # 其他
-        return f"其他错误：{error_message[:50]}"
+        # 其他 - 安全处理可能的None情况
+        if error_message:
+            error_preview = error_message[:50] if len(error_message) > 50 else error_message
+            return f"其他错误：{error_preview}"
+        return "未知错误"
     
     def get_task_progress(self, task_id):
         """Get task progress"""
