@@ -1296,18 +1296,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         toggle_type = parts[2]  # pin, delete, repeat
         task_id = parts[3]
         await toggle_task_config(query, task_id, toggle_type)
-    elif data.startswith('cfg_thread_'):
-        task_id = data.split('_')[2]
-        logger.info(f"User {user_id} configuring thread count for task {task_id}")
-        return await request_thread_config(query, task_id, context)
-    elif data.startswith('cfg_interval_'):
-        task_id = data.split('_')[2]
-        logger.info(f"User {user_id} configuring interval for task {task_id}")
-        return await request_interval_config(query, task_id, context)
-    elif data.startswith('cfg_bidirect_'):
-        task_id = data.split('_')[2]
-        logger.info(f"User {user_id} configuring bidirectional limit for task {task_id}")
-        return await request_bidirect_config(query, task_id, context)
     elif data == 'noop':
         # No operation for info-only buttons
         await query.answer()
@@ -1706,12 +1694,14 @@ async def show_task_detail(query, task_id):
     # 在现有 text 后添加运行时信息
     if task.status == TaskStatus.RUNNING.value:
         # 计算预计完成时间
-        remaining = task.total_targets - task.sent_count - task.failed_count
-        avg_interval = (task.min_interval + task.max_interval) / 2
-        estimated_seconds = remaining * avg_interval
-        estimated_time = timedelta(seconds=int(estimated_seconds))
-        
-        text += f"\n⏱️ 预计剩余时间: {estimated_time}\n"
+        if task.total_targets and task.sent_count is not None and task.failed_count is not None:
+            remaining = task.total_targets - task.sent_count - task.failed_count
+            if remaining > 0 and task.min_interval and task.max_interval:
+                avg_interval = (task.min_interval + task.max_interval) / 2
+                estimated_seconds = remaining * avg_interval
+                estimated_time = timedelta(seconds=int(estimated_seconds))
+                
+                text += f"\n⏱️ 预计剩余时间: {estimated_time}\n"
     
     if task.started_at:
         elapsed = datetime.utcnow() - task.started_at
@@ -1781,8 +1771,11 @@ async def show_task_config(query, task_id):
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
 
 
-async def request_thread_config(query, task_id, context):
+async def request_thread_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Request thread count configuration"""
+    query = update.callback_query
+    await query.answer()
+    task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
     await query.message.reply_text(
         "🧵 <b>配置线程数</b>\n\n"
@@ -1794,8 +1787,11 @@ async def request_thread_config(query, task_id, context):
     return CONFIG_THREAD_INPUT
 
 
-async def request_interval_config(query, task_id, context):
+async def request_interval_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Request interval configuration"""
+    query = update.callback_query
+    await query.answer()
+    task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
     await query.message.reply_text(
         "⏱️ <b>配置发送间隔</b>\n\n"
@@ -1808,8 +1804,11 @@ async def request_interval_config(query, task_id, context):
     return CONFIG_INTERVAL_MIN_INPUT
 
 
-async def request_bidirect_config(query, task_id, context):
+async def request_bidirect_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Request bidirectional limit configuration"""
+    query = update.callback_query
+    await query.answer()
+    task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
     await query.message.reply_text(
         "🔄 <b>配置无视双向次数</b>\n\n"
@@ -2553,9 +2552,9 @@ def main():
     logger.info("Registering task configuration conversation handler...")
     config_conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(lambda u, c: request_thread_config(u.callback_query, u.callback_query.data.split('_')[2], c), pattern='^cfg_thread_'),
-            CallbackQueryHandler(lambda u, c: request_interval_config(u.callback_query, u.callback_query.data.split('_')[2], c), pattern='^cfg_interval_'),
-            CallbackQueryHandler(lambda u, c: request_bidirect_config(u.callback_query, u.callback_query.data.split('_')[2], c), pattern='^cfg_bidirect_')
+            CallbackQueryHandler(request_thread_config, pattern='^cfg_thread_'),
+            CallbackQueryHandler(request_interval_config, pattern='^cfg_interval_'),
+            CallbackQueryHandler(request_bidirect_config, pattern='^cfg_bidirect_')
         ],
         states={
             CONFIG_THREAD_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_thread_config)],
