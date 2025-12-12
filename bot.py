@@ -911,7 +911,7 @@ class TaskManager:
         return True
     
     async def _execute_task(self, task_id):
-        """执行任务 - 支持多线程并发发送"""
+        """执行任务 - 支持重复发送模式和正常模式"""
         task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
         task = Task.from_dict(task_doc)
         
@@ -921,6 +921,7 @@ class TaskManager:
         logger.info(f"任务名称: {task.name}")
         logger.info(f"发送方式: {task.send_method}")
         logger.info(f"线程数配置: {task.thread_count}")
+        logger.info(f"重复发送模式: {task.repeat_send}")
         logger.info("=" * 80)
         
         # 启动进度监控任务
@@ -982,34 +983,11 @@ class TaskManager:
                     stats_text = "\n".join([f"  • {status}: {count}" for status, count in status_stats.items()])
                     raise ValueError(f"❌ 没有可用的活跃账户！\n\n账户状态统计：\n{stats_text}\n\n请检查账户状态或添加新账户。")
             
-            # 使用线程数配置确定并发执行
-            thread_count = min(task.thread_count, len(accounts))
-            logger.info("=" * 80)
-            logger.info(f"并发执行配置:")
-            logger.info(f"  配置的线程数: {task.thread_count}")
-            logger.info(f"  实际使用线程数: {thread_count}")
-            logger.info(f"  活跃账户数: {len(accounts)}")
-            logger.info("=" * 80)
-            
-            # 将目标分批处理
-            batch_size = max(1, len(targets) // thread_count)
-            batches = [targets[i:i + batch_size] for i in range(0, len(targets), batch_size)]
-            logger.info(f"目标分批: {len(batches)} 批，每批约 {batch_size} 个目标")
-            
-            # 为每个批次创建并发任务
-            concurrent_tasks = []
-            for batch_idx, batch in enumerate(batches[:thread_count]):
-                account = accounts[batch_idx % len(accounts)]
-                logger.info(f"批次 {batch_idx + 1}: 分配账户 {account.phone}，处理 {len(batch)} 个目标")
-                concurrent_tasks.append(
-                    self._process_batch(task_id, task, batch, account, batch_idx)
-                )
-            
-            # 并发执行所有批次
-            logger.info("=" * 80)
-            logger.info(f"开始并发执行 {len(concurrent_tasks)} 个批次...")
-            logger.info("=" * 80)
-            await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+            # 根据重复发送模式选择不同的执行逻辑
+            if task.repeat_send:
+                await self._execute_repeat_send_mode(task_id, task, targets, accounts)
+            else:
+                await self._execute_normal_mode(task_id, task, targets, accounts)
             
             # 获取最终任务状态
             task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
@@ -1061,6 +1039,211 @@ class TaskManager:
             if task_id in self.stop_flags:
                 del self.stop_flags[task_id]
             logger.info(f"任务 {task_id}: 清理完成")
+    
+    async def _execute_repeat_send_mode(self, task_id, task, targets, accounts):
+        """执行重复发送模式：所有账号轮流给所有用户发送消息"""
+        logger.info("=" * 80)
+        logger.info("执行模式：重复发送")
+        logger.info(f"目标用户数: {len(targets)}")
+        logger.info(f"可用账号数: {len(accounts)}")
+        logger.info(f"线程数: {task.thread_count}")
+        logger.info("=" * 80)
+        
+        # 将账号分批，每批使用 thread_count 个账号
+        batch_size = task.thread_count
+        account_batches = [accounts[i:i + batch_size] for i in range(0, len(accounts), batch_size)]
+        
+        logger.info(f"账号分批: {len(account_batches)} 批，每批 {batch_size} 个账号")
+        
+        # 每批账号给所有用户发送
+        for batch_index, account_batch in enumerate(account_batches):
+            if self.stop_flags.get(task_id, False):
+                logger.info("检测到停止标志，终止任务")
+                break
+            
+            logger.info("=" * 80)
+            logger.info(f"第 {batch_index + 1}/{len(account_batches)} 轮")
+            logger.info(f"使用账号: {[acc.phone for acc in account_batch]}")
+            logger.info("=" * 80)
+            
+            # 每个账号并发发送给所有用户
+            async def send_to_all_targets(account):
+                """单个账号发送给所有目标"""
+                logger.info(f"账号 {account.phone} 开始给所有用户发送")
+                
+                for target_idx, target in enumerate(targets):
+                    if self.stop_flags.get(task_id, False):
+                        logger.info(f"账号 {account.phone}: 检测到停止标志")
+                        break
+                    
+                    # 检查每日限额
+                    account_doc = self.db[Account.COLLECTION_NAME].find_one({'_id': account._id})
+                    if account_doc:
+                        account = Account.from_dict(account_doc)
+                        if account.messages_sent_today >= account.daily_limit:
+                            logger.warning(f"账号 {account.phone} 达到每日限额")
+                            break
+                        
+                        # 重置每日计数器
+                        if account.last_used and account.last_used.date() < datetime.utcnow().date():
+                            self.db[Account.COLLECTION_NAME].update_one(
+                                {'_id': account._id},
+                                {'$set': {'messages_sent_today': 0, 'updated_at': datetime.utcnow()}}
+                            )
+                            account.messages_sent_today = 0
+                    
+                    # 发送消息
+                    logger.info(f"账号 {account.phone} -> 用户 {target.username or target.user_id} ({target_idx + 1}/{len(targets)})")
+                    success = await self._send_message(task, target, account)
+                    
+                    if success:
+                        self.tasks_col.update_one(
+                            {'_id': ObjectId(task_id)},
+                            {'$inc': {'sent_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                        )
+                        self.db[Account.COLLECTION_NAME].update_one(
+                            {'_id': account._id},
+                            {
+                                '$inc': {'messages_sent_today': 1, 'total_messages_sent': 1},
+                                '$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}
+                            }
+                        )
+                        logger.info(f"✅ 发送成功")
+                    else:
+                        self.tasks_col.update_one(
+                            {'_id': ObjectId(task_id)},
+                            {'$inc': {'failed_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                        )
+                        logger.warning(f"❌ 发送失败")
+                    
+                    # 更新账户最后使用时间
+                    self.db[Account.COLLECTION_NAME].update_one(
+                        {'_id': account._id},
+                        {'$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}}
+                    )
+                    
+                    # 消息间隔
+                    delay = random.randint(task.min_interval, task.max_interval)
+                    logger.debug(f"等待 {delay} 秒...")
+                    await asyncio.sleep(delay)
+                
+                logger.info(f"账号 {account.phone} 完成所有发送")
+            
+            # 并发执行当前批次的所有账号
+            await asyncio.gather(*[send_to_all_targets(acc) for acc in account_batch], return_exceptions=True)
+            
+            logger.info(f"第 {batch_index + 1} 轮完成")
+    
+    async def _execute_normal_mode(self, task_id, task, targets, accounts):
+        """执行正常模式：每个用户按顺序尝试账号，直到成功或无账号可用"""
+        logger.info("=" * 80)
+        logger.info("执行模式：正常模式")
+        logger.info(f"目标用户数: {len(targets)}")
+        logger.info(f"可用账号数: {len(accounts)}")
+        logger.info(f"线程数: {task.thread_count}")
+        logger.info("=" * 80)
+        
+        # 使用线程数配置确定并发执行
+        thread_count = min(task.thread_count, len(accounts))
+        
+        # 将目标分批处理，每批由一个账号处理
+        batch_size = max(1, len(targets) // thread_count)
+        batches = [targets[i:i + batch_size] for i in range(0, len(targets), batch_size)]
+        logger.info(f"目标分批: {len(batches)} 批，每批约 {batch_size} 个目标")
+        
+        # 为每个批次创建并发任务
+        concurrent_tasks = []
+        for batch_idx, batch in enumerate(batches[:thread_count]):
+            account = accounts[batch_idx % len(accounts)]
+            logger.info(f"批次 {batch_idx + 1}: 分配账户 {account.phone}，处理 {len(batch)} 个目标")
+            concurrent_tasks.append(
+                self._process_batch_normal_mode(task_id, task, batch, accounts, batch_idx)
+            )
+        
+        # 并发执行所有批次
+        logger.info("=" * 80)
+        logger.info(f"开始并发执行 {len(concurrent_tasks)} 个批次...")
+        logger.info("=" * 80)
+        await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+    
+    async def _process_batch_normal_mode(self, task_id, task, targets, all_accounts, batch_idx):
+        """处理一批目标 - 正常模式：失败时尝试下一个账号"""
+        logger.info(f"[批次 {batch_idx}] 开始处理 {len(targets)} 个目标")
+        
+        account_pool = all_accounts.copy()
+        account_index = 0
+        
+        for idx, target in enumerate(targets):
+            # 检查停止标志
+            if self.stop_flags.get(task_id, False):
+                logger.info(f"[批次 {batch_idx}] 检测到停止标志，停止执行")
+                break
+            
+            logger.info(f"[批次 {batch_idx}] 处理目标 {idx + 1}/{len(targets)}: {target.username or target.user_id}")
+            
+            success = False
+            attempts = 0
+            max_attempts = len(account_pool)
+            
+            # 尝试多个账号直到成功
+            while not success and attempts < max_attempts:
+                account = account_pool[account_index % len(account_pool)]
+                
+                # 检查每日限额
+                account_doc = self.db[Account.COLLECTION_NAME].find_one({'_id': account._id})
+                if account_doc:
+                    account = Account.from_dict(account_doc)
+                    if account.messages_sent_today >= account.daily_limit:
+                        logger.warning(f"[批次 {batch_idx}] 账户 {account.phone} 达到每日限额，尝试下一个账户")
+                        account_index += 1
+                        attempts += 1
+                        continue
+                    
+                    # 重置每日计数器
+                    if account.last_used and account.last_used.date() < datetime.utcnow().date():
+                        self.db[Account.COLLECTION_NAME].update_one(
+                            {'_id': account._id},
+                            {'$set': {'messages_sent_today': 0, 'updated_at': datetime.utcnow()}}
+                        )
+                        account.messages_sent_today = 0
+                
+                # 发送消息
+                logger.info(f"[批次 {batch_idx}] 使用账户 {account.phone} 尝试发送")
+                success = await self._send_message(task, target, account)
+                
+                if not success:
+                    logger.warning(f"[批次 {batch_idx}] 账户 {account.phone} 发送失败，尝试下一个账户")
+                    account_index += 1
+                    attempts += 1
+                else:
+                    # 发送成功
+                    self.tasks_col.update_one(
+                        {'_id': ObjectId(task_id)},
+                        {'$inc': {'sent_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                    )
+                    self.db[Account.COLLECTION_NAME].update_one(
+                        {'_id': account._id},
+                        {
+                            '$inc': {'messages_sent_today': 1, 'total_messages_sent': 1},
+                            '$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}
+                        }
+                    )
+                    logger.info(f"[批次 {batch_idx}] ✅ 发送成功")
+                    
+                    # 消息间隔
+                    delay = random.randint(task.min_interval, task.max_interval)
+                    await asyncio.sleep(delay)
+                    break
+            
+            # 如果所有账号都尝试过仍然失败
+            if not success:
+                self.tasks_col.update_one(
+                    {'_id': ObjectId(task_id)},
+                    {'$inc': {'failed_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                )
+                logger.warning(f"[批次 {batch_idx}] ❌ 所有账户尝试后仍然失败: {target.username or target.user_id}")
+        
+        logger.info(f"[批次 {batch_idx}] 批次处理完成")
     
     async def _process_batch(self, task_id, task, targets, account, batch_idx):
         """处理一批目标 - 使用单个账户"""
