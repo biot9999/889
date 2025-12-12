@@ -856,6 +856,29 @@ class TaskManager:
         del self.running_tasks[task_id_str]
         del self.stop_flags[task_id_str]
     
+    def delete_task(self, task_id):
+        """Delete task and all associated data"""
+        task_id_str = str(task_id)
+        
+        # Check if task is running
+        if task_id_str in self.running_tasks:
+            raise ValueError("Cannot delete a running task. Please stop it first.")
+        
+        # Delete associated targets
+        self.targets_col.delete_many({'task_id': task_id_str})
+        
+        # Delete associated message logs
+        self.logs_col.delete_many({'task_id': task_id_str})
+        
+        # Delete the task itself
+        result = self.tasks_col.delete_one({'_id': ObjectId(task_id)})
+        
+        if result.deleted_count == 0:
+            raise ValueError(f"Task {task_id} not found")
+        
+        logger.info(f"Task {task_id} and all associated data deleted successfully")
+        return True
+    
     async def _execute_task(self, task_id):
         """Execute task"""
         task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
@@ -1231,6 +1254,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_id = int(data.split('_')[2])
         logger.info(f"User {user_id} exporting task {task_id} results")
         await export_results(query, task_id)
+    elif data.startswith('task_delete_'):
+        task_id = int(data.split('_')[2])
+        logger.info(f"User {user_id} deleting task {task_id}")
+        await delete_task_handler(query, task_id)
     
     # Format selection
     elif data.startswith('format_'):
@@ -1572,6 +1599,9 @@ async def list_tasks(query):
             buttons.append(InlineKeyboardButton("📊 进度", callback_data=f'task_progress_{str(task._id)}'))
             if task.status == TaskStatus.COMPLETED.value:
                 buttons.append(InlineKeyboardButton("📥 导出", callback_data=f'task_export_{str(task._id)}'))
+            # Add delete button (only for non-running tasks)
+            if task.status != TaskStatus.RUNNING.value:
+                buttons.append(InlineKeyboardButton("🗑️ 删除", callback_data=f'task_delete_{str(task._id)}'))
             keyboard.append(buttons)
         
         keyboard.append([InlineKeyboardButton("🔙 返回", callback_data='menu_tasks')])
@@ -2011,6 +2041,33 @@ async def export_results(query, task_id):
         logger.warning(f"Failed to send log file: {e}")
     
     await query.message.reply_text("✅ 结果已导出")
+
+
+async def delete_task_handler(query, task_id):
+    """Delete task handler"""
+    try:
+        # Get task info before deleting
+        task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+        if not task_doc:
+            await query.answer("❌ 任务不存在", show_alert=True)
+            return
+        
+        task = Task.from_dict(task_doc)
+        
+        # Delete the task
+        task_manager.delete_task(task_id)
+        
+        await query.answer(f"✅ 任务 '{task.name}' 已删除", show_alert=True)
+        
+        # Refresh the task list
+        await list_tasks(query)
+        
+    except ValueError as e:
+        logger.error(f"Error deleting task {task_id}: {e}")
+        await query.answer(f"❌ {str(e)}", show_alert=True)
+    except Exception as e:
+        logger.error(f"Unexpected error deleting task {task_id}: {e}")
+        await query.answer("❌ 删除任务时发生错误", show_alert=True)
 
 
 async def show_config(query):
