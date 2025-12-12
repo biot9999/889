@@ -1190,15 +1190,30 @@ class TaskManager:
                 f.write(f"完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("=" * 50 + "\n\n")
                 
+                # 预先批量获取所有账户和目标信息（避免N+1查询）
+                unique_account_ids = list(set([log.account_id for log in results['logs']]))
+                unique_target_ids = list(set([log.target_id for log in results['logs']]))
+                
+                # 批量查询账户信息
+                account_docs = self.db[Account.COLLECTION_NAME].find({
+                    '_id': {'$in': [ObjectId(aid) for aid in unique_account_ids if aid]}
+                })
+                accounts_map = {str(doc['_id']): Account.from_dict(doc) for doc in account_docs}
+                
+                # 批量查询目标信息
+                target_docs = self.targets_col.find({
+                    '_id': {'$in': [ObjectId(tid) for tid in unique_target_ids if tid]}
+                })
+                targets_map = {str(doc['_id']): Target.from_dict(doc) for doc in target_docs}
+                
                 # 统计每个账户的发送情况
                 account_stats = {}
                 for log in results['logs']:
                     account_id = log.account_id
                     if account_id not in account_stats:
-                        # 获取账户信息
-                        account_doc = self.db[Account.COLLECTION_NAME].find_one({'_id': ObjectId(account_id)})
-                        if account_doc:
-                            account = Account.from_dict(account_doc)
+                        # 从预加载的账户信息中获取
+                        account = accounts_map.get(account_id)
+                        if account:
                             account_stats[account_id] = {
                                 'phone': account.phone,
                                 'success': 0,
@@ -1240,15 +1255,14 @@ class TaskManager:
                 f.write("📝 详细发送记录:\n")
                 f.write("-" * 50 + "\n\n")
                 for log in results['logs']:
-                    # 获取账户信息
+                    # 从预加载的数据中获取账户信息
                     account_id = log.account_id
                     phone = account_stats.get(account_id, {}).get('phone', 'Unknown')
                     
-                    # 获取目标用户信息
-                    target_doc = self.targets_col.find_one({'_id': ObjectId(log.target_id)})
+                    # 从预加载的数据中获取目标用户信息
+                    target = targets_map.get(log.target_id)
                     target_name = "Unknown"
-                    if target_doc:
-                        target = Target.from_dict(target_doc)
+                    if target:
                         target_name = target.username or target.user_id or "Unknown"
                     
                     status = "✅ 成功" if log.success else "❌ 失败"
