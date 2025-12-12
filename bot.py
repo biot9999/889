@@ -1419,9 +1419,9 @@ class TaskManager:
                     logger.info(f"等待 @postbot 响应 ({POSTBOT_RESPONSE_WAIT_SECONDS}秒)...")
                     await asyncio.sleep(POSTBOT_RESPONSE_WAIT_SECONDS)
                     
-                    # 获取带按钮的消息
+                    # 获取带按钮的消息 - 检查最近5条消息（因为postbot可能先发确认消息）
                     logger.info("正在获取 @postbot 的按钮消息...")
-                    async for message in client.iter_messages(postbot, limit=1):
+                    async for message in client.iter_messages(postbot, limit=5):
                         if message.buttons:
                             # 转发按钮消息给目标用户
                             logger.info("找到按钮消息，正在转发...")
@@ -1430,8 +1430,8 @@ class TaskManager:
                             break
                     
                     if not sent_message:
-                        logger.error("未找到 @postbot 的按钮消息")
-                        raise ValueError("未找到 @postbot 的按钮消息，可能代码无效或已过期")
+                        logger.error("未找到 @postbot 的按钮消息（检查了最近5条消息）")
+                        raise ValueError("未找到 @postbot 的按钮消息，代码可能无效或已过期，或需要更长等待时间")
                         
                 except Exception as e:
                     logger.error(f"通过 @postbot 发送失败: {e}")
