@@ -593,10 +593,10 @@ def get_db_client(mongodb_uri, database_name):
 def parse_proxy_line(line):
     """
     Parse proxy line from multiple formats:
-    - IP:端口:用户名:密码
-    - socks5://IP:端口:用户名:密码
-    - socks5://user:pass@host:port (ABCProxy格式)
-    - IP:端口 (简单格式)
+    - IP:port:username:password (4-part colon-separated)
+    - socks5://IP:port:username:password (protocol prefix with auth)
+    - socks5://user:pass@host:port (ABCProxy format)
+    - IP:port (simple format without auth)
     
     Returns Proxy object or None if invalid
     """
@@ -703,9 +703,12 @@ async def test_proxy(db, proxy_id):
             success = client.is_connected()
             await client.disconnect()
             
-            # Clean up test session
-            if os.path.exists(f"{test_session}.session"):
-                os.remove(f"{test_session}.session")
+            # Clean up test session - wrapped in try-except to prevent failures
+            try:
+                if os.path.exists(f"{test_session}.session"):
+                    os.remove(f"{test_session}.session")
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to cleanup test session: {cleanup_error}")
             
             # Update proxy statistics
             if success:
@@ -781,7 +784,7 @@ def assign_proxies_to_accounts(db):
             proxy = active_proxies[i % len(active_proxies)]
             db[Account.COLLECTION_NAME].update_one(
                 {'_id': account['_id']},
-                {'$set': {'proxy_id': str(proxy['_id']), 'updated_at': datetime.utcnow()}}
+                {'$set': {'proxy_id': proxy['_id'], 'updated_at': datetime.utcnow()}}
             )
             assigned_count += 1
             logger.info(f"Assigned proxy {proxy['host']}:{proxy['port']} to account {account['phone']}")
@@ -1014,8 +1017,10 @@ class AccountManager:
         if account.proxy_id:
             # Use account-specific proxy
             try:
+                # Handle both ObjectId and string formats
+                proxy_id = account.proxy_id if isinstance(account.proxy_id, ObjectId) else ObjectId(account.proxy_id)
                 proxy_doc = self.db[Proxy.COLLECTION_NAME].find_one({
-                    '_id': ObjectId(account.proxy_id),
+                    '_id': proxy_id,
                     'is_active': True
                 })
                 if proxy_doc:
@@ -2270,10 +2275,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('proxy_delete_'):
         proxy_id = data.split('_')[2]
         logger.info(f"User {user_id} deleting proxy {proxy_id}")
-        db[Proxy.COLLECTION_NAME].delete_one({'_id': ObjectId(proxy_id)})
-        # Remove proxy_id from accounts using this proxy
+        proxy_oid = ObjectId(proxy_id)
+        db[Proxy.COLLECTION_NAME].delete_one({'_id': proxy_oid})
+        # Remove proxy_id from accounts using this proxy (handle both ObjectId and string)
         db[Account.COLLECTION_NAME].update_many(
-            {'proxy_id': proxy_id},
+            {'$or': [{'proxy_id': proxy_oid}, {'proxy_id': proxy_id}]},
             {'$set': {'proxy_id': None}}
         )
         await query.answer("✅ 代理已删除", show_alert=True)
