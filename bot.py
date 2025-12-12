@@ -593,10 +593,10 @@ def get_db_client(mongodb_uri, database_name):
 def parse_proxy_line(line):
     """
     Parse proxy line from multiple formats:
-    - IP:port:username:password (4-part colon-separated)
+    - host:port:username:password (4-part colon-separated, supports domain names like f01a4db3d3952561.abcproxy.vip:4950:user:pass)
     - socks5://IP:port:username:password (protocol prefix with auth)
-    - socks5://user:pass@host:port (ABCProxy format)
-    - IP:port (simple format without auth)
+    - socks5://user:pass@host:port (ABCProxy URL format)
+    - host:port (simple format without auth)
     
     Returns Proxy object or None if invalid
     """
@@ -2273,10 +2273,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Authorized user {username} ({user_id}) accessing main menu")
     
     keyboard = [
-        [InlineKeyboardButton("📱 账户管理", callback_data='menu_accounts')],
-        [InlineKeyboardButton("📝 任务管理", callback_data='menu_tasks')],
-        [InlineKeyboardButton("⚙️ 全局配置", callback_data='menu_config')],
-        [InlineKeyboardButton("📊 统计信息", callback_data='menu_stats')],
+        [InlineKeyboardButton("📢 广告私信", callback_data='menu_messaging')],
         [InlineKeyboardButton("❓ 帮助", callback_data='menu_help')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2306,7 +2303,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Button clicked by user {username} ({user_id}): {data}")
     
     # Main menu
-    if data == 'menu_accounts':
+    if data == 'menu_messaging':
+        # New messaging menu that consolidates all messaging features
+        logger.info(f"User {user_id} accessing messaging menu")
+        await show_messaging_menu(query)
+    elif data == 'menu_accounts':
         logger.info(f"User {user_id} accessing accounts menu")
         await show_accounts_menu(query)
     elif data == 'menu_tasks':
@@ -2349,12 +2350,109 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
     elif data.startswith('proxy_test_'):
-        proxy_id = data.split('_')[2]
-        logger.info(f"User {user_id} testing proxy {proxy_id}")
-        await query.answer("⏳ 正在测试代理...", show_alert=False)
-        success, message = await test_proxy(db, proxy_id)
-        emoji = "✅" if success else "❌"
-        await query.message.reply_text(f"{emoji} {message}")
+        if data == 'proxy_test_all':
+            # Test all proxies concurrently
+            logger.info(f"User {user_id} testing all proxies")
+            await query.answer("⏳ 开始测试所有代理...", show_alert=False)
+            
+            # Get all proxies
+            all_proxies = list(db[Proxy.COLLECTION_NAME].find())
+            total_proxies = len(all_proxies)
+            
+            if total_proxies == 0:
+                await query.message.reply_text("❌ 没有代理可测试")
+                return
+            
+            # Send initial progress message
+            progress_msg = await query.message.reply_text(
+                f"⏳ <b>正在并发测试代理...</b>\n\n"
+                f"进度: 0/{total_proxies} (0%)\n"
+                f"✅ 成功: 0\n"
+                f"❌ 失败: 0\n"
+                f"🗑️ 已删除失败代理: 0",
+                parse_mode='HTML'
+            )
+            
+            # Test proxies with concurrency control (10 at a time)
+            semaphore = asyncio.Semaphore(10)
+            success_count = 0
+            failed_count = 0
+            deleted_count = 0
+            tested_count = 0
+            
+            async def test_proxy_with_semaphore(proxy_doc):
+                """Test single proxy with semaphore"""
+                nonlocal success_count, failed_count, deleted_count, tested_count
+                async with semaphore:
+                    proxy_id = str(proxy_doc['_id'])
+                    success, message = await test_proxy(db, proxy_id)
+                    
+                    tested_count += 1
+                    if success:
+                        success_count += 1
+                    else:
+                        failed_count += 1
+                        # Check if proxy was deleted (test_proxy auto-deletes failed proxies)
+                        if "deleted" in message.lower():
+                            deleted_count += 1
+                    
+                    # Update progress every 5 proxies or on completion
+                    if tested_count % 5 == 0 or tested_count == total_proxies:
+                        percentage = (tested_count / total_proxies * 100) if total_proxies > 0 else 0
+                        try:
+                            await progress_msg.edit_text(
+                                f"⏳ <b>正在并发测试代理...</b>\n\n"
+                                f"进度: {tested_count}/{total_proxies} ({percentage:.1f}%)\n"
+                                f"✅ 成功: {success_count}\n"
+                                f"❌ 失败: {failed_count}\n"
+                                f"🗑️ 已删除失败代理: {deleted_count}",
+                                parse_mode='HTML'
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to update progress: {e}")
+            
+            # Test all proxies concurrently
+            await asyncio.gather(*[test_proxy_with_semaphore(proxy) for proxy in all_proxies])
+            
+            # Get remaining proxies after auto-deletion
+            remaining_proxies = db[Proxy.COLLECTION_NAME].count_documents({})
+            
+            # Reassign proxies to accounts that lost their proxies
+            accounts_without_proxy = list(db[Account.COLLECTION_NAME].find({'proxy_id': None}))
+            reassigned_count = 0
+            for account_doc in accounts_without_proxy:
+                proxy = get_next_available_proxy(db)
+                if proxy:
+                    db[Account.COLLECTION_NAME].update_one(
+                        {'_id': account_doc['_id']},
+                        {'$set': {'proxy_id': proxy._id}}
+                    )
+                    reassigned_count += 1
+            
+            # Delete progress message and show final result
+            try:
+                await progress_msg.delete()
+            except:
+                pass
+            
+            await query.message.reply_text(
+                f"✅ <b>代理测试完成！</b>\n\n"
+                f"📊 <b>测试结果：</b>\n"
+                f"✅ 测试成功: {success_count} 个\n"
+                f"❌ 测试失败: {failed_count} 个\n"
+                f"🗑️ 已自动删除失败代理: {deleted_count} 个\n"
+                f"📦 剩余可用代理: {remaining_proxies} 个\n"
+                f"🔄 已重新分配代理: {reassigned_count} 个账户",
+                parse_mode='HTML'
+            )
+        else:
+            # Test single proxy
+            proxy_id = data.split('_')[2]
+            logger.info(f"User {user_id} testing proxy {proxy_id}")
+            await query.answer("⏳ 正在测试代理...", show_alert=False)
+            success, message = await test_proxy(db, proxy_id)
+            emoji = "✅" if success else "❌"
+            await query.message.reply_text(f"{emoji} {message}")
     elif data.startswith('proxy_delete_'):
         proxy_id = data.split('_')[2]
         logger.info(f"User {user_id} deleting proxy {proxy_id}")
@@ -2400,10 +2498,61 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'accounts_check_status':
         logger.info(f"User {user_id} checking all accounts status")
         await query.answer("🔍 正在检查账户状态，请稍候...", show_alert=False)
-        await query.message.reply_text("⏳ 正在调用 @spambot 检查所有账户...\n这可能需要几分钟时间。")
+        
+        # Send initial progress message
+        progress_msg = await query.message.reply_text(
+            "⏳ <b>正在调用 @spambot 检查所有账户...</b>\n\n"
+            "进度: 0/? (0%)\n"
+            "✅ 无限制: 0\n"
+            "⚠️ 双向限制: 0\n"
+            "❄️ 冻结: 0\n"
+            "🚫 封禁: 0\n\n"
+            "⏱️ 预计时间: 计算中...",
+            parse_mode='HTML'
+        )
+        
+        # Track start time for ETA calculation
+        start_time = datetime.utcnow()
+        
+        async def update_progress(current, total, stats):
+            """Update progress message"""
+            try:
+                # Calculate progress percentage
+                percentage = (current / total * 100) if total > 0 else 0
+                
+                # Calculate ETA
+                elapsed = (datetime.utcnow() - start_time).total_seconds()
+                if current > 0:
+                    avg_time_per_account = elapsed / current
+                    remaining_accounts = total - current
+                    eta_seconds = avg_time_per_account * remaining_accounts
+                    eta_minutes = int(eta_seconds / 60)
+                    eta_text = f"{eta_minutes}分{int(eta_seconds % 60)}秒" if eta_minutes > 0 else f"{int(eta_seconds)}秒"
+                else:
+                    eta_text = "计算中..."
+                
+                # Update progress message
+                await progress_msg.edit_text(
+                    f"⏳ <b>正在调用 @spambot 检查所有账户...</b>\n\n"
+                    f"进度: {current}/{total} ({percentage:.1f}%)\n"
+                    f"✅ 无限制: {len(stats['unlimited'])}\n"
+                    f"⚠️ 双向限制: {len(stats['limited'])}\n"
+                    f"❄️ 冻结: {len(stats['restricted'])}\n"
+                    f"🚫 封禁: {len(stats['banned'])}\n\n"
+                    f"⏱️ 预计剩余时间: {eta_text}",
+                    parse_mode='HTML'
+                )
+            except Exception as e:
+                logger.warning(f"Failed to update progress message: {e}")
         
         try:
-            status_results = await check_all_accounts_status()
+            status_results = await check_all_accounts_status(progress_callback=update_progress)
+            
+            # Delete progress message
+            try:
+                await progress_msg.delete()
+            except:
+                pass
             
             text = (
                 f"✅ <b>账户状态检查完成！</b>\n\n"
@@ -2424,6 +2573,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         except Exception as e:
             logger.error(f"Error checking accounts status: {e}", exc_info=True)
+            # Delete progress message on error
+            try:
+                await progress_msg.delete()
+            except:
+                pass
             await query.message.reply_text(f"❌ 检查失败：{str(e)}")
     
     elif data == 'accounts_export_all':
@@ -2682,6 +2836,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await back_to_main(query)
 
 
+async def show_messaging_menu(query):
+    """Show messaging menu with all features consolidated"""
+    # Get statistics
+    total_accounts = db[Account.COLLECTION_NAME].count_documents({})
+    active_accounts = db[Account.COLLECTION_NAME].count_documents({'status': AccountStatus.ACTIVE.value})
+    total_tasks = db[Task.COLLECTION_NAME].count_documents({})
+    running_tasks = db[Task.COLLECTION_NAME].count_documents({'status': TaskStatus.RUNNING.value})
+    
+    keyboard = [
+        [InlineKeyboardButton("📱 账户管理", callback_data='menu_accounts')],
+        [InlineKeyboardButton("📝 任务管理", callback_data='menu_tasks')],
+        [InlineKeyboardButton("⚙️ 全局配置", callback_data='menu_config')],
+        [InlineKeyboardButton("📊 统计信息", callback_data='menu_stats')],
+        [InlineKeyboardButton("🔙 返回主菜单", callback_data='back_main')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = (
+        f"📢 <b>广告私信</b>\n\n"
+        f"📊 <b>快速概览：</b>\n"
+        f"👥 账户：{active_accounts}/{total_accounts} 个可用\n"
+        f"📋 任务：{running_tasks}/{total_tasks} 个运行中\n\n"
+        f"请选择功能："
+    )
+    
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
 async def show_accounts_menu(query):
     """Show enhanced accounts menu with statistics"""
     # 统计账户数量
@@ -2692,7 +2874,7 @@ async def show_accounts_menu(query):
         [InlineKeyboardButton("📋 账号列表", callback_data='accounts_list')],
         [InlineKeyboardButton("➕ 添加账号", callback_data='accounts_add')],
         [InlineKeyboardButton("🔍 检查账户状态", callback_data='accounts_check_status')],
-        [InlineKeyboardButton("🔙 返回主菜单", callback_data='back_main')]
+        [InlineKeyboardButton("🔙 返回", callback_data='menu_messaging')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -2871,8 +3053,14 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return current_state
 
 
-async def check_all_accounts_status():
-    """Check all accounts using @spambot with enhanced multi-language pattern matching"""
+async def check_all_accounts_status(progress_callback=None):
+    """
+    Check all accounts using @spambot with enhanced multi-language pattern matching
+    
+    Args:
+        progress_callback: Optional async function to call with progress updates
+                          Should accept (current, total, stats) as parameters
+    """
     accounts = list(db[Account.COLLECTION_NAME].find())
     
     # 增强版状态模式 - 支持多语言和更精确的分类
@@ -3017,49 +3205,65 @@ async def check_all_accounts_status():
         logger.warning(f"Unable to classify response, defaulting to unlimited: {response_text[:100]}...")
         return ('unlimited', AccountStatus.ACTIVE.value)
     
-    for account_doc in accounts:
-        account = Account.from_dict(account_doc)
-        try:
-            client = await account_manager.get_client(str(account._id))
-            
-            # 向 @spambot 发送消息
-            spambot = await client.get_entity('spambot')
-            await client.send_message(spambot, '/start')
-            await asyncio.sleep(2)
-            
-            # 获取 @spambot 的回复
-            messages = await client.get_messages(spambot, limit=1)
-            if messages:
-                response = messages[0].text
-                logger.info(f"Account {account.phone} @spambot response: {response[:100]}...")
+    # Process accounts with concurrency control (10 at a time)
+    semaphore = asyncio.Semaphore(10)
+    total_accounts = len(accounts)
+    processed_count = 0
+    
+    async def check_account_with_semaphore(account_doc):
+        """Check single account with semaphore"""
+        nonlocal processed_count
+        async with semaphore:
+            account = Account.from_dict(account_doc)
+            try:
+                client = await account_manager.get_client(str(account._id))
                 
-                # 使用增强的分类系统
-                category, new_status = classify_status(response)
+                # 向 @spambot 发送消息
+                spambot = await client.get_entity('spambot')
+                await client.send_message(spambot, '/start')
+                await asyncio.sleep(2)
                 
-                status_results[category].append(account)
-                
-                # 更新数据库
-                db[Account.COLLECTION_NAME].update_one(
-                    {'_id': account._id},
-                    {'$set': {'status': new_status, 'updated_at': datetime.utcnow()}}
-                )
-            else:
-                # 没有收到回复，可能是无法对话
-                logger.warning(f"Account {account.phone}: No response from @spambot")
+                # 获取 @spambot 的回复
+                messages = await client.get_messages(spambot, limit=1)
+                if messages:
+                    response = messages[0].text
+                    logger.info(f"Account {account.phone} @spambot response: {response[:100]}...")
+                    
+                    # 使用增强的分类系统
+                    category, new_status = classify_status(response)
+                    
+                    status_results[category].append(account)
+                    
+                    # 更新数据库
+                    db[Account.COLLECTION_NAME].update_one(
+                        {'_id': account._id},
+                        {'$set': {'status': new_status, 'updated_at': datetime.utcnow()}}
+                    )
+                else:
+                    # 没有收到回复，可能是无法对话
+                    logger.warning(f"Account {account.phone}: No response from @spambot")
+                    status_results['banned'].append(account)
+                    db[Account.COLLECTION_NAME].update_one(
+                        {'_id': account._id},
+                        {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
+                    )
+                    
+            except Exception as e:
+                # 无法连接或对话的账户认为是封禁/死亡账户
+                logger.error(f"Failed to check account {account.phone}: {e}")
                 status_results['banned'].append(account)
                 db[Account.COLLECTION_NAME].update_one(
                     {'_id': account._id},
                     {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
                 )
-                
-        except Exception as e:
-            # 无法连接或对话的账户认为是封禁/死亡账户
-            logger.error(f"Failed to check account {account.phone}: {e}")
-            status_results['banned'].append(account)
-            db[Account.COLLECTION_NAME].update_one(
-                {'_id': account._id},
-                {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
-            )
+            finally:
+                processed_count += 1
+                # Report progress every 5 accounts
+                if progress_callback and (processed_count % 5 == 0 or processed_count == total_accounts):
+                    await progress_callback(processed_count, total_accounts, status_results)
+    
+    # Process all accounts concurrently
+    await asyncio.gather(*[check_account_with_semaphore(acc) for acc in accounts])
     
     return status_results
 
@@ -3149,7 +3353,7 @@ async def show_tasks_menu(query):
     keyboard = [
         [InlineKeyboardButton("📋 查看任务列表", callback_data='tasks_list')],
         [InlineKeyboardButton("➕ 创建新任务", callback_data='tasks_create')],
-        [InlineKeyboardButton("🔙 返回主菜单", callback_data='back_main')]
+        [InlineKeyboardButton("🔙 返回", callback_data='menu_messaging')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     text = "📝 <b>任务管理</b>\n\n请选择操作："
@@ -3696,6 +3900,12 @@ async def handle_target_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Calculate deduplication stats
         duplicates = original_count - added
         
+        # Create quick action buttons
+        keyboard = [
+            [InlineKeyboardButton("📋 前往任务列表", callback_data='tasks_list')],
+            [InlineKeyboardButton("⚙️ 配置任务", callback_data=f'task_config_{str(task._id)}')]
+        ]
+        
         await update.message.reply_text(
             f"✅ <b>任务创建成功！</b>\n\n"
             f"📝 任务名称: {task.name}\n"
@@ -3703,8 +3913,8 @@ async def handle_target_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"🔄 已去重 {duplicates} 个用户\n"
             f"✅ 最终添加 {added} 个用户\n\n"
             f"<b>注意：</b>用户名发一个自动删除一个，用完代表任务结束\n\n"
-            f"前往任务列表开始任务\n\n"
-            f"使用 /start 查看任务列表",
+            f"使用下方按钮快速访问：",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
         
@@ -4186,7 +4396,7 @@ async def show_config(query):
     )
     keyboard = [
         [InlineKeyboardButton("🌐 代理管理", callback_data='config_proxy')],
-        [InlineKeyboardButton("🔙 返回", callback_data='back_main')]
+        [InlineKeyboardButton("🔙 返回", callback_data='menu_messaging')]
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
@@ -4207,7 +4417,7 @@ async def show_stats(query):
         f"📨 消息: {success_msgs}/{total_msgs}\n"
         f"成功率: {(success_msgs/total_msgs*100):.1f}%" if total_msgs > 0 else "成功率: 0%"
     )
-    keyboard = [[InlineKeyboardButton("🔙 返回", callback_data='back_main')]]
+    keyboard = [[InlineKeyboardButton("🔙 返回", callback_data='menu_messaging')]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
@@ -4232,10 +4442,7 @@ async def show_help(query):
 async def back_to_main(query):
     """Back to main"""
     keyboard = [
-        [InlineKeyboardButton("📱 账户管理", callback_data='menu_accounts')],
-        [InlineKeyboardButton("📝 任务管理", callback_data='menu_tasks')],
-        [InlineKeyboardButton("⚙️ 全局配置", callback_data='menu_config')],
-        [InlineKeyboardButton("📊 统计信息", callback_data='menu_stats')],
+        [InlineKeyboardButton("📢 广告私信", callback_data='menu_messaging')],
         [InlineKeyboardButton("❓ 帮助", callback_data='menu_help')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -4343,11 +4550,19 @@ async def handle_proxy_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         os.remove(file_path)
         context.user_data['waiting_for'] = None
         
+        # Add test button if proxies were imported
+        keyboard = []
+        if imported_count > 0:
+            keyboard.append([InlineKeyboardButton("🧪 测试所有代理", callback_data='proxy_test_all')])
+        keyboard.append([InlineKeyboardButton("🔙 返回代理管理", callback_data='config_proxy')])
+        
         await update.message.reply_text(
             f"✅ <b>代理导入完成</b>\n\n"
             f"成功导入: {imported_count} 个\n"
             f"导入失败: {failed_count} 个\n\n"
-            f"💡 代理将在账户连接时自动分配使用",
+            f"💡 代理将在账户连接时自动分配使用\n\n"
+            f"{'📝 点击下方按钮测试所有代理' if imported_count > 0 else ''}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
         
