@@ -1131,13 +1131,15 @@ class TaskManager:
         logger.info(f"[批次 {batch_idx}] 批次处理完成")
     
     async def _monitor_progress(self, task_id):
-        """监控和更新任务进度 - 每10秒检查一次"""
+        """监控和更新任务进度 - 使用30-60秒随机间隔"""
         try:
             while True:
-                await asyncio.sleep(PROGRESS_MONITOR_INTERVAL)
+                # Use random interval between 30-60 seconds
+                interval = random.randint(30, 60)
+                await asyncio.sleep(interval)
                 # 进度在 _process_batch 中自动更新
                 # 这里只是保持监控任务活跃
-                logger.debug(f"任务 {task_id}: 进度监控心跳")
+                logger.debug(f"任务 {task_id}: 进度监控心跳 (下次检查间隔: {interval}秒)")
         except asyncio.CancelledError:
             logger.info(f"Task {task_id}: Progress monitor cancelled")
             raise
@@ -2251,13 +2253,15 @@ async def request_thread_config(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
-    await query.message.reply_text(
+    prompt_msg = await query.message.reply_text(
         "🧵 <b>配置线程数</b>\n\n"
         "请输入要使用的账号数量（线程数）：\n\n"
         "💡 建议：1-10\n"
         "⚠️ 线程数越多，发送速度越快，但风险也越高",
         parse_mode='HTML'
     )
+    # Store prompt message ID for later deletion
+    context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
     return CONFIG_THREAD_INPUT
 
 
@@ -2267,7 +2271,7 @@ async def request_interval_config(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
-    await query.message.reply_text(
+    prompt_msg = await query.message.reply_text(
         "⏱️ <b>配置发送间隔</b>\n\n"
         "请输入最小间隔和最大间隔（秒），用空格分隔：\n\n"
         "💡 格式：最小值 最大值\n"
@@ -2275,6 +2279,8 @@ async def request_interval_config(update: Update, context: ContextTypes.DEFAULT_
         "⚠️ 间隔越短，风险越高",
         parse_mode='HTML'
     )
+    # Store prompt message ID for later deletion
+    context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
     return CONFIG_INTERVAL_MIN_INPUT
 
 
@@ -2284,7 +2290,7 @@ async def request_bidirect_config(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
-    await query.message.reply_text(
+    prompt_msg = await query.message.reply_text(
         "🔄 <b>配置无视双向次数</b>\n\n"
         "请输入无视双向联系人限制的次数：\n\n"
         "💡 0 = 不忽略限制\n"
@@ -2292,6 +2298,8 @@ async def request_bidirect_config(update: Update, context: ContextTypes.DEFAULT_
         "⚠️ 设置过高可能导致封号",
         parse_mode='HTML'
     )
+    # Store prompt message ID for later deletion
+    context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
     return CONFIG_BIDIRECT_INPUT
 
 
@@ -2658,8 +2666,17 @@ async def handle_thread_config(update: Update, context: ContextTypes.DEFAULT_TYP
         # Auto-delete after configured delay
         await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)
         try:
+            # Delete confirmation message
             await msg.delete()
+            # Delete user input message
             await update.message.delete()
+            # Delete prompt message
+            prompt_msg_id = context.user_data.get('config_prompt_msg_id')
+            if prompt_msg_id:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=prompt_msg_id
+                )
         except Exception as e:
             logger.warning(f"Failed to delete config message: {e}")
         
@@ -2700,8 +2717,17 @@ async def handle_interval_config(update: Update, context: ContextTypes.DEFAULT_T
         # Auto-delete after configured delay
         await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)
         try:
+            # Delete confirmation message
             await msg.delete()
+            # Delete user input message
             await update.message.delete()
+            # Delete prompt message
+            prompt_msg_id = context.user_data.get('config_prompt_msg_id')
+            if prompt_msg_id:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=prompt_msg_id
+                )
         except Exception as e:
             logger.warning(f"Failed to delete config message: {e}")
         
@@ -2731,8 +2757,17 @@ async def handle_bidirect_config(update: Update, context: ContextTypes.DEFAULT_T
         # Auto-delete after configured delay
         await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)
         try:
+            # Delete confirmation message
             await msg.delete()
+            # Delete user input message
             await update.message.delete()
+            # Delete prompt message
+            prompt_msg_id = context.user_data.get('config_prompt_msg_id')
+            if prompt_msg_id:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=prompt_msg_id
+                )
         except Exception as e:
             logger.warning(f"Failed to delete config message: {e}")
         
@@ -2780,7 +2815,46 @@ async def start_task_handler(query, task_id):
         ]
         
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        progress_msg = await query.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        
+        # Wait 1 second then refresh to show initial progress
+        await asyncio.sleep(1)
+        
+        # Get updated task data
+        task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+        if task_doc:
+            task = Task.from_dict(task_doc)
+            progress = (task.sent_count / task.total_targets * 100) if task.total_targets > 0 else 0
+            
+            text = (
+                f"⬇ <b>正在私信中</b> ⬇\n"
+                f"进度 {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n"
+            )
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("👥 总用户数", callback_data='noop'),
+                    InlineKeyboardButton(f"{task.total_targets}", callback_data='noop')
+                ],
+                [
+                    InlineKeyboardButton("✅ 发送成功", callback_data='noop'),
+                    InlineKeyboardButton(f"{task.sent_count}", callback_data='noop')
+                ],
+                [
+                    InlineKeyboardButton("❌ 发送失败", callback_data='noop'),
+                    InlineKeyboardButton(f"{task.failed_count}", callback_data='noop')
+                ],
+                [
+                    InlineKeyboardButton("🔄 刷新进度", callback_data=f'task_progress_refresh_{task_id}'),
+                    InlineKeyboardButton("⏸️ 停止任务", callback_data=f'task_stop_{task_id}')
+                ]
+            ]
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            try:
+                await progress_msg.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+            except Exception as e:
+                logger.warning(f"Failed to update initial progress: {e}")
         
     except ValueError as e:
         # ValueError 通常包含用户友好的错误消息
