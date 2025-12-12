@@ -1191,8 +1191,8 @@ class TaskManager:
                 f.write("=" * 50 + "\n\n")
                 
                 # 预先批量获取所有账户和目标信息（避免N+1查询）
-                unique_account_ids = list(set([log.account_id for log in results['logs']]))
-                unique_target_ids = list(set([log.target_id for log in results['logs']]))
+                unique_account_ids = list(set([log.account_id for log in results['logs'] if log.account_id]))
+                unique_target_ids = list(set([log.target_id for log in results['logs'] if log.target_id]))
                 
                 # 批量查询账户信息
                 account_docs = self.db[Account.COLLECTION_NAME].find({
@@ -1267,8 +1267,9 @@ class TaskManager:
                     
                     status = "✅ 成功" if log.success else "❌ 失败"
                     
-                    # 格式化消息内容预览（最多50个字符）
-                    message_preview = log.message_text[:50] + "..." if len(log.message_text) > 50 else log.message_text
+                    # 格式化消息内容预览（最多50个字符），处理None情况
+                    message_text = log.message_text or ""
+                    message_preview = message_text[:50] + "..." if len(message_text) > 50 else message_text
                     
                     f.write(f"[{log.sent_at}]\n")
                     f.write(f"账户: {phone}\n")
