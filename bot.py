@@ -1769,11 +1769,12 @@ class TaskManager:
             raise
     
     async def check_accounts_availability(self):
-        """Check if any account is available"""
-        available = self.db[Account.COLLECTION_NAME].count_documents({
+        """Check if any account is available - optimized with find_one"""
+        # Use find_one instead of count_documents for better performance
+        available = self.db[Account.COLLECTION_NAME].find_one({
             'status': AccountStatus.ACTIVE.value
         })
-        return available > 0
+        return available is not None
     
     async def check_and_stop_if_no_accounts(self, task_id):
         """Check accounts and stop task if all unavailable"""
@@ -4241,21 +4242,31 @@ async def start_task_handler(query, task_id):
 
 async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
     """Auto refresh task progress every 30-50 seconds"""
+    # Cache total_targets as it doesn't change during task execution
+    total_targets_cache = None
+    error_count = 0
+    max_errors = 5  # Stop after 5 consecutive errors
+    
     while True:
         try:
             # 获取任务状态
             task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
             if not task_doc:
+                logger.info(f"Auto-refresh stopped: Task {task_id} not found")
                 break
             
             task = Task.from_dict(task_doc)
             
             # 任务结束则退出循环
             if task.status in [TaskStatus.COMPLETED.value, TaskStatus.STOPPED.value, TaskStatus.FAILED.value]:
+                logger.info(f"Auto-refresh stopped: Task {task_id} status is {task.status}")
                 break
             
-            # 计算统计
-            total_targets = db[Target.COLLECTION_NAME].count_documents({'task_id': str(task_id)})
+            # 计算统计 - cache total_targets
+            if total_targets_cache is None:
+                total_targets_cache = db[Target.COLLECTION_NAME].count_documents({'task_id': str(task_id)})
+            total_targets = total_targets_cache
+            
             sent_count = task.sent_count
             failed_count = task.failed_count
             progress = (sent_count + failed_count) / total_targets * 100 if total_targets > 0 else 0
@@ -4305,6 +4316,8 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                     reply_markup=reply_markup,
                     parse_mode='HTML'
                 )
+                # Reset error count on successful update
+                error_count = 0
             except Exception as e:
                 if "message is not modified" not in str(e).lower():
                     logger.error(f"Failed to update progress: {e}")
@@ -4313,8 +4326,15 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             await asyncio.sleep(random.randint(AUTO_REFRESH_MIN_INTERVAL, AUTO_REFRESH_MAX_INTERVAL))
             
         except Exception as e:
-            logger.error(f"Error in auto refresh: {e}")
-            # Use average of min and max for error case
+            error_count += 1
+            logger.error(f"Error in auto refresh (count: {error_count}/{max_errors}): {e}")
+            
+            # Stop after max errors to prevent infinite error loops
+            if error_count >= max_errors:
+                logger.error(f"Auto-refresh stopped after {max_errors} consecutive errors")
+                break
+            
+            # Use average interval for error case
             await asyncio.sleep((AUTO_REFRESH_MIN_INTERVAL + AUTO_REFRESH_MAX_INTERVAL) // 2)
 
 
