@@ -4245,6 +4245,9 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
     """Auto refresh task progress every 30-50 seconds"""
     error_count = 0
     
+    # Wait a bit for task to actually start
+    await asyncio.sleep(2)
+    
     while True:
         try:
             # 获取任务状态
@@ -4317,7 +4320,7 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                 if "message is not modified" not in str(e).lower():
                     logger.error(f"Failed to update progress: {e}")
             
-            # 随机等待 30-50 秒
+            # 随机等待 30-50 秒后再次更新
             await asyncio.sleep(random.randint(AUTO_REFRESH_MIN_INTERVAL, AUTO_REFRESH_MAX_INTERVAL))
             
         except Exception as e:
@@ -4422,14 +4425,17 @@ async def stop_task_handler(query, task_id):
             if task_id in task_manager.running_tasks:
                 del task_manager.running_tasks[task_id]
         
-        # Display stopping status
-        await query.edit_message_text(
-            "⏸️ <b>任务已手动停止</b>\n\n正在生成报告...",
-            parse_mode='HTML'
-        )
-        
-        # Generate completion report
-        await send_task_completion_report(query.bot, query.message.chat_id, task_id)
+        # Send completion report directly (don't edit first, just send new message)
+        try:
+            await send_task_completion_report(query.bot, query.message.chat_id, task_id)
+        except Exception as report_error:
+            logger.error(f"Error sending completion report: {report_error}", exc_info=True)
+            # Fallback to simple message
+            await query.message.reply_text(
+                "⏸️ <b>任务已手动停止</b>\n\n"
+                "报告生成失败，请查看日志。",
+                parse_mode='HTML'
+            )
         
     except Exception as e:
         logger.error(f"Error stopping task {task_id}: {e}", exc_info=True)
