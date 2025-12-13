@@ -2914,7 +2914,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # 删除进度消息
             try:
                 await progress_msg.delete()
-            except:
+            except Exception:
                 pass
             
             # Delete all accounts from database
@@ -3030,7 +3030,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # 删除进度消息
             try:
                 await progress_msg.delete()
-            except:
+            except Exception:
                 pass
             
             # Delete limited accounts from database
