@@ -1283,9 +1283,14 @@ class TaskManager:
         except asyncio.TimeoutError:
             asyncio_task.cancel()
         
+        # Update status to STOPPED with completion time
         self.tasks_col.update_one(
             {'_id': ObjectId(task_id)},
-            {'$set': {'status': TaskStatus.PAUSED.value, 'updated_at': datetime.utcnow()}}
+            {'$set': {
+                'status': TaskStatus.STOPPED.value,
+                'completed_at': datetime.utcnow(),
+                'updated_at': datetime.utcnow()
+            }}
         )
         
         del self.running_tasks[task_id_str]
@@ -1465,6 +1470,12 @@ class TaskManager:
                 logger.info("检测到停止标志，终止任务")
                 break
             
+            # 每10轮检查账号
+            if batch_index > 0 and batch_index % 10 == 0:
+                if await self.check_and_stop_if_no_accounts(task_id):
+                    logger.info("所有账号不可用，任务已停止")
+                    break
+            
             logger.info("=" * 80)
             logger.info(f"第 {batch_index + 1}/{len(account_batches)} 轮")
             logger.info(f"使用账号: {[acc.phone for acc in account_batch]}")
@@ -1576,12 +1587,21 @@ class TaskManager:
         
         account_pool = all_accounts.copy()
         account_index = 0
+        loop_count = 0
+        consecutive_failures = 0
         
         for idx, target in enumerate(targets):
             # 检查停止标志
             if self.stop_flags.get(task_id, False):
                 logger.info(f"[批次 {batch_idx}] 检测到停止标志，停止执行")
                 break
+            
+            # 每10次循环检查账号
+            loop_count += 1
+            if loop_count % 10 == 0:
+                if await self.check_and_stop_if_no_accounts(task_id):
+                    logger.info(f"[批次 {batch_idx}] 所有账号不可用，任务已停止")
+                    break
             
             logger.info(f"[批次 {batch_idx}] 处理目标 {idx + 1}/{len(targets)}: {target.username or target.user_id}")
             
@@ -1620,7 +1640,8 @@ class TaskManager:
                     account_index += 1
                     attempts += 1
                 else:
-                    # 发送成功
+                    # 发送成功 - 重置连续失败计数
+                    consecutive_failures = 0
                     self.tasks_col.update_one(
                         {'_id': ObjectId(task_id)},
                         {'$inc': {'sent_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
@@ -1641,11 +1662,25 @@ class TaskManager:
             
             # 如果所有账号都尝试过仍然失败
             if not success:
+                consecutive_failures += 1
                 self.tasks_col.update_one(
                     {'_id': ObjectId(task_id)},
                     {'$inc': {'failed_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
                 )
                 logger.warning(f"[批次 {batch_idx}] ❌ 所有账户尝试后仍然失败: {target.username or target.user_id}")
+                
+                # 检查连续失败次数
+                if consecutive_failures >= 50:
+                    logger.warning(f"[批次 {batch_idx}] 连续失败 {consecutive_failures} 次，检查账号可用性")
+                    # 获取当前任务状态检查是否有成功发送
+                    task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+                    if task_doc:
+                        sent_count = task_doc.get('sent_count', 0)
+                        if sent_count == 0:
+                            # 没有任何成功发送，检查账号
+                            if await self.check_and_stop_if_no_accounts(task_id):
+                                logger.info(f"[批次 {batch_idx}] 所有账号不可用，任务已停止")
+                                break
         
         logger.info(f"[批次 {batch_idx}] 批次处理完成")
     
@@ -1730,6 +1765,50 @@ class TaskManager:
         except asyncio.CancelledError:
             logger.info(f"Task {task_id}: Progress monitor cancelled")
             raise
+    
+    async def check_accounts_availability(self):
+        """Check if any account is available"""
+        available = self.db[Account.COLLECTION_NAME].count_documents({
+            'status': AccountStatus.ACTIVE.value
+        })
+        return available > 0
+    
+    async def check_and_stop_if_no_accounts(self, task_id):
+        """Check accounts and stop task if all unavailable"""
+        if not await self.check_accounts_availability():
+            logger.error(f"Task {task_id}: All accounts unavailable")
+            
+            # 标记任务失败
+            self.tasks_col.update_one(
+                {'_id': ObjectId(task_id)},
+                {
+                    '$set': {
+                        'status': TaskStatus.FAILED.value,
+                        'completed_at': datetime.utcnow(),
+                        'error_message': '所有账号均无法发送消息'
+                    }
+                }
+            )
+            
+            # 发送通知到管理员（如果bot_application可用）
+            if self.bot_application:
+                try:
+                    await self.bot_application.bot.send_message(
+                        Config.ADMIN_USER_ID,
+                        "❌ <b>任务自动停止</b>\n\n"
+                        "原因：所有账号均无法发送消息\n\n"
+                        "请检查账号状态或更换账号",
+                        parse_mode='HTML'
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send admin notification: {e}")
+            
+            # 生成报告
+            await self._send_completion_reports(task_id)
+            
+            return True
+        
+        return False
     
     async def _send_completion_reports(self, task_id):
         """生成并自动发送完成报告 - 任务完成后自动执行"""
@@ -4064,7 +4143,7 @@ async def handle_bidirect_config(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def start_task_handler(query, task_id):
-    """Start task and show progress in new message"""
+    """Start task and show progress in new message with auto-refresh"""
     try:
         await task_manager.start_task(task_id)
         await query.answer("✅ 任务已开始")
@@ -4100,6 +4179,16 @@ async def start_task_handler(query, task_id):
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         progress_msg = await query.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        
+        # 启动后台自动刷新任务（不阻塞）
+        asyncio.create_task(
+            auto_refresh_task_progress(
+                query.bot,
+                query.message.chat_id,
+                progress_msg.message_id,
+                task_id
+            )
+        )
         
         # Wait 1 second then refresh to show initial progress
         await asyncio.sleep(1)
@@ -4148,16 +4237,159 @@ async def start_task_handler(query, task_id):
         await query.answer(f"❌ 启动失败: {str(e)}", show_alert=True)
 
 
+async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
+    """Auto refresh task progress every 30-50 seconds"""
+    import random
+    
+    while True:
+        try:
+            # 获取任务状态
+            task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+            if not task_doc:
+                break
+            
+            task = Task.from_dict(task_doc)
+            
+            # 任务结束则退出循环
+            if task.status in [TaskStatus.COMPLETED.value, TaskStatus.STOPPED.value, TaskStatus.FAILED.value]:
+                break
+            
+            # 计算统计
+            total_targets = db[Target.COLLECTION_NAME].count_documents({'task_id': str(task_id)})
+            sent_count = task.sent_count
+            failed_count = task.failed_count
+            progress = (sent_count + failed_count) / total_targets * 100 if total_targets > 0 else 0
+            
+            # 计算时间
+            if task.started_at:
+                runtime = datetime.utcnow() - task.started_at
+                hours, remainder = divmod(int(runtime.total_seconds()), 3600)
+                minutes, seconds = divmod(remainder, 60)
+                runtime_str = f"{hours}:{minutes:02d}:{seconds:02d}"
+                
+                # 预计剩余
+                if sent_count + failed_count > 0:
+                    avg_time = runtime.total_seconds() / (sent_count + failed_count)
+                    remaining = (total_targets - sent_count - failed_count) * avg_time
+                    rem_hours, rem_remainder = divmod(int(remaining), 3600)
+                    rem_minutes, rem_seconds = divmod(rem_remainder, 60)
+                    remaining_str = f"{rem_hours}:{rem_minutes:02d}:{rem_seconds:02d}"
+                else:
+                    remaining_str = "计算中..."
+            else:
+                runtime_str = "0:00:00"
+                remaining_str = "未知"
+            
+            # 更新消息
+            text = (
+                f"📊 <b>正在私信中</b>\n\n"
+                f"进度: {sent_count + failed_count}/{total_targets} ({progress:.1f}%)\n\n"
+                f"⏱️ 预计剩余: {remaining_str}\n"
+                f"⏰ 已运行: {runtime_str}\n\n"
+                f"👥 总用户数: {total_targets}\n"
+                f"✅ 发送成功: {sent_count}\n"
+                f"❌ 发送失败: {failed_count}"
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("🔄 刷新进度", callback_data=f'task_progress_refresh_{task_id}')],
+                [InlineKeyboardButton("⏸️ 停止任务", callback_data=f'task_stop_{task_id}')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            try:
+                await bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=reply_markup,
+                    parse_mode='HTML'
+                )
+            except Exception as e:
+                if "message is not modified" not in str(e).lower():
+                    logger.error(f"Failed to update progress: {e}")
+            
+            # 随机等待 30-50 秒
+            await asyncio.sleep(random.randint(30, 50))
+            
+        except Exception as e:
+            logger.error(f"Error in auto refresh: {e}")
+            await asyncio.sleep(40)
+
+
+async def send_task_completion_report(bot, chat_id, task_id):
+    """Send enhanced completion report with detailed stats and account status"""
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    if not task_doc:
+        return
+    
+    task = Task.from_dict(task_doc)
+    
+    # 状态文本
+    if task.status == TaskStatus.STOPPED.value:
+        status_text = "⏸️ <b>任务已手动停止</b>"
+    elif task.status == TaskStatus.FAILED.value:
+        error_msg = task_doc.get('error_message', '未知')
+        status_text = f"❌ <b>任务失败</b>\n原因: {error_msg}"
+    else:
+        status_text = "✅ <b>任务完成</b>"
+    
+    # 统计
+    total_targets = db[Target.COLLECTION_NAME].count_documents({'task_id': str(task_id)})
+    success_rate = (task.sent_count / (task.sent_count + task.failed_count) * 100) if (task.sent_count + task.failed_count) > 0 else 0
+    
+    # 时间
+    if task.started_at and task.completed_at:
+        runtime = task.completed_at - task.started_at
+        hours, remainder = divmod(int(runtime.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        runtime_str = f"{hours}小时{minutes}分{seconds}秒" if hours > 0 else f"{minutes}分{seconds}秒"
+    else:
+        runtime_str = "未知"
+    
+    # 账号状态
+    active_accounts = db[Account.COLLECTION_NAME].count_documents({'status': AccountStatus.ACTIVE.value})
+    limited_accounts = db[Account.COLLECTION_NAME].count_documents({'status': AccountStatus.LIMITED.value})
+    banned_accounts = db[Account.COLLECTION_NAME].count_documents({'status': AccountStatus.BANNED.value})
+    
+    text = (
+        f"{status_text}\n\n"
+        f"📊 <b>任务统计：</b>\n"
+        f"👥 目标用户: {total_targets}\n"
+        f"✅ 发送成功: {task.sent_count}\n"
+        f"❌ 发送失败: {task.failed_count}\n"
+        f"📈 成功率: {success_rate:.1f}%\n"
+        f"⏱️ 运行时间: {runtime_str}\n\n"
+        f"📱 <b>账号状态：</b>\n"
+        f"✅ 可用: {active_accounts}\n"
+        f"⚠️ 受限: {limited_accounts}\n"
+        f"🚫 封禁: {banned_accounts}"
+    )
+    
+    # 操作按钮
+    keyboard = [
+        [InlineKeyboardButton("📥 导出日志", callback_data=f'task_export_{task_id}')],
+        [InlineKeyboardButton("📊 查看详情", callback_data=f'task_detail_{task_id}')],
+        [InlineKeyboardButton("🔙 返回任务列表", callback_data='tasks_list')]
+    ]
+    
+    await bot.send_message(chat_id, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
 async def stop_task_handler(query, task_id):
-    """Stop task immediately"""
+    """Stop task immediately and generate report"""
     try:
         # Set stop flag immediately
         task_manager.stop_flags[task_id] = True
         
-        # Update task status immediately
+        # Update task status to STOPPED (not PAUSED) with completion time
         db[Task.COLLECTION_NAME].update_one(
             {'_id': ObjectId(task_id)},
-            {'$set': {'status': TaskStatus.PAUSED.value, 'updated_at': datetime.utcnow()}}
+            {'$set': {
+                'status': TaskStatus.STOPPED.value,
+                'completed_at': datetime.utcnow(),
+                'updated_at': datetime.utcnow()
+            }}
         )
         
         await query.answer("⏸️ 任务停止中...")
@@ -4174,8 +4406,14 @@ async def stop_task_handler(query, task_id):
             if task_id in task_manager.running_tasks:
                 del task_manager.running_tasks[task_id]
         
-        # Show updated task detail
-        await show_task_detail(query, task_id)
+        # Display stopping status
+        await query.edit_message_text(
+            "⏸️ <b>任务已手动停止</b>\n\n正在生成报告...",
+            parse_mode='HTML'
+        )
+        
+        # Generate completion report
+        await send_task_completion_report(query.bot, query.message.chat_id, task_id)
         
     except Exception as e:
         logger.error(f"Error stopping task {task_id}: {e}", exc_info=True)
