@@ -2981,11 +2981,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('task_start_'):
         task_id = data.split('_')[2]
         logger.info(f"User {user_id} starting task {task_id}")
-        await start_task_handler(query, task_id)
+        await start_task_handler(query, task_id, context)
     elif data.startswith('task_stop_'):
         task_id = data.split('_')[2]
         logger.info(f"User {user_id} stopping task {task_id}")
-        await stop_task_handler(query, task_id)
+        await stop_task_handler(query, task_id, context)
     elif data.startswith('task_progress_'):
         # Handle both task_progress_refresh_ and task_progress_
         if 'refresh' in data:
@@ -4311,7 +4311,7 @@ async def handle_bidirect_config(update: Update, context: ContextTypes.DEFAULT_T
         return CONFIG_BIDIRECT_INPUT
 
 
-async def start_task_handler(query, task_id):
+async def start_task_handler(query, task_id, context):
     """Start task and show progress in new message with auto-refresh"""
     try:
         await task_manager.start_task(task_id)
@@ -4352,7 +4352,7 @@ async def start_task_handler(query, task_id):
         # 启动后台自动刷新任务（不阻塞）
         asyncio.create_task(
             auto_refresh_task_progress(
-                query.bot,
+                context.bot,
                 query.message.chat_id,
                 progress_msg.message_id,
                 task_id
@@ -4562,7 +4562,7 @@ async def send_task_completion_report(bot, chat_id, task_id):
     await bot.send_message(chat_id, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
-async def stop_task_handler(query, task_id):
+async def stop_task_handler(query, task_id, context):
     """Stop task immediately and generate report"""
     try:
         # Set stop flag immediately
@@ -4594,7 +4594,7 @@ async def stop_task_handler(query, task_id):
         
         # Send completion report directly (don't edit first, just send new message)
         try:
-            await send_task_completion_report(query.bot, query.message.chat_id, task_id)
+            await send_task_completion_report(context.bot, query.message.chat_id, task_id)
         except Exception as report_error:
             logger.error(f"Error sending completion report: {report_error}", exc_info=True)
             # Fallback to simple message
