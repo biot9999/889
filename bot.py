@@ -4768,15 +4768,27 @@ async def start_task_handler(query, task_id, context):
         reply_markup = InlineKeyboardMarkup(keyboard)
         progress_msg = await query.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
         
-        # 启动后台自动刷新任务（不阻塞）
-        asyncio.create_task(
-            auto_refresh_task_progress(
-                context.bot,
-                query.message.chat_id,
-                progress_msg.message_id,
-                task_id
-            )
-        )
+        # 启动后台自动刷新任务（不阻塞）- 带异常处理包装
+        async def auto_refresh_wrapper():
+            try:
+                await auto_refresh_task_progress(
+                    context.bot,
+                    query.message.chat_id,
+                    progress_msg.message_id,
+                    task_id
+                )
+            except asyncio.CancelledError:
+                logger.info(f"Auto-refresh task for task {task_id} was cancelled")
+                raise  # Re-raise to properly handle cancellation
+            except Exception as e:
+                logger.error(f"Unhandled exception in auto_refresh_task_progress for task {task_id}: {e}", exc_info=True)
+        
+        refresh_task = asyncio.create_task(auto_refresh_wrapper())
+        
+        # Store the refresh task so it can be cancelled later if needed
+        if not hasattr(task_manager, 'refresh_tasks'):
+            task_manager.refresh_tasks = {}
+        task_manager.refresh_tasks[task_id] = refresh_task
         
         # Wait 1 second then refresh to show initial progress
         await asyncio.sleep(1)
@@ -4922,9 +4934,21 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                 )
                 # Reset error count on successful update
                 error_count = 0
+            except telegram_error.BadRequest as e:
+                # Handle message not found, deleted, or too old to edit
+                error_str = str(e).lower()
+                if any(keyword in error_str for keyword in ['message to edit not found', 'message can\'t be edited', 'message is not modified', 'message to delete not found']):
+                    logger.info(f"Auto-refresh stopped: message no longer available for task {task_id}")
+                    break  # Stop the refresh loop
+                else:
+                    logger.error(f"BadRequest updating progress: {e}")
+                    error_count += 1
             except Exception as e:
+                error_count += 1
                 if "message is not modified" not in str(e).lower():
                     logger.error(f"Failed to update progress: {e}")
+                    if error_count >= MAX_AUTO_REFRESH_ERRORS:
+                        break
             
             # 智能刷新间隔：前1分钟每10秒，后面30-50秒
             elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
@@ -5034,6 +5058,19 @@ async def stop_task_handler(query, task_id, context):
         
         await safe_answer_query(query, "⏸️ 任务停止中...")
         
+        # Cancel the auto-refresh task if it exists
+        if hasattr(task_manager, 'refresh_tasks') and task_id in task_manager.refresh_tasks:
+            refresh_task = task_manager.refresh_tasks[task_id]
+            if not refresh_task.done():
+                refresh_task.cancel()
+                try:
+                    await asyncio.wait_for(refresh_task, timeout=1.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass  # Expected when cancelling
+                except Exception as e:
+                    logger.warning(f"Error cancelling refresh task: {e}")
+            del task_manager.refresh_tasks[task_id]
+        
         # Try to stop the task gracefully
         if task_id in task_manager.running_tasks:
             asyncio_task = task_manager.running_tasks[task_id]
@@ -5042,6 +5079,12 @@ async def stop_task_handler(query, task_id, context):
             except asyncio.TimeoutError:
                 # Cancel forcefully if it takes too long
                 asyncio_task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio_task, timeout=1.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass  # Expected
+            except Exception as e:
+                logger.warning(f"Error stopping task: {e}")
             
             if task_id in task_manager.running_tasks:
                 del task_manager.running_tasks[task_id]
