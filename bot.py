@@ -285,17 +285,23 @@ async def check_account_real_status(account_manager, account_id):
                 logger.debug(f"Using cached status for account {account_id}: {cached['status']}")
                 return cached['status']
     
+    client = None
     try:
-        # 获取客户端
-        client = await account_manager.get_client(account_id)
+        # 获取客户端 - 带超时保护
+        client = await asyncio.wait_for(
+            account_manager.get_client(account_id),
+            timeout=10.0
+        )
         
-        # 查询 @spambot
-        spambot = await client.get_entity('spambot')
-        await client.send_message(spambot, '/start')
-        await asyncio.sleep(2)
+        # 查询 @spambot - 整个操作带超时保护
+        async def query_spambot():
+            spambot = await client.get_entity('spambot')
+            await client.send_message(spambot, '/start')
+            await asyncio.sleep(2)
+            return await client.get_messages(spambot, limit=1)
         
-        # 获取回复
-        messages = await client.get_messages(spambot, limit=1)
+        messages = await asyncio.wait_for(query_spambot(), timeout=15.0)
+        
         if not messages:
             logger.warning(f"No response from @spambot for account {account_id}")
             return 'unknown'
@@ -331,9 +337,21 @@ async def check_account_real_status(account_manager, account_id):
         
         return status
         
-    except Exception as e:
-        logger.error(f"Error checking account {account_id} with @spambot: {e}")
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout checking account {account_id} with @spambot")
         return 'unknown'
+    except Exception as e:
+        logger.error(f"Error checking account {account_id} with @spambot: {e}", exc_info=True)
+        return 'unknown'
+    finally:
+        # Ensure any pending operations are properly handled
+        # Note: We don't disconnect the client as it's cached and managed by account_manager
+        if client:
+            try:
+                # Give a moment for any pending operations to complete
+                await asyncio.sleep(0.1)
+            except Exception:
+                pass
 
 
 async def should_stop_task_due_to_accounts(db_instance, task_id):
