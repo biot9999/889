@@ -197,6 +197,7 @@ ACCOUNT_CHECK_LOOP_INTERVAL = 10  # check accounts every N loop iterations
 CONSECUTIVE_FAILURES_THRESHOLD = 50  # check accounts after N consecutive failures
 STOP_CONFIRMATION_ITERATIONS = 50  # wait iterations for task stop confirmation (50 * 0.1s = 5s)
 STOP_CONFIRMATION_SLEEP = 0.1  # seconds to sleep between confirmation checks
+MAX_REPORT_RETRY_ATTEMPTS = 3  # maximum attempts to send completion report
 
 # UI labels mapping
 SEND_METHOD_LABELS = {
@@ -1196,6 +1197,7 @@ class TaskManager:
         self.running_tasks = {}  # {task_id: {'asyncio_task': Task, 'stop_event': Event, 'started_at': datetime}}
         self.stop_flags = {}  # Keep for backward compatibility
         self.report_sent = set()  # Track which tasks have sent completion reports
+        self.report_retry_count = {}  # Track report send retry attempts {task_id: count}
         self.bot_application = bot_application  # 用于发送完成报告
     
     def create_task(self, name, message_text, message_format, media_type=MediaType.TEXT,
@@ -1298,6 +1300,14 @@ class TaskManager:
         # Get task info early to avoid undefined variable
         task_info = self.running_tasks[task_id_str]
         
+        # Validate task_info structure (should always be dict with new implementation)
+        if not isinstance(task_info, dict):
+            logger.error(f"Task {task_id}: Invalid task_info structure, expected dict")
+            # Try to handle old format for safety
+            asyncio_task = task_info
+        else:
+            asyncio_task = task_info.get('asyncio_task')
+        
         # 1. Set memory stop flag (for backward compatibility)
         self.stop_flags[task_id_str] = True
         
@@ -1318,7 +1328,6 @@ class TaskManager:
         logger.info(f"Task {task_id}: Database status updated to STOPPED")
         
         # 4. Wait for task to acknowledge and stop (with timeout)
-        asyncio_task = task_info.get('asyncio_task') if isinstance(task_info, dict) else task_info
         try:
             await asyncio.wait_for(asyncio_task, timeout=10.0)
             logger.info(f"Task {task_id}: Stopped gracefully")
@@ -1915,12 +1924,19 @@ class TaskManager:
             logger.info(f"任务 {task_id}: 报告已发送，跳过重复发送")
             return
         
+        # Check retry limit
+        retry_count = self.report_retry_count.get(task_id, 0)
+        if retry_count >= MAX_REPORT_RETRY_ATTEMPTS:
+            logger.error(f"任务 {task_id}: 达到最大重试次数 ({MAX_REPORT_RETRY_ATTEMPTS})，停止发送报告")
+            return
+        
         self.report_sent.add(task_id)
         
         try:
             logger.info(f"========================================")
             logger.info(f"任务完成 - 开始生成报告")
             logger.info(f"任务ID: {task_id}")
+            logger.info(f"尝试次数: {retry_count + 1}/{MAX_REPORT_RETRY_ATTEMPTS}")
             logger.info(f"========================================")
             
             # Get task info for message count
@@ -2172,8 +2188,10 @@ class TaskManager:
             
         except Exception as e:
             logger.error(f"任务 {task_id}: 生成完成报告出错: {e}", exc_info=True)
-            # Remove from report_sent on error so it can be retried
+            # Remove from report_sent and increment retry count
             self.report_sent.discard(task_id)
+            self.report_retry_count[task_id] = retry_count + 1
+            logger.info(f"任务 {task_id}: 报告发送失败，将在下次尝试 (剩余重试: {MAX_REPORT_RETRY_ATTEMPTS - self.report_retry_count[task_id]})")
     
     async def _send_message(self, task, target, account):
         """发送消息 - 支持所有发送方式"""
@@ -2435,21 +2453,26 @@ class TaskManager:
         if not task_doc:
             return None
         
+        # Success: is_sent=True
         success_docs = self.targets_col.find({'task_id': task_id, 'is_sent': True})
         success_targets = [Target.from_dict(doc) for doc in success_docs]
         
+        # Failed: is_sent=False AND has error_message
         failed_docs = self.targets_col.find({
             'task_id': task_id,
             'is_sent': False,
-            'error_message': {'$ne': None}
+            'error_message': {'$ne': None, '$exists': True}
         })
         failed_targets = [Target.from_dict(doc) for doc in failed_docs]
         
-        # Get remaining targets (not sent and no error)
+        # Remaining: is_sent=False AND no error_message (or error_message doesn't exist)
         remaining_docs = self.targets_col.find({
             'task_id': task_id,
-            'is_sent': {'$ne': True},
-            'error_message': None
+            'is_sent': False,
+            '$or': [
+                {'error_message': None},
+                {'error_message': {'$exists': False}}
+            ]
         })
         remaining_targets = [Target.from_dict(doc) for doc in remaining_docs]
         
