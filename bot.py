@@ -189,6 +189,12 @@ PROGRESS_MONITOR_INTERVAL = 10
 TASK_STOP_TIMEOUT_SECONDS = 2.0
 CONFIG_MESSAGE_DELETE_DELAY = 3
 
+# Auto-refresh and account checking
+AUTO_REFRESH_MIN_INTERVAL = 30  # seconds
+AUTO_REFRESH_MAX_INTERVAL = 50  # seconds
+ACCOUNT_CHECK_LOOP_INTERVAL = 10  # check accounts every N loop iterations
+CONSECUTIVE_FAILURES_THRESHOLD = 50  # check accounts after N consecutive failures
+
 # UI labels mapping
 SEND_METHOD_LABELS = {
     SendMethod.DIRECT: '📤 直接发送',
@@ -1472,7 +1478,7 @@ class TaskManager:
                 break
             
             # 每10轮检查账号
-            if batch_index > 0 and batch_index % 10 == 0:
+            if batch_index > 0 and batch_index % ACCOUNT_CHECK_LOOP_INTERVAL == 0:
                 if await self.check_and_stop_if_no_accounts(task_id):
                     logger.info("所有账号不可用，任务已停止")
                     break
@@ -1599,7 +1605,7 @@ class TaskManager:
             
             # 每10次循环检查账号
             loop_count += 1
-            if loop_count % 10 == 0:
+            if loop_count % ACCOUNT_CHECK_LOOP_INTERVAL == 0:
                 if await self.check_and_stop_if_no_accounts(task_id):
                     logger.info(f"[批次 {batch_idx}] 所有账号不可用，任务已停止")
                     break
@@ -1671,17 +1677,12 @@ class TaskManager:
                 logger.warning(f"[批次 {batch_idx}] ❌ 所有账户尝试后仍然失败: {target.username or target.user_id}")
                 
                 # 检查连续失败次数
-                if consecutive_failures >= 50:
+                if consecutive_failures >= CONSECUTIVE_FAILURES_THRESHOLD:
                     logger.warning(f"[批次 {batch_idx}] 连续失败 {consecutive_failures} 次，检查账号可用性")
-                    # 获取当前任务状态检查是否有成功发送
-                    task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
-                    if task_doc:
-                        sent_count = task_doc.get('sent_count', 0)
-                        if sent_count == 0:
-                            # 没有任何成功发送，检查账号
-                            if await self.check_and_stop_if_no_accounts(task_id):
-                                logger.info(f"[批次 {batch_idx}] 所有账号不可用，任务已停止")
-                                break
+                    # 检查账号可用性（无论是否有成功发送）
+                    if await self.check_and_stop_if_no_accounts(task_id):
+                        logger.info(f"[批次 {batch_idx}] 所有账号不可用，任务已停止")
+                        break
         
         logger.info(f"[批次 {batch_idx}] 批次处理完成")
     
@@ -4240,8 +4241,6 @@ async def start_task_handler(query, task_id):
 
 async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
     """Auto refresh task progress every 30-50 seconds"""
-    import random
-    
     while True:
         try:
             # 获取任务状态
@@ -4311,11 +4310,12 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                     logger.error(f"Failed to update progress: {e}")
             
             # 随机等待 30-50 秒
-            await asyncio.sleep(random.randint(30, 50))
+            await asyncio.sleep(random.randint(AUTO_REFRESH_MIN_INTERVAL, AUTO_REFRESH_MAX_INTERVAL))
             
         except Exception as e:
             logger.error(f"Error in auto refresh: {e}")
-            await asyncio.sleep(40)
+            # Use average of min and max for error case
+            await asyncio.sleep((AUTO_REFRESH_MIN_INTERVAL + AUTO_REFRESH_MAX_INTERVAL) // 2)
 
 
 async def send_task_completion_report(bot, chat_id, task_id):
