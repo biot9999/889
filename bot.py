@@ -1194,7 +1194,7 @@ class TaskManager:
         self.targets_col = db[Target.COLLECTION_NAME]
         self.logs_col = db[MessageLog.COLLECTION_NAME]
         self.account_manager = account_manager
-        self.running_tasks = {}  # {task_id: {'asyncio_task': Task, 'stop_event': Event, 'started_at': datetime}}
+        self.running_tasks = {}  # {task_id: {'asyncio_task': asyncio.Task, 'stop_event': asyncio.Event, 'started_at': datetime}}
         self.stop_flags = {}  # Keep for backward compatibility
         self.report_sent = set()  # Track which tasks have sent completion reports
         self.report_retry_count = {}  # Track report send retry attempts {task_id: count}
@@ -1301,9 +1301,11 @@ class TaskManager:
         task_info = self.running_tasks[task_id_str]
         
         # Validate task_info structure (should always be dict with new implementation)
+        # Old format (before this fix): asyncio.Task was stored directly
+        # New format: {'asyncio_task': asyncio.Task, 'stop_event': asyncio.Event, 'started_at': datetime}
         if not isinstance(task_info, dict):
-            logger.error(f"Task {task_id}: Invalid task_info structure, expected dict")
-            # Try to handle old format for safety
+            logger.error(f"Task {task_id}: Invalid task_info structure, expected dict (old format detected)")
+            # Fallback to handle old format for safety
             asyncio_task = task_info
         else:
             asyncio_task = task_info.get('asyncio_task')
@@ -1955,7 +1957,7 @@ class TaskManager:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             logger.info(f"报告时间戳: {timestamp}")
             
-            # 生成4个报告文件（添加剩余用户名文件）
+            # 生成4个报告文件: 成功/失败/剩余用户列表 + 运行日志
             success_file = os.path.join(Config.RESULTS_DIR, f"发送成功的用户名_{task_id}_{timestamp}.txt")
             failed_file = os.path.join(Config.RESULTS_DIR, f"发送失败的用户名_{task_id}_{timestamp}.txt")
             remaining_file = os.path.join(Config.RESULTS_DIR, f"剩余未发送的用户名_{task_id}_{timestamp}.txt")
