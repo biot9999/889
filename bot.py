@@ -195,6 +195,8 @@ AUTO_REFRESH_MAX_INTERVAL = 50  # seconds
 MAX_AUTO_REFRESH_ERRORS = 5  # stop auto-refresh after N consecutive errors
 ACCOUNT_CHECK_LOOP_INTERVAL = 10  # check accounts every N loop iterations
 CONSECUTIVE_FAILURES_THRESHOLD = 50  # check accounts after N consecutive failures
+STOP_CONFIRMATION_ITERATIONS = 50  # wait iterations for task stop confirmation (50 * 0.1s = 5s)
+STOP_CONFIRMATION_SLEEP = 0.1  # seconds to sleep between confirmation checks
 
 # UI labels mapping
 SEND_METHOD_LABELS = {
@@ -1293,15 +1295,16 @@ class TaskManager:
         if task_id_str not in self.running_tasks:
             raise ValueError("Task not running")
         
+        # Get task info early to avoid undefined variable
+        task_info = self.running_tasks[task_id_str]
+        
         # 1. Set memory stop flag (for backward compatibility)
         self.stop_flags[task_id_str] = True
         
         # 2. Set asyncio.Event for immediate stop
-        if task_id_str in self.running_tasks:
-            task_info = self.running_tasks[task_id_str]
-            if isinstance(task_info, dict) and 'stop_event' in task_info:
-                task_info['stop_event'].set()
-                logger.info(f"Task {task_id}: Stop event set")
+        if isinstance(task_info, dict) and 'stop_event' in task_info:
+            task_info['stop_event'].set()
+            logger.info(f"Task {task_id}: Stop event set")
         
         # 3. Update database status immediately
         self.tasks_col.update_one(
@@ -1328,13 +1331,13 @@ class TaskManager:
                 pass
         
         # 5. Wait for confirmation that task has cleaned up
-        for i in range(50):
+        for i in range(STOP_CONFIRMATION_ITERATIONS):
             if task_id_str not in self.running_tasks:
                 logger.info(f"Task {task_id}: Confirmed stopped (iteration {i})")
                 break
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(STOP_CONFIRMATION_SLEEP)
         else:
-            # Force cleanup after 5 seconds
+            # Force cleanup after timeout (STOP_CONFIRMATION_ITERATIONS * STOP_CONFIRMATION_SLEEP seconds)
             logger.warning(f"Task {task_id}: Force cleanup after timeout")
             if task_id_str in self.running_tasks:
                 del self.running_tasks[task_id_str]
@@ -2102,8 +2105,22 @@ class TaskManager:
                 total_messages = task.sent_count  # Total messages sent (including repeat sends)
                 remaining_count = len(results['remaining_targets'])
                 
+                # Context-aware completion message
+                if remaining_count == 0:
+                    status_emoji = "🎉"
+                    status_msg = "任务完成，用户名已用完！"
+                elif task.status == TaskStatus.STOPPED.value:
+                    status_emoji = "⏸️"
+                    status_msg = "任务已手动停止"
+                elif task.status == TaskStatus.FAILED.value:
+                    status_emoji = "❌"
+                    status_msg = "任务失败"
+                else:
+                    status_emoji = "✅"
+                    status_msg = "任务完成！"
+                
                 completion_text = (
-                    f"🎉 <b>任务完成！</b>\n\n"
+                    f"{status_emoji} <b>{status_msg}</b>\n\n"
                     f"📊 任务统计：\n"
                     f"✅ 发送成功: {total_messages} 条消息\n"
                     f"📧 成功用户: {unique_users} 人\n"
