@@ -2052,9 +2052,32 @@ class TaskManager:
         return available is not None
     
     async def check_and_stop_if_no_accounts(self, task_id):
-        """Check accounts and stop task if all unavailable"""
+        """Check accounts and stop task if all unavailable - with detailed reason"""
         if not await self.check_accounts_availability():
             logger.error(f"Task {task_id}: All accounts unavailable")
+            
+            # 获取账户状态统计
+            total_accounts = self.db[Account.COLLECTION_NAME].count_documents({})
+            banned_count = self.db[Account.COLLECTION_NAME].count_documents({
+                'status': AccountStatus.BANNED.value
+            })
+            limited_count = self.db[Account.COLLECTION_NAME].count_documents({
+                'status': AccountStatus.LIMITED.value
+            })
+            inactive_count = self.db[Account.COLLECTION_NAME].count_documents({
+                'status': AccountStatus.INACTIVE.value
+            })
+            
+            # 构建详细的停止原因
+            reason_parts = []
+            if banned_count > 0:
+                reason_parts.append(f"封禁: {banned_count}")
+            if limited_count > 0:
+                reason_parts.append(f"受限: {limited_count}")
+            if inactive_count > 0:
+                reason_parts.append(f"未激活: {inactive_count}")
+            
+            detailed_reason = f"所有账号均无法发送消息 (总计: {total_accounts}, {', '.join(reason_parts)})"
             
             # 标记任务失败
             self.tasks_col.update_one(
@@ -2063,7 +2086,7 @@ class TaskManager:
                     '$set': {
                         'status': TaskStatus.FAILED.value,
                         'completed_at': datetime.utcnow(),
-                        'error_message': '所有账号均无法发送消息'
+                        'error_message': detailed_reason
                     }
                 }
             )
@@ -2073,9 +2096,17 @@ class TaskManager:
                 try:
                     await self.bot_application.bot.send_message(
                         Config.ADMIN_USER_ID,
-                        "❌ <b>任务自动停止</b>\n\n"
-                        "原因：所有账号均无法发送消息\n\n"
-                        "请检查账号状态或更换账号",
+                        f"❌ <b>任务自动停止</b>\n\n"
+                        f"原因：{detailed_reason}\n\n"
+                        f"📊 账户状态详情：\n"
+                        f"• 总账户数: {total_accounts}\n"
+                        f"• 🚫 封禁: {banned_count}\n"
+                        f"• ⚠️ 受限: {limited_count}\n"
+                        f"• ❄️ 未激活: {inactive_count}\n\n"
+                        f"💡 建议：\n"
+                        f"1. 使用 '检查账户状态' 功能查询 @spambot\n"
+                        f"2. 添加新的可用账户\n"
+                        f"3. 等待受限账户恢复",
                         parse_mode='HTML'
                     )
                 except Exception as e:
@@ -2509,20 +2540,58 @@ class TaskManager:
             
         except FloodWaitError as e:
             error_msg = f"FloodWait: {e.seconds}s"
-            self.db[Account.COLLECTION_NAME].update_one(
-                {'_id': account._id},
-                {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.utcnow()}}
-            )
+            logger.warning(f"Account {account.phone} hit FloodWait, checking real status...")
+            
+            # 实时检查账户状态
+            real_status = await check_account_real_status(self.account_manager, account._id)
+            if real_status == 'banned':
+                self.db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
+                )
+                logger.error(f"Account {account.phone} is BANNED, marked as unavailable")
+            elif real_status == 'limited':
+                self.db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.utcnow()}}
+                )
+                logger.warning(f"Account {account.phone} is LIMITED")
+            else:
+                # Even if status is active, still mark as limited temporarily due to FloodWait
+                self.db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.utcnow()}}
+                )
+            
             self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, error_msg)
             await asyncio.sleep(e.seconds)
             return False
             
         except PeerFloodError:
             error_msg = "PeerFlood"
-            self.db[Account.COLLECTION_NAME].update_one(
-                {'_id': account._id},
-                {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.utcnow()}}
-            )
+            logger.warning(f"Account {account.phone} hit PeerFlood, checking real status...")
+            
+            # 实时检查账户状态
+            real_status = await check_account_real_status(self.account_manager, account._id)
+            if real_status == 'banned':
+                self.db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
+                )
+                logger.error(f"Account {account.phone} is BANNED, marked as unavailable")
+            elif real_status == 'limited':
+                self.db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.utcnow()}}
+                )
+                logger.warning(f"Account {account.phone} is LIMITED")
+            else:
+                # Even if status is active, still mark as limited temporarily due to PeerFlood
+                self.db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.utcnow()}}
+                )
+            
             self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, error_msg)
             return False
             
