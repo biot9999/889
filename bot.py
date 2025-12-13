@@ -195,6 +195,9 @@ AUTO_REFRESH_MAX_INTERVAL = 50  # seconds
 MAX_AUTO_REFRESH_ERRORS = 5  # stop auto-refresh after N consecutive errors
 ACCOUNT_CHECK_LOOP_INTERVAL = 10  # check accounts every N loop iterations
 CONSECUTIVE_FAILURES_THRESHOLD = 50  # check accounts after N consecutive failures
+STOP_CONFIRMATION_ITERATIONS = 50  # wait iterations for task stop confirmation (50 * 0.1s = 5s)
+STOP_CONFIRMATION_SLEEP = 0.1  # seconds to sleep between confirmation checks
+MAX_REPORT_RETRY_ATTEMPTS = 3  # maximum attempts to send completion report
 
 # UI labels mapping
 SEND_METHOD_LABELS = {
@@ -1191,8 +1194,10 @@ class TaskManager:
         self.targets_col = db[Target.COLLECTION_NAME]
         self.logs_col = db[MessageLog.COLLECTION_NAME]
         self.account_manager = account_manager
-        self.running_tasks = {}
-        self.stop_flags = {}
+        self.running_tasks = {}  # {task_id: {'asyncio_task': asyncio.Task, 'stop_event': asyncio.Event, 'started_at': datetime}}
+        self.stop_flags = {}  # Keep for backward compatibility
+        self.report_sent = set()  # Track which tasks have sent completion reports
+        self.report_retry_count = {}  # Track report send retry attempts {task_id: count}
         self.bot_application = bot_application  # 用于发送完成报告
     
     def create_task(self, name, message_text, message_format, media_type=MediaType.TEXT,
@@ -1255,7 +1260,7 @@ class TaskManager:
         return targets
     
     async def start_task(self, task_id):
-        """Start task"""
+        """Start task with dual stop mechanism"""
         task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
         if not task_doc:
             raise ValueError(f"Task {task_id} not found")
@@ -1273,25 +1278,47 @@ class TaskManager:
             }}
         )
         
-        self.stop_flags[str(task_id)] = False
-        asyncio_task = asyncio.create_task(self._execute_task(str(task_id)))
-        self.running_tasks[str(task_id)] = asyncio_task
+        # Create stop event for immediate stopping
+        stop_event = asyncio.Event()
+        self.stop_flags[str(task_id)] = False  # Keep for backward compatibility
+        
+        # Create and store asyncio task with stop event
+        asyncio_task = asyncio.create_task(self._execute_task(str(task_id), stop_event))
+        self.running_tasks[str(task_id)] = {
+            'asyncio_task': asyncio_task,
+            'stop_event': stop_event,
+            'started_at': datetime.utcnow()
+        }
         return asyncio_task
     
     async def stop_task(self, task_id):
-        """Stop task"""
+        """Stop task immediately with dual mechanism"""
         task_id_str = str(task_id)
         if task_id_str not in self.running_tasks:
             raise ValueError("Task not running")
         
-        self.stop_flags[task_id_str] = True
-        asyncio_task = self.running_tasks[task_id_str]
-        try:
-            await asyncio.wait_for(asyncio_task, timeout=10.0)
-        except asyncio.TimeoutError:
-            asyncio_task.cancel()
+        # Get task info early to avoid undefined variable
+        task_info = self.running_tasks[task_id_str]
         
-        # Update status to STOPPED with completion time
+        # Validate task_info structure (should always be dict with new implementation)
+        # Old format (before this fix): asyncio.Task was stored directly
+        # New format: {'asyncio_task': asyncio.Task, 'stop_event': asyncio.Event, 'started_at': datetime}
+        if not isinstance(task_info, dict):
+            logger.error(f"Task {task_id}: Invalid task_info structure, expected dict (old format detected)")
+            # Fallback to handle old format for safety
+            asyncio_task = task_info
+        else:
+            asyncio_task = task_info.get('asyncio_task')
+        
+        # 1. Set memory stop flag (for backward compatibility)
+        self.stop_flags[task_id_str] = True
+        
+        # 2. Set asyncio.Event for immediate stop
+        if isinstance(task_info, dict) and 'stop_event' in task_info:
+            task_info['stop_event'].set()
+            logger.info(f"Task {task_id}: Stop event set")
+        
+        # 3. Update database status immediately
         self.tasks_col.update_one(
             {'_id': ObjectId(task_id)},
             {'$set': {
@@ -1300,9 +1327,35 @@ class TaskManager:
                 'updated_at': datetime.utcnow()
             }}
         )
+        logger.info(f"Task {task_id}: Database status updated to STOPPED")
         
-        del self.running_tasks[task_id_str]
-        del self.stop_flags[task_id_str]
+        # 4. Wait for task to acknowledge and stop (with timeout)
+        try:
+            await asyncio.wait_for(asyncio_task, timeout=10.0)
+            logger.info(f"Task {task_id}: Stopped gracefully")
+        except asyncio.TimeoutError:
+            logger.warning(f"Task {task_id}: Timeout, cancelling forcefully")
+            asyncio_task.cancel()
+            try:
+                await asyncio_task
+            except asyncio.CancelledError:
+                pass
+        
+        # 5. Wait for confirmation that task has cleaned up
+        for i in range(STOP_CONFIRMATION_ITERATIONS):
+            if task_id_str not in self.running_tasks:
+                logger.info(f"Task {task_id}: Confirmed stopped (iteration {i})")
+                break
+            await asyncio.sleep(STOP_CONFIRMATION_SLEEP)
+        else:
+            # Force cleanup after timeout (STOP_CONFIRMATION_ITERATIONS * STOP_CONFIRMATION_SLEEP seconds)
+            logger.warning(f"Task {task_id}: Force cleanup after timeout")
+            if task_id_str in self.running_tasks:
+                del self.running_tasks[task_id_str]
+            if task_id_str in self.stop_flags:
+                del self.stop_flags[task_id_str]
+        
+        logger.info(f"Task {task_id}: Stop task completed")
     
     def delete_task(self, task_id):
         """Delete task and all associated data"""
@@ -1327,8 +1380,8 @@ class TaskManager:
         logger.info(f"Task {task_id} and all associated data deleted successfully")
         return True
     
-    async def _execute_task(self, task_id):
-        """执行任务 - 支持重复发送模式和正常模式"""
+    async def _execute_task(self, task_id, stop_event):
+        """执行任务 - 支持重复发送模式和正常模式，使用双重停止机制"""
         task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
         task = Task.from_dict(task_doc)
         
@@ -1346,6 +1399,22 @@ class TaskManager:
         logger.info("进度监控任务已启动")
         
         try:
+            # Priority 1: Check stop event
+            if stop_event.is_set():
+                logger.info(f"Task {task_id}: Stop event detected before start")
+                return
+            
+            # Priority 2: Check database status
+            task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+            if not task_doc:
+                logger.info(f"Task {task_id}: Task not found in database")
+                return
+            
+            task = Task.from_dict(task_doc)
+            if task.status != TaskStatus.RUNNING.value:
+                logger.info(f"Task {task_id}: Status is {task.status}, not RUNNING")
+                return
+            
             # 获取待发送目标
             target_docs = self.targets_col.find({
                 'task_id': task_id,
@@ -1402,9 +1471,14 @@ class TaskManager:
             
             # 根据重复发送模式选择不同的执行逻辑
             if task.repeat_send:
-                await self._execute_repeat_send_mode(task_id, task, targets, accounts)
+                await self._execute_repeat_send_mode(task_id, task, targets, accounts, stop_event)
             else:
-                await self._execute_normal_mode(task_id, task, targets, accounts)
+                await self._execute_normal_mode(task_id, task, targets, accounts, stop_event)
+            
+            # Check if stopped before generating report
+            if stop_event.is_set():
+                logger.info(f"Task {task_id}: Stopped, skipping final completion")
+                return
             
             # 获取最终任务状态
             task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
@@ -1457,7 +1531,7 @@ class TaskManager:
                 del self.stop_flags[task_id]
             logger.info(f"任务 {task_id}: 清理完成")
     
-    async def _execute_repeat_send_mode(self, task_id, task, targets, accounts):
+    async def _execute_repeat_send_mode(self, task_id, task, targets, accounts, stop_event):
         """执行重复发送模式：所有账号轮流给所有用户发送消息"""
         logger.info("=" * 80)
         logger.info("执行模式：重复发送")
@@ -1474,9 +1548,22 @@ class TaskManager:
         
         # 每批账号给所有用户发送
         for batch_index, account_batch in enumerate(account_batches):
+            # Check stop event first
+            if stop_event.is_set():
+                logger.info("检测到停止事件，终止任务")
+                break
+            
             if self.stop_flags.get(task_id, False):
                 logger.info("检测到停止标志，终止任务")
                 break
+            
+            # Check database status
+            task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+            if task_doc:
+                task_status = Task.from_dict(task_doc).status
+                if task_status != TaskStatus.RUNNING.value:
+                    logger.info(f"任务状态变更为 {task_status}，停止执行")
+                    break
             
             # 每10轮检查账号
             if batch_index > 0 and batch_index % ACCOUNT_CHECK_LOOP_INTERVAL == 0:
@@ -1495,6 +1582,11 @@ class TaskManager:
                 logger.info(f"账号 {account.phone} 开始给所有用户发送")
                 
                 for target_idx, target in enumerate(targets):
+                    # Check stop event
+                    if stop_event.is_set():
+                        logger.info(f"账号 {account.phone}: 检测到停止事件")
+                        break
+                    
                     if self.stop_flags.get(task_id, False):
                         logger.info(f"账号 {account.phone}: 检测到停止标志")
                         break
@@ -1557,7 +1649,7 @@ class TaskManager:
             
             logger.info(f"第 {batch_index + 1} 轮完成")
     
-    async def _execute_normal_mode(self, task_id, task, targets, accounts):
+    async def _execute_normal_mode(self, task_id, task, targets, accounts, stop_event):
         """执行正常模式：每个用户按顺序尝试账号，直到成功或无账号可用"""
         logger.info("=" * 80)
         logger.info("执行模式：正常模式")
@@ -1580,7 +1672,7 @@ class TaskManager:
             account = accounts[batch_idx % len(accounts)]
             logger.info(f"批次 {batch_idx + 1}: 分配账户 {account.phone}，处理 {len(batch)} 个目标")
             concurrent_tasks.append(
-                self._process_batch_normal_mode(task_id, task, batch, accounts, batch_idx)
+                self._process_batch_normal_mode(task_id, task, batch, accounts, batch_idx, stop_event)
             )
         
         # 并发执行所有批次
@@ -1589,7 +1681,7 @@ class TaskManager:
         logger.info("=" * 80)
         await asyncio.gather(*concurrent_tasks, return_exceptions=True)
     
-    async def _process_batch_normal_mode(self, task_id, task, targets, all_accounts, batch_idx):
+    async def _process_batch_normal_mode(self, task_id, task, targets, all_accounts, batch_idx, stop_event):
         """处理一批目标 - 正常模式：失败时尝试下一个账号"""
         logger.info(f"[批次 {batch_idx}] 开始处理 {len(targets)} 个目标")
         
@@ -1599,10 +1691,23 @@ class TaskManager:
         consecutive_failures = 0
         
         for idx, target in enumerate(targets):
-            # 检查停止标志
+            # Priority 1: Check stop event
+            if stop_event.is_set():
+                logger.info(f"[批次 {batch_idx}] 检测到停止事件，停止执行")
+                break
+            
+            # Priority 2: Check stop flag (backward compatibility)
             if self.stop_flags.get(task_id, False):
                 logger.info(f"[批次 {batch_idx}] 检测到停止标志，停止执行")
                 break
+            
+            # Priority 3: Check database status
+            task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+            if task_doc:
+                task_status = Task.from_dict(task_doc).status
+                if task_status != TaskStatus.RUNNING.value:
+                    logger.info(f"[批次 {batch_idx}] 任务状态变更为 {task_status}，停止执行")
+                    break
             
             # 每10次循环检查账号
             loop_count += 1
@@ -1815,11 +1920,25 @@ class TaskManager:
         return False
     
     async def _send_completion_reports(self, task_id):
-        """生成并自动发送完成报告 - 任务完成后自动执行"""
+        """生成并自动发送完成报告 - 任务完成后自动执行，防止重复发送"""
+        # Prevent duplicate reports
+        if task_id in self.report_sent:
+            logger.info(f"任务 {task_id}: 报告已发送，跳过重复发送")
+            return
+        
+        # Check retry limit
+        retry_count = self.report_retry_count.get(task_id, 0)
+        if retry_count >= MAX_REPORT_RETRY_ATTEMPTS:
+            logger.error(f"任务 {task_id}: 达到最大重试次数 ({MAX_REPORT_RETRY_ATTEMPTS})，停止发送报告")
+            return
+        
+        self.report_sent.add(task_id)
+        
         try:
             logger.info(f"========================================")
             logger.info(f"任务完成 - 开始生成报告")
             logger.info(f"任务ID: {task_id}")
+            logger.info(f"尝试次数: {retry_count + 1}/{MAX_REPORT_RETRY_ATTEMPTS}")
             logger.info(f"========================================")
             
             # Get task info for message count
@@ -1838,9 +1957,10 @@ class TaskManager:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             logger.info(f"报告时间戳: {timestamp}")
             
-            # 生成3个报告文件
+            # 生成4个报告文件: 成功/失败/剩余用户列表 + 运行日志
             success_file = os.path.join(Config.RESULTS_DIR, f"发送成功的用户名_{task_id}_{timestamp}.txt")
             failed_file = os.path.join(Config.RESULTS_DIR, f"发送失败的用户名_{task_id}_{timestamp}.txt")
+            remaining_file = os.path.join(Config.RESULTS_DIR, f"剩余未发送的用户名_{task_id}_{timestamp}.txt")
             log_file = os.path.join(Config.RESULTS_DIR, f"任务运行日志_{task_id}_{timestamp}.txt")
             
             # 写入成功用户列表
@@ -1860,6 +1980,16 @@ class TaskManager:
                 f.write("=" * 50 + "\n\n")
                 for t in results['failed_targets']:
                     f.write(f"{t.username or t.user_id}: {t.error_message or '未知错误'}\n")
+            
+            # 写入剩余未发送用户列表
+            logger.info(f"生成剩余用户列表: {len(results['remaining_targets'])} 个用户")
+            with open(remaining_file, 'w', encoding='utf-8') as f:
+                f.write(f"任务完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"总剩余数: {len(results['remaining_targets'])}\n")
+                f.write(f"说明: 这些用户尚未发送，可用于下次任务\n")
+                f.write("=" * 50 + "\n\n")
+                for t in results['remaining_targets']:
+                    f.write(f"{t.username or t.user_id}\n")
             
             # 写入运行日志 - 详细版本
             logger.info(f"生成运行日志: {len(results['logs'])} 条记录")
@@ -1991,13 +2121,29 @@ class TaskManager:
                 # Calculate unique users who received messages
                 unique_users = len(results['success_targets'])
                 total_messages = task.sent_count  # Total messages sent (including repeat sends)
+                remaining_count = len(results['remaining_targets'])
+                
+                # Context-aware completion message
+                if remaining_count == 0:
+                    status_emoji = "🎉"
+                    status_msg = "任务完成，用户名已用完！"
+                elif task.status == TaskStatus.STOPPED.value:
+                    status_emoji = "⏸️"
+                    status_msg = "任务已手动停止"
+                elif task.status == TaskStatus.FAILED.value:
+                    status_emoji = "❌"
+                    status_msg = "任务失败"
+                else:
+                    status_emoji = "✅"
+                    status_msg = "任务完成！"
                 
                 completion_text = (
-                    f"🎉 <b>任务完成，用户名已用完！</b>\n\n"
+                    f"{status_emoji} <b>{status_msg}</b>\n\n"
                     f"📊 任务统计：\n"
                     f"✅ 发送成功: {total_messages} 条消息\n"
                     f"📧 成功用户: {unique_users} 人\n"
-                    f"❌ 发送失败: {len(results['failed_targets'])}\n\n"
+                    f"❌ 发送失败: {len(results['failed_targets'])} 人\n"
+                    f"⏸️ 剩余未发送: {remaining_count} 人\n\n"
                     f"📁 正在发送日志报告..."
                 )
                 
@@ -2011,10 +2157,11 @@ class TaskManager:
                 except Exception as e:
                     logger.error(f"发送完成消息失败: {e}")
                 
-                # 发送3个文件
+                # 发送4个文件（添加剩余用户名文件）
                 files_to_send = [
                     (success_file, "发送成功的用户名.txt"),
                     (failed_file, "发送失败的用户名.txt"),
+                    (remaining_file, "剩余未发送的用户名.txt"),
                     (log_file, "任务运行日志.txt")
                 ]
                 
@@ -2043,6 +2190,10 @@ class TaskManager:
             
         except Exception as e:
             logger.error(f"任务 {task_id}: 生成完成报告出错: {e}", exc_info=True)
+            # Remove from report_sent and increment retry count
+            self.report_sent.discard(task_id)
+            self.report_retry_count[task_id] = retry_count + 1
+            logger.info(f"任务 {task_id}: 报告发送失败，将在下次尝试 (剩余重试: {MAX_REPORT_RETRY_ATTEMPTS - self.report_retry_count[task_id]})")
     
     async def _send_message(self, task, target, account):
         """发送消息 - 支持所有发送方式"""
@@ -2299,20 +2450,33 @@ class TaskManager:
         }
     
     def export_task_results(self, task_id):
-        """Export results"""
+        """Export results including remaining targets"""
         task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
         if not task_doc:
             return None
         
+        # Success: is_sent=True
         success_docs = self.targets_col.find({'task_id': task_id, 'is_sent': True})
         success_targets = [Target.from_dict(doc) for doc in success_docs]
         
+        # Failed: is_sent=False AND has error_message
         failed_docs = self.targets_col.find({
             'task_id': task_id,
             'is_sent': False,
-            'error_message': {'$ne': None}
+            'error_message': {'$ne': None, '$exists': True}
         })
         failed_targets = [Target.from_dict(doc) for doc in failed_docs]
+        
+        # Remaining: is_sent=False AND no error_message (or error_message doesn't exist)
+        remaining_docs = self.targets_col.find({
+            'task_id': task_id,
+            'is_sent': False,
+            '$or': [
+                {'error_message': None},
+                {'error_message': {'$exists': False}}
+            ]
+        })
+        remaining_targets = [Target.from_dict(doc) for doc in remaining_docs]
         
         log_docs = self.logs_col.find({'task_id': task_id})
         logs = [MessageLog.from_dict(doc) for doc in log_docs]
@@ -2320,6 +2484,7 @@ class TaskManager:
         return {
             'success_targets': success_targets,
             'failed_targets': failed_targets,
+            'remaining_targets': remaining_targets,
             'logs': logs
         }
 
@@ -2816,11 +2981,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('task_start_'):
         task_id = data.split('_')[2]
         logger.info(f"User {user_id} starting task {task_id}")
-        await start_task_handler(query, task_id)
+        await start_task_handler(query, task_id, context)
     elif data.startswith('task_stop_'):
         task_id = data.split('_')[2]
         logger.info(f"User {user_id} stopping task {task_id}")
-        await stop_task_handler(query, task_id)
+        await stop_task_handler(query, task_id, context)
     elif data.startswith('task_progress_'):
         # Handle both task_progress_refresh_ and task_progress_
         if 'refresh' in data:
@@ -4146,7 +4311,7 @@ async def handle_bidirect_config(update: Update, context: ContextTypes.DEFAULT_T
         return CONFIG_BIDIRECT_INPUT
 
 
-async def start_task_handler(query, task_id):
+async def start_task_handler(query, task_id, context):
     """Start task and show progress in new message with auto-refresh"""
     try:
         await task_manager.start_task(task_id)
@@ -4187,7 +4352,7 @@ async def start_task_handler(query, task_id):
         # 启动后台自动刷新任务（不阻塞）
         asyncio.create_task(
             auto_refresh_task_progress(
-                query.bot,
+                context.bot,
                 query.message.chat_id,
                 progress_msg.message_id,
                 task_id
@@ -4355,6 +4520,7 @@ async def send_task_completion_report(bot, chat_id, task_id):
     
     # 统计
     total_targets = db[Target.COLLECTION_NAME].count_documents({'task_id': str(task_id)})
+    remaining_count = total_targets - task.sent_count - task.failed_count
     success_rate = (task.sent_count / (task.sent_count + task.failed_count) * 100) if (task.sent_count + task.failed_count) > 0 else 0
     
     # 时间
@@ -4377,6 +4543,7 @@ async def send_task_completion_report(bot, chat_id, task_id):
         f"👥 目标用户: {total_targets}\n"
         f"✅ 发送成功: {task.sent_count}\n"
         f"❌ 发送失败: {task.failed_count}\n"
+        f"⏸️ 剩余未发送: {remaining_count}\n"
         f"📈 成功率: {success_rate:.1f}%\n"
         f"⏱️ 运行时间: {runtime_str}\n\n"
         f"📱 <b>账号状态：</b>\n"
@@ -4395,7 +4562,7 @@ async def send_task_completion_report(bot, chat_id, task_id):
     await bot.send_message(chat_id, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
-async def stop_task_handler(query, task_id):
+async def stop_task_handler(query, task_id, context):
     """Stop task immediately and generate report"""
     try:
         # Set stop flag immediately
@@ -4427,7 +4594,7 @@ async def stop_task_handler(query, task_id):
         
         # Send completion report directly (don't edit first, just send new message)
         try:
-            await send_task_completion_report(query.bot, query.message.chat_id, task_id)
+            await send_task_completion_report(context.bot, query.message.chat_id, task_id)
         except Exception as report_error:
             logger.error(f"Error sending completion report: {report_error}", exc_info=True)
             # Fallback to simple message
