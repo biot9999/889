@@ -23,8 +23,9 @@ import shutil
 import zipfile
 import json
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+import threading
 
 # Telegram Bot API
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -234,23 +235,31 @@ async def safe_answer_query(query, text="", show_alert=False, timeout=5.0):
         show_alert: 是否显示警告框
         timeout: 超时时间（秒）
     """
+    if query is None:
+        logger.warning("safe_answer_query called with None query, skipping")
+        return
+    
     try:
         await asyncio.wait_for(
             query.answer(text, show_alert=show_alert),
             timeout=timeout
         )
     except asyncio.TimeoutError:
-        logger.warning(f"Query answer timeout after {timeout}s: query_id={query.id}")
+        query_id = getattr(query, 'id', 'unknown')
+        logger.warning(f"Query answer timeout after {timeout}s: query_id={query_id}")
     except telegram_error.BadRequest as e:
         # Query already answered or expired
         logger.warning(f"Query BadRequest (likely expired): {e}")
+    except AttributeError as e:
+        logger.error(f"Query object missing required attributes: {e}")
     except Exception as e:
         logger.error(f"Unexpected error answering query: {e}")
 
 
-# Global cache for account spambot status checks
+# Global cache for account spambot status checks (thread-safe)
 # Format: {account_id: {'status': 'active/limited/banned', 'checked_at': datetime}}
 account_status_cache = {}
+account_status_cache_lock = threading.Lock()
 
 
 async def check_account_real_status(account_manager, account_id):
@@ -263,17 +272,18 @@ async def check_account_real_status(account_manager, account_id):
         account_id: 账户ID
     
     Returns:
-        str: 'active', 'limited', 'banned'
+        str: 'active', 'limited', 'banned', or 'unknown'
     """
     account_id_str = str(account_id)
     
-    # 检查缓存
-    if account_id_str in account_status_cache:
-        cached = account_status_cache[account_id_str]
-        cache_age = (datetime.utcnow() - cached['checked_at']).total_seconds()
-        if cache_age < ACCOUNT_STATUS_CACHE_DURATION:
-            logger.debug(f"Using cached status for account {account_id}: {cached['status']}")
-            return cached['status']
+    # 检查缓存（线程安全）
+    with account_status_cache_lock:
+        if account_id_str in account_status_cache:
+            cached = account_status_cache[account_id_str]
+            cache_age = (datetime.now(timezone.utc) - cached['checked_at']).total_seconds()
+            if cache_age < ACCOUNT_STATUS_CACHE_DURATION:
+                logger.debug(f"Using cached status for account {account_id}: {cached['status']}")
+                return cached['status']
     
     try:
         # 获取客户端
@@ -300,22 +310,23 @@ async def check_account_real_status(account_manager, account_id):
         elif any(keyword in response for keyword in ['限制', 'limit', 'restrict', 'frozen', '冻结']):
             status = 'limited'
         
-        # 更新缓存
-        account_status_cache[account_id_str] = {
-            'status': status,
-            'checked_at': datetime.utcnow()
-        }
+        # 更新缓存（线程安全）
+        with account_status_cache_lock:
+            account_status_cache[account_id_str] = {
+                'status': status,
+                'checked_at': datetime.now(timezone.utc)
+            }
         
         # 更新数据库状态
         if status == 'banned':
             account_manager.accounts_col.update_one(
                 {'_id': ObjectId(account_id)},
-                {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
+                {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.now(timezone.utc)}}
             )
         elif status == 'limited':
             account_manager.accounts_col.update_one(
                 {'_id': ObjectId(account_id)},
-                {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.utcnow()}}
+                {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.now(timezone.utc)}}
             )
         
         return status
@@ -352,8 +363,8 @@ async def should_stop_task_due_to_accounts(db_instance, task_id):
             {
                 '$set': {
                     'status': TaskStatus.STOPPED.value,
-                    'completed_at': datetime.utcnow(),
-                    'updated_at': datetime.utcnow()
+                    'completed_at': datetime.now(timezone.utc),
+                    'updated_at': datetime.now(timezone.utc)
                 }
             }
         )
@@ -2787,9 +2798,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.info(f"Button clicked by user {username} ({user_id}): {data}")
     
-    # Immediately answer query to prevent timeout
+    # Immediately answer query to prevent timeout (with error handling)
     # The actual handlers will update the message content
-    asyncio.create_task(safe_answer_query(query))
+    async def answer_query_with_logging():
+        try:
+            await safe_answer_query(query)
+        except Exception as e:
+            logger.error(f"Error answering query in background: {e}")
+    
+    asyncio.create_task(answer_query_with_logging())
     
     # Main menu
     if data == 'menu_messaging':
@@ -4793,7 +4810,7 @@ async def start_task_handler(query, task_id, context):
 async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
     """Auto refresh task progress with smart intervals (10s first minute, then 30-50s)"""
     error_count = 0
-    start_time = datetime.utcnow()
+    start_time = datetime.now(timezone.utc)
     
     # Wait a bit for task to actually start
     await asyncio.sleep(2)
@@ -4817,7 +4834,12 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             total_targets = task.total_targets
             sent_count = task.sent_count
             failed_count = task.failed_count
-            progress_percent = (sent_count + failed_count) / total_targets * 100 if total_targets > 0 else 0
+            
+            # 计算进度百分比（带验证）
+            if total_targets > 0 and sent_count is not None and failed_count is not None:
+                progress_percent = min(100.0, (sent_count + failed_count) / total_targets * 100)
+            else:
+                progress_percent = 0.0
             
             # 生成进度条
             progress_bar_length = 10
@@ -4826,7 +4848,7 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             
             # 计算时间和速度
             if task.started_at:
-                runtime = datetime.utcnow() - task.started_at
+                runtime = datetime.now(timezone.utc) - task.started_at
                 hours, remainder = divmod(int(runtime.total_seconds()), 3600)
                 minutes, seconds = divmod(remainder, 60)
                 runtime_str = f"{hours}:{minutes:02d}:{seconds:02d}"
@@ -4887,7 +4909,7 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                     logger.error(f"Failed to update progress: {e}")
             
             # 智能刷新间隔：前1分钟每10秒，后面30-50秒
-            elapsed = (datetime.utcnow() - start_time).total_seconds()
+            elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
             if elapsed < AUTO_REFRESH_FAST_DURATION:
                 # 前1分钟使用快速间隔
                 interval = AUTO_REFRESH_FAST_INTERVAL
@@ -4909,7 +4931,7 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                 break
             
             # Use fast interval for error case during first minute, normal otherwise
-            elapsed = (datetime.utcnow() - start_time).total_seconds()
+            elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
             interval = AUTO_REFRESH_FAST_INTERVAL if elapsed < AUTO_REFRESH_FAST_DURATION else random.randint(AUTO_REFRESH_MIN_INTERVAL, AUTO_REFRESH_MAX_INTERVAL)
             await asyncio.sleep(interval)
 
