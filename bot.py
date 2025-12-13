@@ -147,6 +147,7 @@ class TaskStatus(enum.Enum):
     PENDING = "pending"
     RUNNING = "running"
     PAUSED = "paused"
+    STOPPED = "stopped"
     COMPLETED = "completed"
     FAILED = "failed"
 
