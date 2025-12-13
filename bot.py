@@ -192,6 +192,7 @@ CONFIG_MESSAGE_DELETE_DELAY = 3
 # Auto-refresh and account checking
 AUTO_REFRESH_MIN_INTERVAL = 30  # seconds
 AUTO_REFRESH_MAX_INTERVAL = 50  # seconds
+MAX_AUTO_REFRESH_ERRORS = 5  # stop auto-refresh after N consecutive errors
 ACCOUNT_CHECK_LOOP_INTERVAL = 10  # check accounts every N loop iterations
 CONSECUTIVE_FAILURES_THRESHOLD = 50  # check accounts after N consecutive failures
 
@@ -4242,10 +4243,7 @@ async def start_task_handler(query, task_id):
 
 async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
     """Auto refresh task progress every 30-50 seconds"""
-    # Cache total_targets as it doesn't change during task execution
-    total_targets_cache = None
     error_count = 0
-    max_errors = 5  # Stop after 5 consecutive errors
     
     while True:
         try:
@@ -4262,11 +4260,8 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                 logger.info(f"Auto-refresh stopped: Task {task_id} status is {task.status}")
                 break
             
-            # 计算统计 - cache total_targets
-            if total_targets_cache is None:
-                total_targets_cache = db[Target.COLLECTION_NAME].count_documents({'task_id': str(task_id)})
-            total_targets = total_targets_cache
-            
+            # 使用任务文档中的 total_targets（已在任务创建时设置）
+            total_targets = task.total_targets
             sent_count = task.sent_count
             failed_count = task.failed_count
             progress = (sent_count + failed_count) / total_targets * 100 if total_targets > 0 else 0
@@ -4327,15 +4322,15 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             
         except Exception as e:
             error_count += 1
-            logger.error(f"Error in auto refresh (count: {error_count}/{max_errors}): {e}")
+            logger.error(f"Error in auto refresh (count: {error_count}/{MAX_AUTO_REFRESH_ERRORS}): {e}")
             
             # Stop after max errors to prevent infinite error loops
-            if error_count >= max_errors:
-                logger.error(f"Auto-refresh stopped after {max_errors} consecutive errors")
+            if error_count >= MAX_AUTO_REFRESH_ERRORS:
+                logger.error(f"Auto-refresh stopped after {MAX_AUTO_REFRESH_ERRORS} consecutive errors")
                 break
             
-            # Use average interval for error case
-            await asyncio.sleep((AUTO_REFRESH_MIN_INTERVAL + AUTO_REFRESH_MAX_INTERVAL) // 2)
+            # Use random interval for error case (consistency with normal operation)
+            await asyncio.sleep(random.randint(AUTO_REFRESH_MIN_INTERVAL, AUTO_REFRESH_MAX_INTERVAL))
 
 
 async def send_task_completion_report(bot, chat_id, task_id):
