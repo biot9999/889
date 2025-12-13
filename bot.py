@@ -2840,15 +2840,82 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("❌ 没有账户可导出", show_alert=True)
                 return
             
+            # 显示准备进度
+            progress_msg = await query.message.reply_text(
+                "⏳ 正在准备导出...\n\n"
+                f"📊 账户总数: {len(account_ids)}\n"
+                f"🔌 正在断开所有活跃连接...",
+                parse_mode='HTML'
+            )
+            
+            # 断开所有活跃的 Telethon 客户端
+            disconnected_count = 0
+            for account_id in account_ids:
+                try:
+                    # 检查 account_manager 中是否有活跃客户端
+                    client = account_manager.clients.get(account_id)
+                    if client and client.is_connected():
+                        await client.disconnect()
+                        disconnected_count += 1
+                        logger.info(f"Disconnected client for account {account_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to disconnect account {account_id}: {e}")
+            
+            logger.info(f"Disconnected {disconnected_count} active clients before export")
+            
+            # 等待1秒确保所有连接完全关闭
+            await asyncio.sleep(1)
+            
+            # 更新进度
+            await progress_msg.edit_text(
+                f"✅ 已断开 {disconnected_count} 个活跃连接\n\n"
+                f"📦 正在生成 ZIP 文件...",
+                parse_mode='HTML'
+            )
+            
             zip_path = await export_accounts(account_ids, 'all')
             
-            with open(zip_path, 'rb') as f:
-                await query.message.reply_document(
-                    document=f,
-                    filename=os.path.basename(zip_path),
-                    caption=f"📥 <b>所有账户导出</b>\n\n共 {len(account_ids)} 个账户\n\n⚠️ 导出后将自动清空本地数据",
+            # 更新进度
+            await progress_msg.edit_text("📤 正在上传文件...", parse_mode='HTML')
+            
+            # 发送文件，添加超时处理
+            try:
+                with open(zip_path, 'rb') as f:
+                    await asyncio.wait_for(
+                        query.message.reply_document(
+                            document=f,
+                            filename=os.path.basename(zip_path),
+                            caption=f"📥 <b>所有账户导出</b>\n\n共 {len(account_ids)} 个账户\n\n⚠️ 导出后将自动清空本地数据",
+                            parse_mode='HTML'
+                        ),
+                        timeout=60.0  # 60秒超时
+                    )
+            except asyncio.TimeoutError:
+                logger.error("Document upload timeout")
+                await progress_msg.delete()
+                await query.message.reply_text(
+                    "❌ 上传超时\n\n"
+                    f"文件已保存至服务器：{os.path.basename(zip_path)}\n"
+                    "请联系管理员手动获取",
                     parse_mode='HTML'
                 )
+                return  # 不删除账户数据
+            except Exception as upload_error:
+                logger.error(f"Document upload failed: {upload_error}", exc_info=True)
+                await progress_msg.delete()
+                await query.message.reply_text(
+                    f"❌ 上传失败：{str(upload_error)}\n\n"
+                    f"文件已保存至服务器\n"
+                    "请联系管理员",
+                    parse_mode='HTML'
+                )
+                return
+            
+            # 删除进度消息
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
             
             # Delete all accounts from database
             delete_result = db[Account.COLLECTION_NAME].delete_many({})
@@ -2899,15 +2966,72 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("✅ 没有受限账户", show_alert=True)
                 return
             
+            # 显示准备进度
+            progress_msg = await query.message.reply_text(
+                f"⏳ 正在准备导出 {len(account_ids)} 个受限账户...\n\n"
+                f"🔌 正在断开连接...",
+                parse_mode='HTML'
+            )
+            
+            # 断开受限账户的客户端
+            disconnected_count = 0
+            for account_id in account_ids:
+                try:
+                    client = account_manager.clients.get(account_id)
+                    if client and client.is_connected():
+                        await client.disconnect()
+                        disconnected_count += 1
+                        logger.info(f"Disconnected limited account client {account_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to disconnect limited account {account_id}: {e}")
+            
+            logger.info(f"Disconnected {disconnected_count} limited account clients")
+            await asyncio.sleep(1)
+            
+            await progress_msg.edit_text("📦 正在生成 ZIP 文件...", parse_mode='HTML')
+            
             zip_path = await export_accounts(account_ids, 'limited')
             
-            with open(zip_path, 'rb') as f:
-                await query.message.reply_document(
-                    document=f,
-                    filename=os.path.basename(zip_path),
-                    caption=f"⚠️ <b>受限账户导出</b>\n\n共 {len(account_ids)} 个账户\n\n⚠️ 导出后将自动删除这些受限账户",
+            await progress_msg.edit_text("📤 正在上传文件...", parse_mode='HTML')
+            
+            # 发送文件，添加超时处理
+            try:
+                with open(zip_path, 'rb') as f:
+                    await asyncio.wait_for(
+                        query.message.reply_document(
+                            document=f,
+                            filename=os.path.basename(zip_path),
+                            caption=f"⚠️ <b>受限账户导出</b>\n\n共 {len(account_ids)} 个账户\n\n⚠️ 导出后将自动删除这些受限账户",
+                            parse_mode='HTML'
+                        ),
+                        timeout=60.0
+                    )
+            except asyncio.TimeoutError:
+                logger.error("Limited accounts document upload timeout")
+                await progress_msg.delete()
+                await query.message.reply_text(
+                    "❌ 上传超时\n\n"
+                    f"文件已保存至服务器：{os.path.basename(zip_path)}\n"
+                    "请联系管理员手动获取",
                     parse_mode='HTML'
                 )
+                return
+            except Exception as upload_error:
+                logger.error(f"Limited accounts document upload failed: {upload_error}", exc_info=True)
+                await progress_msg.delete()
+                await query.message.reply_text(
+                    f"❌ 上传失败：{str(upload_error)}\n\n"
+                    f"文件已保存至服务器\n"
+                    "请联系管理员",
+                    parse_mode='HTML'
+                )
+                return
+            
+            # 删除进度消息
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
             
             # Delete limited accounts from database
             limited_ids = [acc['_id'] for acc in limited_accounts]
@@ -3517,28 +3641,45 @@ async def check_all_accounts_status(progress_callback=None):
 
 
 async def export_accounts(account_ids, export_type='all'):
-    """Export accounts as zip file"""
+    """Export accounts as zip file with enhanced error handling"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     export_dir = os.path.join(Config.RESULTS_DIR, f"export_{timestamp}")
     os.makedirs(export_dir, exist_ok=True)
     
+    exported_count = 0
+    failed_count = 0
+    
     for account_id in account_ids:
-        account_doc = db[Account.COLLECTION_NAME].find_one({'_id': ObjectId(account_id)})
-        if not account_doc:
-            continue
-        
-        account = Account.from_dict(account_doc)
-        session_name = account.session_name
-        session_path = os.path.join(Config.SESSIONS_DIR, f"{session_name}.session")
-        
-        if os.path.exists(session_path):
-            # 复制 session 文件
-            shutil.copy2(session_path, export_dir)
+        try:
+            account_doc = db[Account.COLLECTION_NAME].find_one({'_id': ObjectId(account_id)})
+            if not account_doc:
+                logger.warning(f"Account {account_id} not found in database")
+                failed_count += 1
+                continue
             
-            # 如果有对应的 json 文件也复制
-            json_path = f"{session_path}.json"
-            if os.path.exists(json_path):
-                shutil.copy2(json_path, export_dir)
+            account = Account.from_dict(account_doc)
+            session_name = account.session_name
+            session_path = os.path.join(Config.SESSIONS_DIR, f"{session_name}.session")
+            
+            if os.path.exists(session_path):
+                # 复制 session 文件
+                shutil.copy2(session_path, export_dir)
+                exported_count += 1
+                logger.info(f"Exported session: {session_name}")
+                
+                # 如果有对应的 json 文件也复制
+                json_path = f"{session_path}.json"
+                if os.path.exists(json_path):
+                    shutil.copy2(json_path, export_dir)
+                    logger.info(f"Exported json: {session_name}.json")
+            else:
+                logger.warning(f"Session file not found: {session_path}")
+                failed_count += 1
+        except Exception as e:
+            logger.error(f"Failed to export account {account_id}: {e}")
+            failed_count += 1
+    
+    logger.info(f"Export summary: {exported_count} success, {failed_count} failed")
     
     # 打包为 zip
     zip_filename = f"accounts_{export_type}_{timestamp}.zip"
@@ -3553,6 +3694,8 @@ async def export_accounts(account_ids, export_type='all'):
     
     # 清理临时目录
     shutil.rmtree(export_dir)
+    
+    logger.info(f"Created zip file: {zip_path} ({os.path.getsize(zip_path)} bytes)")
     
     return zip_path
 
