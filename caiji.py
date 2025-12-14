@@ -986,21 +986,36 @@ COLLECTION_FILTER_CONFIG = 5
 # ============================================================================
 async def show_collection_menu(query):
     """显示采集菜单"""
+    from bot import Account, AccountStatus
+    
     # Use module-level _db
     db = _get_db()
+    
+    # 统计采集任务
     total_collections = db[Collection.COLLECTION_NAME].count_documents({})
     running_collections = db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.RUNNING.value})
     completed_collections = db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.COMPLETED.value})
+    
+    # 统计可用账户（仅 session/session+json 格式）
+    total_accounts = db[Account.COLLECTION_NAME].count_documents({
+        'session_name': {'$regex': r'\.(session|session\+json)$'}
+    })
+    active_accounts = db[Account.COLLECTION_NAME].count_documents({
+        'status': AccountStatus.ACTIVE.value,
+        'session_name': {'$regex': r'\.(session|session\+json)$'}
+    })
     
     text = (
         "👥 <b>用户采集</b>\n\n"
         f"📊 采集任务: {total_collections}\n"
         f"🔄 运行中: {running_collections}\n"
         f"✅ 已完成: {completed_collections}\n\n"
+        f"📱 可用账户: {active_accounts}/{total_accounts}\n\n"
         "选择操作："
     )
     
     keyboard = [
+        [InlineKeyboardButton("📤 上传账户", callback_data='collection_upload_account')],
         [InlineKeyboardButton("📋 采集列表", callback_data='collection_list')],
         [InlineKeyboardButton("➕ 创建采集", callback_data='collection_create')],
         [InlineKeyboardButton("🔙 返回主菜单", callback_data='back_main')]
@@ -1214,7 +1229,10 @@ async def handle_collection_type(update, context):
             "❌ 没有可用的账户\n\n"
             "采集功能仅支持 session/session+json 格式账户\n"
             "请先添加账户",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data='menu_collection')]]),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📤 上传账户", callback_data='collection_upload_account')],
+                [InlineKeyboardButton("🔙 返回", callback_data='menu_collection')]
+            ]),
             parse_mode='HTML'
         )
         return ConversationHandler.END
