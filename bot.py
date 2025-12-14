@@ -3024,6 +3024,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'menu_collection':
         logger.info(f"User {user_id} accessing collection menu")
         await caiji.show_collection_menu(query)
+    elif data == 'collection_upload_account':
+        logger.info(f"User {user_id} uploading account from collection menu")
+        await show_add_account_menu(query)
     elif data == 'collection_list':
         logger.info(f"User {user_id} viewing collection list")
         await caiji.show_collection_list(query)
