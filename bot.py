@@ -2801,8 +2801,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Authorized user {username} ({user_id}) accessing main menu")
     
     keyboard = [
-        [InlineKeyboardButton("📢 广告私信", callback_data='menu_messaging')],
-        [InlineKeyboardButton("👥 采集用户", callback_data='menu_collection')],
+        [InlineKeyboardButton("📢 广告私信", callback_data='menu_messaging'), InlineKeyboardButton("👥 采集用户", callback_data='menu_collection')],
         [InlineKeyboardButton("❓ 帮助", callback_data='menu_help')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -5469,8 +5468,7 @@ async def show_help(query):
 async def back_to_main(query):
     """Back to main"""
     keyboard = [
-        [InlineKeyboardButton("📢 广告私信", callback_data='menu_messaging')],
-        [InlineKeyboardButton("👥 采集用户", callback_data='menu_collection')],
+        [InlineKeyboardButton("📢 广告私信", callback_data='menu_messaging'), InlineKeyboardButton("👥 采集用户", callback_data='menu_collection')],
         [InlineKeyboardButton("❓ 帮助", callback_data='menu_help')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
