@@ -23,6 +23,18 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# 模块级变量
+# ============================================================================
+_db = None
+
+
+def init_db(database):
+    """初始化数据库实例"""
+    global _db
+    _db = database
+
+
+# ============================================================================
 # 常量
 # ============================================================================
 # Telegram username pattern (5-32 characters, alphanumeric and underscore)
@@ -953,11 +965,10 @@ COLLECTION_FILTER_CONFIG = 5
 # ============================================================================
 async def show_collection_menu(query):
     """显示采集菜单"""
-    from bot import db
-    # Use module-level imports instead of self-import
-    total_collections = db[Collection.COLLECTION_NAME].count_documents({})
-    running_collections = db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.RUNNING.value})
-    completed_collections = db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.COMPLETED.value})
+    # Use module-level _db
+    total_collections = _db[Collection.COLLECTION_NAME].count_documents({})
+    running_collections = _db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.RUNNING.value})
+    completed_collections = _db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.COMPLETED.value})
     
     text = (
         "👥 <b>用户采集</b>\n\n"
@@ -978,13 +989,12 @@ async def show_collection_menu(query):
 
 async def show_collection_list(query, page=0):
     """显示采集任务列表"""
-    from bot import db
-    # Use module-level Collection class
+    # Use module-level _db
     limit = 5
     skip = page * limit
     
-    collections = list(db[Collection.COLLECTION_NAME].find().sort('created_at', -1).skip(skip).limit(limit))
-    total = db[Collection.COLLECTION_NAME].count_documents({})
+    collections = list(_db[Collection.COLLECTION_NAME].find().sort('created_at', -1).skip(skip).limit(limit))
+    total = _db[Collection.COLLECTION_NAME].count_documents({})
     
     if not collections:
         text = "📋 <b>采集列表</b>\n\n暂无采集任务"
@@ -1040,10 +1050,9 @@ async def show_collection_list(query, page=0):
 
 async def show_collection_detail(query, collection_id):
     """显示采集任务详情"""
-    from bot import db
     from bson import ObjectId
-    # Use module-level classes
-    coll_doc = db[Collection.COLLECTION_NAME].find_one({'_id': ObjectId(collection_id)})
+    # Use module-level _db
+    coll_doc = _db[Collection.COLLECTION_NAME].find_one({'_id': ObjectId(collection_id)})
     if not coll_doc:
         await query.answer("❌ 采集任务不存在", show_alert=True)
         return
@@ -1151,7 +1160,7 @@ async def handle_collection_name(update, context):
 
 async def handle_collection_type(query, context):
     """处理采集类型选择"""
-    from bot import db, Account, AccountStatus
+    from bot import Account, AccountStatus
     from bson import ObjectId
     
     coll_type = query.data.replace('coll_type_', '')
@@ -1166,7 +1175,7 @@ async def handle_collection_type(query, context):
     }.get(coll_type, '未知类型')
     
     # 获取可用账户（只显示session格式）
-    accounts = list(db[Account.COLLECTION_NAME].find({
+    accounts = list(_db[Account.COLLECTION_NAME].find({
         'status': AccountStatus.ACTIVE.value,
         'session_name': {'$regex': r'\.(session|session\+json)$'}
     }).limit(10))
@@ -1203,14 +1212,14 @@ async def handle_collection_type(query, context):
 
 async def handle_collection_account(query, context):
     """处理账户选择"""
-    from bot import db, Account
+    from bot import Account
     from bson import ObjectId
     
     account_id = query.data.replace('coll_account_', '')
     context.user_data['collection_account_id'] = account_id
     
     # 获取账户信息
-    acc_doc = db[Account.COLLECTION_NAME].find_one({'_id': ObjectId(account_id)})
+    acc_doc = _db[Account.COLLECTION_NAME].find_one({'_id': ObjectId(account_id)})
     if not acc_doc:
         await query.answer("❌ 账户不存在", show_alert=True)
         return ConversationHandler.END

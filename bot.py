@@ -5625,6 +5625,10 @@ def main():
     db = init_db(Config.MONGODB_URI, Config.MONGODB_DATABASE)
     logger.info("Database initialized successfully")
     
+    logger.info("Initializing caiji module database...")
+    caiji.init_db(db)
+    logger.info("Caiji module database initialized")
+    
     logger.info("Initializing account manager...")
     account_manager = AccountManager(db)
     logger.info("Account manager initialized")
