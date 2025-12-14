@@ -738,12 +738,12 @@ class CollectionManager:
     
     def _apply_user_filters(self, user, filters):
         """应用用户过滤器"""
-        if not filters:
-            return True
-        
-        # 检查是否为机器人
+        # 检查是否为机器人（始终过滤）
         if hasattr(user, 'bot') and user.bot:
             return False
+        
+        if not filters:
+            return True
         
         # 过滤管理员
         if filters.get('exclude_admin', False):
