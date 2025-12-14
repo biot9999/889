@@ -3231,7 +3231,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_answer_query(query, "📥 正在导出所有账户...", show_alert=False)
         
         try:
-            all_accounts = list(db[Account.COLLECTION_NAME].find())
+            # Only export messaging accounts
+            all_accounts = list(db[Account.COLLECTION_NAME].find({'account_type': 'messaging'}))
             account_ids = [str(acc['_id']) for acc in all_accounts]
             
             if not account_ids:
@@ -3355,8 +3356,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_answer_query(query, "⚠️ 正在导出受限账户...", show_alert=False)
         
         try:
+            # Only export limited messaging accounts
             limited_accounts = list(db[Account.COLLECTION_NAME].find({
-                'status': {'$in': [AccountStatus.LIMITED.value, AccountStatus.BANNED.value, AccountStatus.INACTIVE.value]}
+                'status': {'$in': [AccountStatus.LIMITED.value, AccountStatus.BANNED.value, AccountStatus.INACTIVE.value]},
+                'account_type': 'messaging'
             }))
             account_ids = [str(acc['_id']) for acc in limited_accounts]
             
@@ -3835,7 +3838,8 @@ async def check_all_accounts_status(progress_callback=None):
         progress_callback: Optional async function to call with progress updates
                           Should accept (current, total, stats) as parameters
     """
-    accounts = list(db[Account.COLLECTION_NAME].find())
+    # Only check messaging accounts
+    accounts = list(db[Account.COLLECTION_NAME].find({'account_type': 'messaging'}))
     
     # 增强版状态模式 - 支持多语言和更精确的分类
     status_patterns = {
