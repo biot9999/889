@@ -49,6 +49,13 @@ from telethon.errors import (
 from pymongo import MongoClient
 from bson import ObjectId
 
+# Collection module
+import caiji
+from caiji import (
+    CollectionManager, Collection, CollectedUser, CollectedGroup,
+    CollectionType, CollectionStatus, init_collection_indexes
+)
+
 # ============================================================================
 # 配置加载
 # ============================================================================
@@ -764,6 +771,9 @@ def init_db(mongodb_uri, database_name):
     
     db[Proxy.COLLECTION_NAME].create_index('is_active')
     db[Proxy.COLLECTION_NAME].create_index([('host', 1), ('port', 1)])
+    
+    # Initialize collection indexes
+    init_collection_indexes(db)
     
     return db
 
@@ -2770,6 +2780,7 @@ class TaskManager:
 # Global managers
 account_manager = None
 task_manager = None
+collection_manager = None
 db = None
 
 
@@ -2789,6 +2800,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("📢 广告私信", callback_data='menu_messaging')],
+        [InlineKeyboardButton("👥 采集用户", callback_data='menu_collection')],
         [InlineKeyboardButton("❓ 帮助", callback_data='menu_help')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -3008,6 +3020,97 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'menu_help':
         logger.info(f"User {user_id} accessing help menu")
         await show_help(query)
+    elif data == 'menu_collection':
+        logger.info(f"User {user_id} accessing collection menu")
+        await caiji.show_collection_menu(query)
+    elif data == 'collection_list':
+        logger.info(f"User {user_id} viewing collection list")
+        await caiji.show_collection_list(query)
+    elif data.startswith('collection_list_'):
+        page = int(data.split('_')[2])
+        await caiji.show_collection_list(query, page)
+    elif data.startswith('collection_detail_'):
+        collection_id = data.split('_')[2]
+        await caiji.show_collection_detail(query, collection_id)
+    elif data.startswith('collection_start_'):
+        collection_id = data.split('_')[2]
+        await safe_answer_query(query, "▶️ 正在启动采集任务...", show_alert=False)
+        try:
+            await collection_manager.start_collection(collection_id)
+            await query.message.reply_text("✅ 采集任务已启动")
+            await caiji.show_collection_detail(query, collection_id)
+        except Exception as e:
+            await query.message.reply_text(f"❌ 启动失败: {str(e)}")
+    elif data.startswith('collection_stop_'):
+        collection_id = data.split('_')[2]
+        await safe_answer_query(query, "⏸️ 正在停止采集任务...", show_alert=False)
+        try:
+            await collection_manager.stop_collection(collection_id)
+            await query.message.reply_text("⏸️ 采集任务已停止")
+            await caiji.show_collection_detail(query, collection_id)
+        except Exception as e:
+            await query.message.reply_text(f"❌ 停止失败: {str(e)}")
+    elif data.startswith('collection_delete_'):
+        collection_id = data.split('_')[2]
+        await safe_answer_query(query, "🗑️ 正在删除采集任务...", show_alert=False)
+        try:
+            collection_manager.delete_collection(collection_id)
+            await query.message.reply_text("✅ 采集任务已删除")
+            await caiji.show_collection_list(query)
+        except Exception as e:
+            await query.message.reply_text(f"❌ 删除失败: {str(e)}")
+    elif data.startswith('collection_export_users_'):
+        collection_id = data.split('_')[3]
+        await safe_answer_query(query, "📥 正在导出用户列表...", show_alert=False)
+        try:
+            users = await collection_manager.export_collected_users(collection_id)
+            if users:
+                # Create CSV content
+                import csv
+                import io
+                output = io.StringIO()
+                writer = csv.DictWriter(output, fieldnames=['user_id', 'username', 'first_name', 'last_name', 'tags'])
+                writer.writeheader()
+                writer.writerows(users)
+                
+                # Send as file
+                from telegram import InputFile
+                file_content = output.getvalue().encode('utf-8')
+                await query.message.reply_document(
+                    document=file_content,
+                    filename=f'collected_users_{collection_id}.csv',
+                    caption=f"✅ 已导出 {len(users)} 个用户"
+                )
+            else:
+                await query.message.reply_text("❌ 没有用户数据")
+        except Exception as e:
+            await query.message.reply_text(f"❌ 导出失败: {str(e)}")
+    elif data.startswith('collection_export_groups_'):
+        collection_id = data.split('_')[3]
+        await safe_answer_query(query, "📥 正在导出群组列表...", show_alert=False)
+        try:
+            groups = await collection_manager.export_collected_groups(collection_id)
+            if groups:
+                # Create CSV content
+                import csv
+                import io
+                output = io.StringIO()
+                writer = csv.DictWriter(output, fieldnames=['group_id', 'title', 'username', 'link', 'member_count', 'is_public'])
+                writer.writeheader()
+                writer.writerows(groups)
+                
+                # Send as file
+                from telegram import InputFile
+                file_content = output.getvalue().encode('utf-8')
+                await query.message.reply_document(
+                    document=file_content,
+                    filename=f'collected_groups_{collection_id}.csv',
+                    caption=f"✅ 已导出 {len(groups)} 个群组/频道"
+                )
+            else:
+                await query.message.reply_text("❌ 没有群组数据")
+        except Exception as e:
+            await query.message.reply_text(f"❌ 导出失败: {str(e)}")
     
     # Accounts
     elif data == 'accounts_list':
@@ -5367,6 +5470,7 @@ async def back_to_main(query):
     """Back to main"""
     keyboard = [
         [InlineKeyboardButton("📢 广告私信", callback_data='menu_messaging')],
+        [InlineKeyboardButton("👥 采集用户", callback_data='menu_collection')],
         [InlineKeyboardButton("❓ 帮助", callback_data='menu_help')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -5501,7 +5605,7 @@ async def handle_proxy_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ============================================================================
 def main():
     """Main function"""
-    global account_manager, task_manager, db
+    global account_manager, task_manager, collection_manager, db
     
     logger.info("=" * 80)
     logger.info("Starting Telegram Bot")
@@ -5535,6 +5639,10 @@ def main():
     # 创建task_manager时传入bot_application
     task_manager = TaskManager(db, account_manager, application)
     logger.info("Task manager initialized with bot application")
+    
+    logger.info("Initializing collection manager...")
+    collection_manager = CollectionManager(db, account_manager)
+    logger.info("Collection manager initialized")
     
     logger.info("Registering command handlers...")
     application.add_handler(CommandHandler("start", start))
@@ -5591,6 +5699,26 @@ def main():
         fallbacks=[CommandHandler("start", start)]
     )
     application.add_handler(config_conv)
+    
+    # Collection conversation handler
+    logger.info("Registering collection conversation handler...")
+    collection_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(caiji.start_create_collection, pattern='^collection_create$')],
+        states={
+            caiji.COLLECTION_NAME_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, caiji.handle_collection_name)],
+            caiji.COLLECTION_TYPE_SELECT: [CallbackQueryHandler(caiji.handle_collection_type, pattern='^coll_type_')],
+            caiji.COLLECTION_ACCOUNT_SELECT: [CallbackQueryHandler(caiji.handle_collection_account, pattern='^coll_account_')],
+            caiji.COLLECTION_TARGET_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, caiji.handle_collection_target)],
+            caiji.COLLECTION_KEYWORD_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, caiji.handle_collection_keyword)],
+            caiji.COLLECTION_FILTER_CONFIG: [
+                CallbackQueryHandler(caiji.show_filter_config, pattern='^coll_configure_filters$'),
+                CallbackQueryHandler(caiji.toggle_filter, pattern='^coll_filter_toggle_'),
+                CallbackQueryHandler(caiji.create_collection_now, pattern='^coll_create_now$')
+            ]
+        },
+        fallbacks=[CommandHandler("start", start)]
+    )
+    application.add_handler(collection_conv)
     
     # Proxy file upload handler (for document uploads when waiting for proxy file)
     logger.info("Registering proxy file upload handler...")
