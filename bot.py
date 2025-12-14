@@ -374,9 +374,10 @@ async def should_stop_task_due_to_accounts(db_instance, task_id):
     Returns:
         tuple: (should_stop: bool, reason: str)
     """
-    # 统计可用账户
+    # 统计可用账户（只统计 messaging 类型的账户）
     active_count = db_instance[Account.COLLECTION_NAME].count_documents({
-        'status': AccountStatus.ACTIVE.value
+        'status': AccountStatus.ACTIVE.value,
+        'account_type': 'messaging'
     })
     
     if active_count == 0:
