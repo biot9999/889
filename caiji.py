@@ -1142,8 +1142,10 @@ async def show_collection_detail(query, collection_id):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
-async def start_create_collection(query, context):
+async def start_create_collection(update, context):
     """开始创建采集任务"""
+    query = update.callback_query
+    await query.answer()
     await query.edit_message_text(
         "➕ <b>创建采集任务</b>\n\n"
         "请输入采集任务名称：",
@@ -1182,8 +1184,10 @@ async def handle_collection_name(update, context):
     return COLLECTION_TYPE_SELECT
 
 
-async def handle_collection_type(query, context):
+async def handle_collection_type(update, context):
     """处理采集类型选择"""
+    query = update.callback_query
+    await query.answer()
     from bot import Account, AccountStatus
     from bson import ObjectId
     
@@ -1235,8 +1239,10 @@ async def handle_collection_type(query, context):
     return COLLECTION_ACCOUNT_SELECT
 
 
-async def handle_collection_account(query, context):
+async def handle_collection_account(update, context):
     """处理账户选择"""
+    query = update.callback_query
+    await query.answer()
     from bot import Account
     from bson import ObjectId
     
@@ -1323,8 +1329,10 @@ async def handle_collection_keyword(update, context):
     return COLLECTION_FILTER_CONFIG
 
 
-async def show_filter_config(query, context):
+async def show_filter_config(update, context):
     """显示过滤器配置"""
+    query = update.callback_query
+    await query.answer()
     filters = context.user_data.get('collection_filters', {})
     
     text = "⚙️ <b>过滤器配置</b>\n\n"
@@ -1365,19 +1373,23 @@ async def show_filter_config(query, context):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
-async def toggle_filter(query, context):
+async def toggle_filter(update, context):
     """切换过滤器选项"""
+    query = update.callback_query
+    await query.answer()
     filter_name = query.data.replace('coll_filter_toggle_', '')
     
     filters = context.user_data.get('collection_filters', {})
     filters[filter_name] = not filters.get(filter_name, False)
     context.user_data['collection_filters'] = filters
     
-    await show_filter_config(query, context)
+    await show_filter_config(update, context)
 
 
-async def create_collection_now(query, context):
+async def create_collection_now(update, context):
     """立即创建采集任务"""
+    query = update.callback_query
+    await query.answer()
     from bson import ObjectId
     
     try:
