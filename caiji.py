@@ -11,7 +11,6 @@ from bson import ObjectId
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ConversationHandler
 from telethon import TelegramClient
-from telethon.tl.functions.contacts import SearchQuery
 from telethon.tl.functions.messages import GetHistoryRequest, GetRepliesRequest
 from telethon.tl.types import InputPeerEmpty, PeerChannel, PeerUser
 from telethon.errors import (
