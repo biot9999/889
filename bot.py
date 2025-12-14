@@ -23,8 +23,9 @@ import shutil
 import zipfile
 import json
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+import threading
 
 # Telegram Bot API
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -32,6 +33,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
+from telegram import error as telegram_error
 
 # Telethon for account management
 from telethon import TelegramClient
@@ -39,7 +41,8 @@ from telethon.errors import (
     SessionPasswordNeededError, PhoneCodeInvalidError,
     PhoneNumberInvalidError, FloodWaitError,
     UserPrivacyRestrictedError, UserIsBlockedError,
-    ChatWriteForbiddenError, UserNotMutualContactError, PeerFloodError
+    ChatWriteForbiddenError, UserNotMutualContactError, PeerFloodError,
+    TypeNotFoundError
 )
 
 # Database
@@ -192,12 +195,15 @@ CONFIG_MESSAGE_DELETE_DELAY = 3
 # Auto-refresh and account checking
 AUTO_REFRESH_MIN_INTERVAL = 30  # seconds
 AUTO_REFRESH_MAX_INTERVAL = 50  # seconds
+AUTO_REFRESH_FAST_INTERVAL = 10  # seconds for first minute
+AUTO_REFRESH_FAST_DURATION = 60  # seconds to use fast interval
 MAX_AUTO_REFRESH_ERRORS = 5  # stop auto-refresh after N consecutive errors
 ACCOUNT_CHECK_LOOP_INTERVAL = 10  # check accounts every N loop iterations
 CONSECUTIVE_FAILURES_THRESHOLD = 50  # check accounts after N consecutive failures
 STOP_CONFIRMATION_ITERATIONS = 50  # wait iterations for task stop confirmation (50 * 0.1s = 5s)
 STOP_CONFIRMATION_SLEEP = 0.1  # seconds to sleep between confirmation checks
 MAX_REPORT_RETRY_ATTEMPTS = 3  # maximum attempts to send completion report
+ACCOUNT_STATUS_CACHE_DURATION = 300  # seconds (5 minutes) to cache spambot status
 
 # UI labels mapping
 SEND_METHOD_LABELS = {
@@ -214,6 +220,176 @@ MEDIA_TYPE_LABELS = {
     MediaType.DOCUMENT: '📄 文档',
     MediaType.FORWARD: '📡 转发'
 }
+
+
+# ============================================================================
+# 辅助函数
+# ============================================================================
+async def safe_answer_query(query, text="", show_alert=False, timeout=5.0):
+    """
+    安全地回答 callback query，避免超时错误
+    
+    Args:
+        query: CallbackQuery 对象
+        text: 回答文本
+        show_alert: 是否显示警告框
+        timeout: 超时时间（秒）
+    """
+    if query is None:
+        logger.warning("safe_answer_query called with None query, skipping")
+        return
+    
+    try:
+        await asyncio.wait_for(
+            query.answer(text, show_alert=show_alert),
+            timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        query_id = getattr(query, 'id', 'unknown')
+        logger.warning(f"Query answer timeout after {timeout}s: query_id={query_id}")
+    except telegram_error.BadRequest as e:
+        # Query already answered or expired
+        logger.warning(f"Query BadRequest (likely expired): {e}")
+    except AttributeError as e:
+        logger.error(f"Query object missing required attributes: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error answering query: {e}")
+
+
+# Global cache for account spambot status checks (thread-safe)
+# Format: {account_id: {'status': 'active/limited/banned', 'checked_at': datetime}}
+account_status_cache = {}
+account_status_cache_lock = threading.Lock()
+
+
+async def check_account_real_status(account_manager, account_id):
+    """
+    实时检查账户状态（通过 @spambot）
+    带有5分钟缓存避免频繁查询
+    
+    Args:
+        account_manager: AccountManager 实例
+        account_id: 账户ID
+    
+    Returns:
+        str: 'active', 'limited', 'banned', or 'unknown'
+    """
+    account_id_str = str(account_id)
+    
+    # 检查缓存（线程安全）
+    with account_status_cache_lock:
+        if account_id_str in account_status_cache:
+            cached = account_status_cache[account_id_str]
+            cache_age = (datetime.now(timezone.utc) - cached['checked_at']).total_seconds()
+            if cache_age < ACCOUNT_STATUS_CACHE_DURATION:
+                logger.debug(f"Using cached status for account {account_id}: {cached['status']}")
+                return cached['status']
+    
+    client = None
+    try:
+        # 获取客户端 - 带超时保护
+        client = await asyncio.wait_for(
+            account_manager.get_client(account_id),
+            timeout=10.0
+        )
+        
+        # 查询 @spambot - 整个操作带超时保护
+        async def query_spambot():
+            spambot = await client.get_entity('spambot')
+            await client.send_message(spambot, '/start')
+            await asyncio.sleep(2)
+            return await client.get_messages(spambot, limit=1)
+        
+        messages = await asyncio.wait_for(query_spambot(), timeout=15.0)
+        
+        if not messages:
+            logger.warning(f"No response from @spambot for account {account_id}")
+            return 'unknown'
+        
+        response = messages[0].text.lower()
+        logger.info(f"@spambot response for account {account_id}: {response[:100]}...")
+        
+        # 分类状态（使用与 check_all_accounts_status 相同的逻辑）
+        status = 'active'
+        if any(keyword in response for keyword in ['banned', 'ban', 'spam', 'block', '封禁', '禁止']):
+            status = 'banned'
+        elif any(keyword in response for keyword in ['限制', 'limit', 'restrict', 'frozen', '冻结']):
+            status = 'limited'
+        
+        # 更新缓存（线程安全）
+        with account_status_cache_lock:
+            account_status_cache[account_id_str] = {
+                'status': status,
+                'checked_at': datetime.now(timezone.utc)
+            }
+        
+        # 更新数据库状态
+        if status == 'banned':
+            account_manager.accounts_col.update_one(
+                {'_id': ObjectId(account_id)},
+                {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.now(timezone.utc)}}
+            )
+        elif status == 'limited':
+            account_manager.accounts_col.update_one(
+                {'_id': ObjectId(account_id)},
+                {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.now(timezone.utc)}}
+            )
+        
+        return status
+        
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout checking account {account_id} with @spambot")
+        return 'unknown'
+    except Exception as e:
+        logger.error(f"Error checking account {account_id} with @spambot: {e}", exc_info=True)
+        return 'unknown'
+    finally:
+        # Ensure any pending operations are properly handled
+        # Note: We don't disconnect the client as it's cached and managed by account_manager
+        if client:
+            try:
+                # Give a moment for any pending operations to complete
+                await asyncio.sleep(0.1)
+            except Exception:
+                pass
+
+
+async def should_stop_task_due_to_accounts(db_instance, task_id):
+    """
+    检查是否应该因为没有可用账户而停止任务
+    
+    Args:
+        db_instance: MongoDB database instance
+        task_id: 任务ID
+    
+    Returns:
+        tuple: (should_stop: bool, reason: str)
+    """
+    # 统计可用账户
+    active_count = db_instance[Account.COLLECTION_NAME].count_documents({
+        'status': AccountStatus.ACTIVE.value
+    })
+    
+    if active_count == 0:
+        # 没有可用账户，应该停止任务
+        reason = "所有账户均无法使用（封禁/受限/冻结）"
+        logger.warning(f"Task {task_id}: {reason}")
+        
+        # 更新任务状态
+        db_instance[Task.COLLECTION_NAME].update_one(
+            {'_id': ObjectId(task_id)},
+            {
+                '$set': {
+                    'status': TaskStatus.STOPPED.value,
+                    'completed_at': datetime.now(timezone.utc),
+                    'updated_at': datetime.now(timezone.utc)
+                }
+            }
+        )
+        
+        return True, reason
+    
+    return False, ""
 
 
 # ============================================================================
@@ -1003,6 +1179,16 @@ class AccountManager:
             await client.disconnect()
             
             return {'account': account, 'user': me}
+        except TypeNotFoundError as e:
+            # Session file corrupted or incompatible Telethon version
+            logger.error(
+                f"Session file corrupted or incompatible: {os.path.basename(session_path)}\n"
+                f"Error: {e}\n"
+                f"This account needs to be re-logged in. Skipping..."
+            )
+            if client.is_connected():
+                await client.disconnect()
+            return None
         except Exception as e:
             logger.error(f"Error verifying session {os.path.basename(session_path)}: {e}", exc_info=True)
             if client.is_connected():
@@ -1138,15 +1324,27 @@ class AccountManager:
         # Fallback: Connect without proxy (local)
         if not client:
             logger.info(f"🏠 Connecting locally (no proxy) for account {account.phone}")
-            client = TelegramClient(session_path, int(account.api_id), account.api_hash, proxy=None)
-            await client.connect()
-            
-            if not await client.is_user_authorized():
+            try:
+                client = TelegramClient(session_path, int(account.api_id), account.api_hash, proxy=None)
+                await client.connect()
+                
+                if not await client.is_user_authorized():
+                    self.accounts_col.update_one(
+                        {'_id': ObjectId(account_id)},
+                        {'$set': {'status': AccountStatus.INACTIVE.value, 'updated_at': datetime.utcnow()}}
+                    )
+                    raise ValueError(f"Account {account_id} not authorized")
+            except TypeNotFoundError as e:
+                logger.error(
+                    f"Session file corrupted or incompatible for account {account.phone}\n"
+                    f"Error: {e}\n"
+                    f"This account needs to be re-logged in."
+                )
                 self.accounts_col.update_one(
                     {'_id': ObjectId(account_id)},
                     {'$set': {'status': AccountStatus.INACTIVE.value, 'updated_at': datetime.utcnow()}}
                 )
-                raise ValueError(f"Account {account_id} not authorized")
+                raise ValueError(f"Session corrupted for account {account_id}, please re-login")
         
         self.clients[account_id_str] = client
         return client
@@ -1883,9 +2081,32 @@ class TaskManager:
         return available is not None
     
     async def check_and_stop_if_no_accounts(self, task_id):
-        """Check accounts and stop task if all unavailable"""
+        """Check accounts and stop task if all unavailable - with detailed reason"""
         if not await self.check_accounts_availability():
             logger.error(f"Task {task_id}: All accounts unavailable")
+            
+            # 获取账户状态统计
+            total_accounts = self.db[Account.COLLECTION_NAME].count_documents({})
+            banned_count = self.db[Account.COLLECTION_NAME].count_documents({
+                'status': AccountStatus.BANNED.value
+            })
+            limited_count = self.db[Account.COLLECTION_NAME].count_documents({
+                'status': AccountStatus.LIMITED.value
+            })
+            inactive_count = self.db[Account.COLLECTION_NAME].count_documents({
+                'status': AccountStatus.INACTIVE.value
+            })
+            
+            # 构建详细的停止原因
+            reason_parts = []
+            if banned_count > 0:
+                reason_parts.append(f"封禁: {banned_count}")
+            if limited_count > 0:
+                reason_parts.append(f"受限: {limited_count}")
+            if inactive_count > 0:
+                reason_parts.append(f"未激活: {inactive_count}")
+            
+            detailed_reason = f"所有账号均无法发送消息 (总计: {total_accounts}, {', '.join(reason_parts)})"
             
             # 标记任务失败
             self.tasks_col.update_one(
@@ -1894,7 +2115,7 @@ class TaskManager:
                     '$set': {
                         'status': TaskStatus.FAILED.value,
                         'completed_at': datetime.utcnow(),
-                        'error_message': '所有账号均无法发送消息'
+                        'error_message': detailed_reason
                     }
                 }
             )
@@ -1904,9 +2125,17 @@ class TaskManager:
                 try:
                     await self.bot_application.bot.send_message(
                         Config.ADMIN_USER_ID,
-                        "❌ <b>任务自动停止</b>\n\n"
-                        "原因：所有账号均无法发送消息\n\n"
-                        "请检查账号状态或更换账号",
+                        f"❌ <b>任务自动停止</b>\n\n"
+                        f"原因：{detailed_reason}\n\n"
+                        f"📊 账户状态详情：\n"
+                        f"• 总账户数: {total_accounts}\n"
+                        f"• 🚫 封禁: {banned_count}\n"
+                        f"• ⚠️ 受限: {limited_count}\n"
+                        f"• ❄️ 未激活: {inactive_count}\n\n"
+                        f"💡 建议：\n"
+                        f"1. 使用 '检查账户状态' 功能查询 @spambot\n"
+                        f"2. 添加新的可用账户\n"
+                        f"3. 等待受限账户恢复",
                         parse_mode='HTML'
                     )
                 except Exception as e:
@@ -2340,20 +2569,58 @@ class TaskManager:
             
         except FloodWaitError as e:
             error_msg = f"FloodWait: {e.seconds}s"
-            self.db[Account.COLLECTION_NAME].update_one(
-                {'_id': account._id},
-                {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.utcnow()}}
-            )
+            logger.warning(f"Account {account.phone} hit FloodWait, checking real status...")
+            
+            # 实时检查账户状态
+            real_status = await check_account_real_status(self.account_manager, account._id)
+            if real_status == 'banned':
+                self.db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
+                )
+                logger.error(f"Account {account.phone} is BANNED, marked as unavailable")
+            elif real_status == 'limited':
+                self.db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.utcnow()}}
+                )
+                logger.warning(f"Account {account.phone} is LIMITED")
+            else:
+                # Even if status is active, still mark as limited temporarily due to FloodWait
+                self.db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.utcnow()}}
+                )
+            
             self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, error_msg)
             await asyncio.sleep(e.seconds)
             return False
             
         except PeerFloodError:
             error_msg = "PeerFlood"
-            self.db[Account.COLLECTION_NAME].update_one(
-                {'_id': account._id},
-                {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.utcnow()}}
-            )
+            logger.warning(f"Account {account.phone} hit PeerFlood, checking real status...")
+            
+            # 实时检查账户状态
+            real_status = await check_account_real_status(self.account_manager, account._id)
+            if real_status == 'banned':
+                self.db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
+                )
+                logger.error(f"Account {account.phone} is BANNED, marked as unavailable")
+            elif real_status == 'limited':
+                self.db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.utcnow()}}
+                )
+                logger.warning(f"Account {account.phone} is LIMITED")
+            else:
+                # Even if status is active, still mark as limited temporarily due to PeerFlood
+                self.db[Account.COLLECTION_NAME].update_one(
+                    {'_id': account._id},
+                    {'$set': {'status': AccountStatus.LIMITED.value, 'updated_at': datetime.utcnow()}}
+                )
+            
             self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, error_msg)
             return False
             
@@ -2543,12 +2810,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle button callbacks"""
     query = update.callback_query
-    await query.answer()
     data = query.data
     user_id = query.from_user.id
     username = query.from_user.username or "unknown"
     
     logger.info(f"Button clicked by user {username} ({user_id}): {data}")
+    
+    # Immediately answer query to prevent timeout (with error handling)
+    # The actual handlers will update the message content
+    async def answer_query_with_logging():
+        try:
+            await safe_answer_query(query)
+        except Exception as e:
+            logger.error(f"Error answering query in background: {e}")
+    
+    asyncio.create_task(answer_query_with_logging())
     
     # Main menu
     if data == 'menu_messaging':
@@ -2601,7 +2877,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == 'proxy_test_all':
             # Test all proxies concurrently
             logger.info(f"User {user_id} testing all proxies")
-            await query.answer("⏳ 开始测试所有代理...", show_alert=False)
+            await safe_answer_query(query, "⏳ 开始测试所有代理...", show_alert=False)
             
             # Get all proxies
             all_proxies = list(db[Proxy.COLLECTION_NAME].find())
@@ -2697,7 +2973,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Test single proxy
             proxy_id = data.split('_')[2]
             logger.info(f"User {user_id} testing proxy {proxy_id}")
-            await query.answer("⏳ 正在测试代理...", show_alert=False)
+            await safe_answer_query(query, "⏳ 正在测试代理...", show_alert=False)
             success, message = await test_proxy(db, proxy_id)
             emoji = "✅" if success else "❌"
             await query.message.reply_text(f"{emoji} {message}")
@@ -2711,7 +2987,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {'$or': [{'proxy_id': proxy_oid}, {'proxy_id': proxy_id}]},
             {'$set': {'proxy_id': None}}
         )
-        await query.answer("✅ 代理已删除", show_alert=True)
+        await safe_answer_query(query, "✅ 代理已删除", show_alert=True)
         await list_proxies(query)
     elif data.startswith('proxy_toggle_'):
         proxy_id = data.split('_')[2]
@@ -2724,7 +3000,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 {'$set': {'is_active': new_status, 'updated_at': datetime.utcnow()}}
             )
             status_text = "启用" if new_status else "禁用"
-            await query.answer(f"✅ 代理已{status_text}", show_alert=True)
+            await safe_answer_query(query, f"✅ 代理已{status_text}", show_alert=True)
             await list_proxies(query)
     elif data == 'menu_stats':
         logger.info(f"User {user_id} accessing stats menu")
@@ -2745,7 +3021,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_upload_type_menu(query)
     elif data == 'accounts_check_status':
         logger.info(f"User {user_id} checking all accounts status")
-        await query.answer("🔍 正在检查账户状态，请稍候...", show_alert=False)
+        await safe_answer_query(query, "🔍 正在检查账户状态，请稍候...", show_alert=False)
         
         # Send initial progress message
         progress_msg = await query.message.reply_text(
@@ -2830,14 +3106,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data == 'accounts_export_all':
         logger.info(f"User {user_id} exporting all accounts")
-        await query.answer("📥 正在导出所有账户...", show_alert=False)
+        await safe_answer_query(query, "📥 正在导出所有账户...", show_alert=False)
         
         try:
             all_accounts = list(db[Account.COLLECTION_NAME].find())
             account_ids = [str(acc['_id']) for acc in all_accounts]
             
             if not account_ids:
-                await query.answer("❌ 没有账户可导出", show_alert=True)
+                await safe_answer_query(query, "❌ 没有账户可导出", show_alert=True)
                 return
             
             # 显示准备进度
@@ -2950,11 +3226,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logger.error(f"Error exporting all accounts: {e}", exc_info=True)
-            await query.answer(f"❌ 导出失败：{str(e)}", show_alert=True)
+            await safe_answer_query(query, f"❌ 导出失败：{str(e)}", show_alert=True)
     
     elif data == 'accounts_export_limited':
         logger.info(f"User {user_id} exporting limited accounts")
-        await query.answer("⚠️ 正在导出受限账户...", show_alert=False)
+        await safe_answer_query(query, "⚠️ 正在导出受限账户...", show_alert=False)
         
         try:
             limited_accounts = list(db[Account.COLLECTION_NAME].find({
@@ -2963,7 +3239,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             account_ids = [str(acc['_id']) for acc in limited_accounts]
             
             if not account_ids:
-                await query.answer("✅ 没有受限账户", show_alert=True)
+                await safe_answer_query(query, "✅ 没有受限账户", show_alert=True)
                 return
             
             # 显示准备进度
@@ -3073,7 +3349,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logger.error(f"Error exporting limited accounts: {e}", exc_info=True)
-            await query.answer(f"❌ 导出失败：{str(e)}", show_alert=True)
+            await safe_answer_query(query, f"❌ 导出失败：{str(e)}", show_alert=True)
     # Note: upload_session_file and upload_tdata_file are handled by ConversationHandler
     elif data.startswith('account_check_'):
         account_id = data.split('_')[2]
@@ -3101,7 +3377,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await toggle_task_config(query, task_id, toggle_type)
     elif data == 'noop':
         # No operation for info-only buttons
-        await query.answer()
+        await safe_answer_query(query)
     elif data.startswith('task_start_'):
         task_id = data.split('_')[2]
         logger.info(f"User {user_id} starting task {task_id}")
@@ -3308,7 +3584,7 @@ async def request_session_upload(update: Update, context: ContextTypes.DEFAULT_T
         int: SESSION_UPLOAD state constant
     """
     query = update.callback_query
-    await query.answer()
+    await safe_answer_query(query)
     logger.info(f"User {query.from_user.id} requested session file upload")
     context.user_data['upload_type'] = 'session'
     await query.message.reply_text(
@@ -3334,7 +3610,7 @@ async def request_tdata_upload(update: Update, context: ContextTypes.DEFAULT_TYP
         int: TDATA_UPLOAD state constant
     """
     query = update.callback_query
-    await query.answer()
+    await safe_answer_query(query)
     logger.info(f"User {query.from_user.id} requested tdata file upload")
     context.user_data['upload_type'] = 'tdata'
     await query.message.reply_text(
@@ -3793,7 +4069,7 @@ async def show_task_detail(query, task_id):
     """Show task detail with configuration options and real-time progress"""
     task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
     if not task_doc:
-        await query.answer("❌ 任务不存在", show_alert=True)
+        await safe_answer_query(query, "❌ 任务不存在", show_alert=True)
         return
     
     task = Task.from_dict(task_doc)
@@ -3887,7 +4163,7 @@ async def show_task_config(query, task_id):
     """Show task configuration options"""
     task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
     if not task_doc:
-        await query.answer("❌ 任务不存在", show_alert=True)
+        await safe_answer_query(query, "❌ 任务不存在", show_alert=True)
         return
     
     task = Task.from_dict(task_doc)
@@ -3919,7 +4195,7 @@ async def show_task_config(query, task_id):
 async def request_thread_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Request thread count configuration"""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_query(query)
     task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
     prompt_msg = await query.message.reply_text(
@@ -3937,7 +4213,7 @@ async def request_thread_config(update: Update, context: ContextTypes.DEFAULT_TY
 async def request_interval_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Request interval configuration"""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_query(query)
     task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
     prompt_msg = await query.message.reply_text(
@@ -3956,7 +4232,7 @@ async def request_interval_config(update: Update, context: ContextTypes.DEFAULT_
 async def request_bidirect_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Request bidirectional limit configuration"""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_query(query)
     task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
     prompt_msg = await query.message.reply_text(
@@ -3983,7 +4259,7 @@ async def start_create_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         int: TASK_NAME_INPUT state constant
     """
     query = update.callback_query
-    await query.answer()
+    await safe_answer_query(query)
     logger.info(f"User {query.from_user.id} starting task creation")
     await query.message.reply_text("➕ <b>创建新任务</b>\n\n请输入任务名称：", parse_mode='HTML')
     context.user_data['creating_task'] = True
@@ -4458,7 +4734,7 @@ async def start_task_handler(query, task_id, context):
     """Start task and show progress in new message with auto-refresh"""
     try:
         await task_manager.start_task(task_id)
-        await query.answer("✅ 任务已开始")
+        await safe_answer_query(query, "✅ 任务已开始")
         
         # Send a NEW message for progress tracking instead of editing the existing one
         task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
@@ -4492,15 +4768,27 @@ async def start_task_handler(query, task_id, context):
         reply_markup = InlineKeyboardMarkup(keyboard)
         progress_msg = await query.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
         
-        # 启动后台自动刷新任务（不阻塞）
-        asyncio.create_task(
-            auto_refresh_task_progress(
-                context.bot,
-                query.message.chat_id,
-                progress_msg.message_id,
-                task_id
-            )
-        )
+        # 启动后台自动刷新任务（不阻塞）- 带异常处理包装
+        async def auto_refresh_wrapper():
+            try:
+                await auto_refresh_task_progress(
+                    context.bot,
+                    query.message.chat_id,
+                    progress_msg.message_id,
+                    task_id
+                )
+            except asyncio.CancelledError:
+                logger.info(f"Auto-refresh task for task {task_id} was cancelled")
+                raise  # Re-raise to properly handle cancellation
+            except Exception as e:
+                logger.error(f"Unhandled exception in auto_refresh_task_progress for task {task_id}: {e}", exc_info=True)
+        
+        refresh_task = asyncio.create_task(auto_refresh_wrapper())
+        
+        # Store the refresh task so it can be cancelled later if needed
+        if not hasattr(task_manager, 'refresh_tasks'):
+            task_manager.refresh_tasks = {}
+        task_manager.refresh_tasks[task_id] = refresh_task
         
         # Wait 1 second then refresh to show initial progress
         await asyncio.sleep(1)
@@ -4546,19 +4834,20 @@ async def start_task_handler(query, task_id, context):
         await query.message.reply_text(str(e), parse_mode='HTML')
     except Exception as e:
         logger.error(f"Unexpected error starting task {task_id}: {e}", exc_info=True)
-        await query.answer(f"❌ 启动失败: {str(e)}", show_alert=True)
+        await safe_answer_query(query, f"❌ 启动失败: {str(e)}", show_alert=True)
 
 
 async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
-    """Auto refresh task progress every 30-50 seconds"""
+    """Auto refresh task progress with smart intervals (10s first minute, then 30-50s)"""
     error_count = 0
+    start_time = datetime.now(timezone.utc)
     
     # Wait a bit for task to actually start
     await asyncio.sleep(2)
     
     while True:
         try:
-            # 获取任务状态
+            # 获取任务状态 - 强制从数据库读取最新数据
             task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
             if not task_doc:
                 logger.info(f"Auto-refresh stopped: Task {task_id} not found")
@@ -4575,32 +4864,53 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             total_targets = task.total_targets
             sent_count = task.sent_count
             failed_count = task.failed_count
-            progress = (sent_count + failed_count) / total_targets * 100 if total_targets > 0 else 0
             
-            # 计算时间
+            # 计算进度百分比（带验证）
+            if total_targets > 0 and sent_count is not None and failed_count is not None:
+                progress_percent = min(100.0, (sent_count + failed_count) / total_targets * 100)
+            else:
+                progress_percent = 0.0
+            
+            # 生成进度条
+            progress_bar_length = 10
+            filled = int(progress_percent / 10)
+            progress_bar = '█' * filled + '░' * (progress_bar_length - filled)
+            
+            # 计算时间和速度
             if task.started_at:
-                runtime = datetime.utcnow() - task.started_at
+                runtime = datetime.now(timezone.utc) - task.started_at
                 hours, remainder = divmod(int(runtime.total_seconds()), 3600)
                 minutes, seconds = divmod(remainder, 60)
                 runtime_str = f"{hours}:{minutes:02d}:{seconds:02d}"
                 
-                # 预计剩余
-                if sent_count + failed_count > 0:
-                    avg_time = runtime.total_seconds() / (sent_count + failed_count)
-                    remaining = (total_targets - sent_count - failed_count) * avg_time
-                    rem_hours, rem_remainder = divmod(int(remaining), 3600)
-                    rem_minutes, rem_seconds = divmod(rem_remainder, 60)
-                    remaining_str = f"{rem_hours}:{rem_minutes:02d}:{rem_seconds:02d}"
+                # 计算速度
+                if sent_count + failed_count > 0 and runtime.total_seconds() > 0:
+                    speed = (sent_count + failed_count) / runtime.total_seconds() * 60  # messages per minute
+                    speed_str = f"{speed:.1f} 条/分钟"
+                    
+                    # 预计剩余时间
+                    remaining_count = total_targets - sent_count - failed_count
+                    if speed > 0:
+                        remaining_seconds = remaining_count / speed * 60
+                        rem_hours, rem_remainder = divmod(int(remaining_seconds), 3600)
+                        rem_minutes, rem_seconds = divmod(rem_remainder, 60)
+                        remaining_str = f"{rem_hours}:{rem_minutes:02d}:{rem_seconds:02d}"
+                    else:
+                        remaining_str = "计算中..."
                 else:
+                    speed_str = "计算中..."
                     remaining_str = "计算中..."
             else:
                 runtime_str = "0:00:00"
+                speed_str = "0.0 条/分钟"
                 remaining_str = "未知"
             
             # 更新消息
             text = (
                 f"📊 <b>正在私信中</b>\n\n"
-                f"进度: {sent_count + failed_count}/{total_targets} ({progress:.1f}%)\n\n"
+                f"进度: {sent_count + failed_count}/{total_targets} ({progress_percent:.1f}%)\n"
+                f"{progress_bar}\n\n"
+                f"⚡ 速度: {speed_str}\n"
                 f"⏱️ 预计剩余: {remaining_str}\n"
                 f"⏰ 已运行: {runtime_str}\n\n"
                 f"👥 总用户数: {total_targets}\n"
@@ -4624,12 +4934,34 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                 )
                 # Reset error count on successful update
                 error_count = 0
+            except telegram_error.BadRequest as e:
+                # Handle message not found, deleted, or too old to edit
+                error_str = str(e).lower()
+                if any(keyword in error_str for keyword in ['message to edit not found', 'message can\'t be edited', 'message is not modified', 'message to delete not found']):
+                    logger.info(f"Auto-refresh stopped: message no longer available for task {task_id}")
+                    break  # Stop the refresh loop
+                else:
+                    logger.error(f"BadRequest updating progress: {e}")
+                    error_count += 1
             except Exception as e:
+                error_count += 1
                 if "message is not modified" not in str(e).lower():
                     logger.error(f"Failed to update progress: {e}")
+                    if error_count >= MAX_AUTO_REFRESH_ERRORS:
+                        break
             
-            # 随机等待 30-50 秒后再次更新
-            await asyncio.sleep(random.randint(AUTO_REFRESH_MIN_INTERVAL, AUTO_REFRESH_MAX_INTERVAL))
+            # 智能刷新间隔：前1分钟每10秒，后面30-50秒
+            elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
+            if elapsed < AUTO_REFRESH_FAST_DURATION:
+                # 前1分钟使用快速间隔
+                interval = AUTO_REFRESH_FAST_INTERVAL
+                logger.debug(f"Auto-refresh: fast interval ({interval}s)")
+            else:
+                # 1分钟后使用随机间隔
+                interval = random.randint(AUTO_REFRESH_MIN_INTERVAL, AUTO_REFRESH_MAX_INTERVAL)
+                logger.debug(f"Auto-refresh: normal interval ({interval}s)")
+            
+            await asyncio.sleep(interval)
             
         except Exception as e:
             error_count += 1
@@ -4640,8 +4972,11 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                 logger.error(f"Auto-refresh stopped after {MAX_AUTO_REFRESH_ERRORS} consecutive errors")
                 break
             
-            # Use random interval for error case (consistency with normal operation)
-            await asyncio.sleep(random.randint(AUTO_REFRESH_MIN_INTERVAL, AUTO_REFRESH_MAX_INTERVAL))
+            # Use fast interval for error case during first minute, normal otherwise
+            elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
+            interval = AUTO_REFRESH_FAST_INTERVAL if elapsed < AUTO_REFRESH_FAST_DURATION else random.randint(AUTO_REFRESH_MIN_INTERVAL, AUTO_REFRESH_MAX_INTERVAL)
+            await asyncio.sleep(interval)
+
 
 
 async def send_task_completion_report(bot, chat_id, task_id):
@@ -4721,7 +5056,20 @@ async def stop_task_handler(query, task_id, context):
             }}
         )
         
-        await query.answer("⏸️ 任务停止中...")
+        await safe_answer_query(query, "⏸️ 任务停止中...")
+        
+        # Cancel the auto-refresh task if it exists
+        if hasattr(task_manager, 'refresh_tasks') and task_id in task_manager.refresh_tasks:
+            refresh_task = task_manager.refresh_tasks[task_id]
+            if not refresh_task.done():
+                refresh_task.cancel()
+                try:
+                    await asyncio.wait_for(refresh_task, timeout=1.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass  # Expected when cancelling
+                except Exception as e:
+                    logger.warning(f"Error cancelling refresh task: {e}")
+            del task_manager.refresh_tasks[task_id]
         
         # Try to stop the task gracefully
         if task_id in task_manager.running_tasks:
@@ -4731,6 +5079,12 @@ async def stop_task_handler(query, task_id, context):
             except asyncio.TimeoutError:
                 # Cancel forcefully if it takes too long
                 asyncio_task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio_task, timeout=1.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass  # Expected
+            except Exception as e:
+                logger.warning(f"Error stopping task: {e}")
             
             if task_id in task_manager.running_tasks:
                 del task_manager.running_tasks[task_id]
@@ -4749,7 +5103,7 @@ async def stop_task_handler(query, task_id, context):
         
     except Exception as e:
         logger.error(f"Error stopping task {task_id}: {e}", exc_info=True)
-        await query.answer(f"❌ 停止失败: {str(e)}", show_alert=True)
+        await safe_answer_query(query, f"❌ 停止失败: {str(e)}", show_alert=True)
 
 
 async def show_task_progress(query, task_id):
@@ -4778,7 +5132,7 @@ async def refresh_task_progress(query, task_id):
     
     task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
     if not task_doc:
-        await query.answer("❌ 任务不存在", show_alert=True)
+        await safe_answer_query(query, "❌ 任务不存在", show_alert=True)
         return
     
     task = Task.from_dict(task_doc)
@@ -4830,10 +5184,10 @@ async def refresh_task_progress(query, task_id):
     
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
-        await query.answer("✅ 进度已刷新")
+        await safe_answer_query(query, "✅ 进度已刷新")
     except Exception as e:
         logger.error(f"更新进度显示失败: {e}")
-        await query.answer("刷新完成")
+        await safe_answer_query(query, "刷新完成")
 
 
 async def export_results(query, task_id):
@@ -4890,7 +5244,7 @@ async def toggle_task_config(query, task_id, toggle_type):
     """Toggle task configuration options"""
     task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
     if not task_doc:
-        await query.answer("❌ 任务不存在", show_alert=True)
+        await safe_answer_query(query, "❌ 任务不存在", show_alert=True)
         return
     
     task = Task.from_dict(task_doc)
@@ -4902,21 +5256,21 @@ async def toggle_task_config(query, task_id, toggle_type):
             {'_id': ObjectId(task_id)},
             {'$set': {'pin_message': task.pin_message, 'updated_at': datetime.utcnow()}}
         )
-        await query.answer(f"{'✔️ 已启用' if task.pin_message else '❌ 已禁用'} 置顶消息")
+        await safe_answer_query(query, f"{'✔️ 已启用' if task.pin_message else '❌ 已禁用'} 置顶消息")
     elif toggle_type == 'delete':
         task.delete_dialog = not task.delete_dialog
         db[Task.COLLECTION_NAME].update_one(
             {'_id': ObjectId(task_id)},
             {'$set': {'delete_dialog': task.delete_dialog, 'updated_at': datetime.utcnow()}}
         )
-        await query.answer(f"{'✔️ 已启用' if task.delete_dialog else '❌ 已禁用'} 删除对话框")
+        await safe_answer_query(query, f"{'✔️ 已启用' if task.delete_dialog else '❌ 已禁用'} 删除对话框")
     elif toggle_type == 'repeat':
         task.repeat_send = not task.repeat_send
         db[Task.COLLECTION_NAME].update_one(
             {'_id': ObjectId(task_id)},
             {'$set': {'repeat_send': task.repeat_send, 'updated_at': datetime.utcnow()}}
         )
-        await query.answer(f"{'✔️ 已启用' if task.repeat_send else '❌ 已禁用'} 重复发送")
+        await safe_answer_query(query, f"{'✔️ 已启用' if task.repeat_send else '❌ 已禁用'} 重复发送")
     
     # Refresh the config page
     await show_task_config(query, task_id)
@@ -4928,7 +5282,7 @@ async def delete_task_handler(query, task_id):
         # Get task info before deleting
         task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
         if not task_doc:
-            await query.answer("❌ 任务不存在", show_alert=True)
+            await safe_answer_query(query, "❌ 任务不存在", show_alert=True)
             return
         
         task = Task.from_dict(task_doc)
@@ -4936,17 +5290,17 @@ async def delete_task_handler(query, task_id):
         # Delete the task
         task_manager.delete_task(task_id)
         
-        await query.answer(f"✅ 任务 '{task.name}' 已删除", show_alert=True)
+        await safe_answer_query(query, f"✅ 任务 '{task.name}' 已删除", show_alert=True)
         
         # Refresh the task list
         await list_tasks(query)
         
     except ValueError as e:
         logger.error(f"Error deleting task {task_id}: {e}")
-        await query.answer(f"❌ {str(e)}", show_alert=True)
+        await safe_answer_query(query, f"❌ {str(e)}", show_alert=True)
     except Exception as e:
         logger.error(f"Unexpected error deleting task {task_id}: {e}")
-        await query.answer("❌ 删除任务时发生错误", show_alert=True)
+        await safe_answer_query(query, "❌ 删除任务时发生错误", show_alert=True)
 
 
 async def show_config(query):
