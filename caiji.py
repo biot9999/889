@@ -23,6 +23,13 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# 常量
+# ============================================================================
+# Telegram username pattern (5-32 characters, alphanumeric and underscore)
+USERNAME_PATTERN = r'[a-zA-Z0-9_]{5,32}'
+
+
+# ============================================================================
 # 枚举类型
 # ============================================================================
 class CollectionType(enum.Enum):
@@ -537,9 +544,9 @@ class CollectionManager:
                 # 提取用户名和链接
                 if message.text:
                     # 提取 @username
-                    usernames = re.findall(r'@([a-zA-Z0-9_]{5,32})', message.text)
+                    usernames = re.findall(f'@({USERNAME_PATTERN})', message.text)
                     # 提取 t.me/username
-                    telegram_links = re.findall(r't\.me/([a-zA-Z0-9_]{5,32})', message.text)
+                    telegram_links = re.findall(rf't\.me/({USERNAME_PATTERN})', message.text)
                     
                     all_usernames = set(usernames + telegram_links)
                     

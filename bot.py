@@ -23,6 +23,8 @@ import shutil
 import zipfile
 import json
 import random
+import csv
+import io
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import threading
@@ -3066,8 +3068,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             users = await collection_manager.export_collected_users(collection_id)
             if users:
                 # Create CSV content
-                import csv
-                import io
                 output = io.StringIO()
                 writer = csv.DictWriter(output, fieldnames=['user_id', 'username', 'first_name', 'last_name', 'tags'])
                 writer.writeheader()
@@ -3093,8 +3093,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             groups = await collection_manager.export_collected_groups(collection_id)
             if groups:
                 # Create CSV content
-                import csv
-                import io
                 output = io.StringIO()
                 writer = csv.DictWriter(output, fieldnames=['group_id', 'title', 'username', 'link', 'member_count', 'is_public'])
                 writer.writeheader()
