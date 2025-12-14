@@ -5646,6 +5646,10 @@ def main():
     collection_manager = CollectionManager(db, account_manager)
     logger.info("Collection manager initialized")
     
+    logger.info("Initializing caiji module collection manager...")
+    caiji.init_collection_manager(collection_manager)
+    logger.info("Caiji module collection manager initialized")
+    
     logger.info("Registering command handlers...")
     application.add_handler(CommandHandler("start", start))
     

@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 # 模块级变量
 # ============================================================================
 _db = None
+_collection_manager = None
 
 
 def init_db(database):
@@ -34,11 +35,24 @@ def init_db(database):
     _db = database
 
 
+def init_collection_manager(manager):
+    """初始化采集管理器实例"""
+    global _collection_manager
+    _collection_manager = manager
+
+
 def _get_db():
     """获取数据库实例，如果未初始化则抛出异常"""
     if _db is None:
         raise RuntimeError("Database not initialized. Call init_db() first.")
     return _db
+
+
+def _get_collection_manager():
+    """获取采集管理器实例，如果未初始化则抛出异常"""
+    if _collection_manager is None:
+        raise RuntimeError("Collection manager not initialized. Call init_collection_manager() first.")
+    return _collection_manager
 
 
 # ============================================================================
@@ -1364,10 +1378,10 @@ async def toggle_filter(query, context):
 
 async def create_collection_now(query, context):
     """立即创建采集任务"""
-    from bot import collection_manager
     from bson import ObjectId
     
     try:
+        collection_manager = _get_collection_manager()
         name = context.user_data.get('collection_name')
         coll_type = context.user_data.get('collection_type')
         account_id = context.user_data.get('collection_account_id')
