@@ -1188,7 +1188,9 @@ class AccountManager:
             )
             result = self.accounts_col.insert_one(account.to_dict())
             account._id = result.inserted_id
-            logger.info(f"Account saved to database: {phone} with status: {account.status}, type: {account.account_type}")
+            # Mask phone number in logs for privacy (show only last 4 digits)
+            masked_phone = f"***{phone[-4:]}" if phone and len(phone) >= 4 else "***"
+            logger.info(f"Account saved to database: {masked_phone} with status: {account.status}, type: {account.account_type}")
             
             # 验证状态
             saved_account = self.accounts_col.find_one({'_id': result.inserted_id})

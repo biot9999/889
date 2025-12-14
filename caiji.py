@@ -996,7 +996,7 @@ async def show_collection_menu(query):
     running_collections = db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.RUNNING.value})
     completed_collections = db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.COMPLETED.value})
     
-    # 统计采集专用账户（只统计 collection 类型）
+    # 统计采集账户（只统计 collection 类型）
     total_accounts = db[Account.COLLECTION_NAME].count_documents({
         'account_type': 'collection',
         'session_name': {'$regex': r'\.(session|session\+json)$'}
