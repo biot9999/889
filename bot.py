@@ -5625,6 +5625,10 @@ def main():
     db = init_db(Config.MONGODB_URI, Config.MONGODB_DATABASE)
     logger.info("Database initialized successfully")
     
+    logger.info("Initializing caiji module database...")
+    caiji.init_db(db)
+    logger.info("Caiji module database initialized")
+    
     logger.info("Initializing account manager...")
     account_manager = AccountManager(db)
     logger.info("Account manager initialized")
@@ -5641,6 +5645,10 @@ def main():
     logger.info("Initializing collection manager...")
     collection_manager = CollectionManager(db, account_manager)
     logger.info("Collection manager initialized")
+    
+    logger.info("Initializing caiji module collection manager...")
+    caiji.init_collection_manager(collection_manager)
+    logger.info("Caiji module collection manager initialized")
     
     logger.info("Registering command handlers...")
     application.add_handler(CommandHandler("start", start))

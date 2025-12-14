@@ -23,6 +23,39 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# 模块级变量
+# ============================================================================
+_db = None
+_collection_manager = None
+
+
+def init_db(database):
+    """初始化数据库实例"""
+    global _db
+    _db = database
+
+
+def init_collection_manager(manager):
+    """初始化采集管理器实例"""
+    global _collection_manager
+    _collection_manager = manager
+
+
+def _get_db():
+    """获取数据库实例，如果未初始化则抛出异常"""
+    if _db is None:
+        raise RuntimeError("Database not initialized. Call init_db() first.")
+    return _db
+
+
+def _get_collection_manager():
+    """获取采集管理器实例，如果未初始化则抛出异常"""
+    if _collection_manager is None:
+        raise RuntimeError("Collection manager not initialized. Call init_collection_manager() first.")
+    return _collection_manager
+
+
+# ============================================================================
 # 常量
 # ============================================================================
 # Telegram username pattern (5-32 characters, alphanumeric and underscore)
@@ -953,8 +986,8 @@ COLLECTION_FILTER_CONFIG = 5
 # ============================================================================
 async def show_collection_menu(query):
     """显示采集菜单"""
-    from bot import db
-    # Use module-level imports instead of self-import
+    # Use module-level _db
+    db = _get_db()
     total_collections = db[Collection.COLLECTION_NAME].count_documents({})
     running_collections = db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.RUNNING.value})
     completed_collections = db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.COMPLETED.value})
@@ -978,8 +1011,8 @@ async def show_collection_menu(query):
 
 async def show_collection_list(query, page=0):
     """显示采集任务列表"""
-    from bot import db
-    # Use module-level Collection class
+    # Use module-level _db
+    db = _get_db()
     limit = 5
     skip = page * limit
     
@@ -1040,9 +1073,9 @@ async def show_collection_list(query, page=0):
 
 async def show_collection_detail(query, collection_id):
     """显示采集任务详情"""
-    from bot import db
     from bson import ObjectId
-    # Use module-level classes
+    # Use module-level _db
+    db = _get_db()
     coll_doc = db[Collection.COLLECTION_NAME].find_one({'_id': ObjectId(collection_id)})
     if not coll_doc:
         await query.answer("❌ 采集任务不存在", show_alert=True)
@@ -1109,8 +1142,10 @@ async def show_collection_detail(query, collection_id):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
-async def start_create_collection(query, context):
+async def start_create_collection(update, context):
     """开始创建采集任务"""
+    query = update.callback_query
+    await query.answer()
     await query.edit_message_text(
         "➕ <b>创建采集任务</b>\n\n"
         "请输入采集任务名称：",
@@ -1149,9 +1184,11 @@ async def handle_collection_name(update, context):
     return COLLECTION_TYPE_SELECT
 
 
-async def handle_collection_type(query, context):
+async def handle_collection_type(update, context):
     """处理采集类型选择"""
-    from bot import db, Account, AccountStatus
+    query = update.callback_query
+    await query.answer()
+    from bot import Account, AccountStatus
     from bson import ObjectId
     
     coll_type = query.data.replace('coll_type_', '')
@@ -1166,6 +1203,7 @@ async def handle_collection_type(query, context):
     }.get(coll_type, '未知类型')
     
     # 获取可用账户（只显示session格式）
+    db = _get_db()
     accounts = list(db[Account.COLLECTION_NAME].find({
         'status': AccountStatus.ACTIVE.value,
         'session_name': {'$regex': r'\.(session|session\+json)$'}
@@ -1201,15 +1239,18 @@ async def handle_collection_type(query, context):
     return COLLECTION_ACCOUNT_SELECT
 
 
-async def handle_collection_account(query, context):
+async def handle_collection_account(update, context):
     """处理账户选择"""
-    from bot import db, Account
+    query = update.callback_query
+    await query.answer()
+    from bot import Account
     from bson import ObjectId
     
     account_id = query.data.replace('coll_account_', '')
     context.user_data['collection_account_id'] = account_id
     
     # 获取账户信息
+    db = _get_db()
     acc_doc = db[Account.COLLECTION_NAME].find_one({'_id': ObjectId(account_id)})
     if not acc_doc:
         await query.answer("❌ 账户不存在", show_alert=True)
@@ -1288,8 +1329,10 @@ async def handle_collection_keyword(update, context):
     return COLLECTION_FILTER_CONFIG
 
 
-async def show_filter_config(query, context):
+async def show_filter_config(update, context):
     """显示过滤器配置"""
+    query = update.callback_query
+    await query.answer()
     filters = context.user_data.get('collection_filters', {})
     
     text = "⚙️ <b>过滤器配置</b>\n\n"
@@ -1330,23 +1373,27 @@ async def show_filter_config(query, context):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
-async def toggle_filter(query, context):
+async def toggle_filter(update, context):
     """切换过滤器选项"""
+    query = update.callback_query
+    await query.answer()
     filter_name = query.data.replace('coll_filter_toggle_', '')
     
     filters = context.user_data.get('collection_filters', {})
     filters[filter_name] = not filters.get(filter_name, False)
     context.user_data['collection_filters'] = filters
     
-    await show_filter_config(query, context)
+    await show_filter_config(update, context)
 
 
-async def create_collection_now(query, context):
+async def create_collection_now(update, context):
     """立即创建采集任务"""
-    from bot import collection_manager
+    query = update.callback_query
+    await query.answer()
     from bson import ObjectId
     
     try:
+        collection_manager = _get_collection_manager()
         name = context.user_data.get('collection_name')
         coll_type = context.user_data.get('collection_type')
         account_id = context.user_data.get('collection_account_id')
