@@ -947,8 +947,7 @@ COLLECTION_FILTER_CONFIG = 5
 async def show_collection_menu(query):
     """显示采集菜单"""
     from bot import db
-    from caiji import Collection, CollectionStatus
-    
+    # Use module-level imports instead of self-import
     total_collections = db[Collection.COLLECTION_NAME].count_documents({})
     running_collections = db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.RUNNING.value})
     completed_collections = db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.COMPLETED.value})
@@ -973,8 +972,7 @@ async def show_collection_menu(query):
 async def show_collection_list(query, page=0):
     """显示采集任务列表"""
     from bot import db
-    from caiji import Collection
-    
+    # Use module-level Collection class
     limit = 5
     skip = page * limit
     
@@ -1036,9 +1034,8 @@ async def show_collection_list(query, page=0):
 async def show_collection_detail(query, collection_id):
     """显示采集任务详情"""
     from bot import db
-    from caiji import Collection, CollectedUser, CollectedGroup
     from bson import ObjectId
-    
+    # Use module-level classes
     coll_doc = db[Collection.COLLECTION_NAME].find_one({'_id': ObjectId(collection_id)})
     if not coll_doc:
         await query.answer("❌ 采集任务不存在", show_alert=True)
@@ -1147,7 +1144,8 @@ async def handle_collection_name(update, context):
 
 async def handle_collection_type(query, context):
     """处理采集类型选择"""
-    from bot import db, Account
+    from bot import db, Account, AccountStatus
+    from bson import ObjectId
     
     coll_type = query.data.replace('coll_type_', '')
     context.user_data['collection_type'] = coll_type
@@ -1162,7 +1160,7 @@ async def handle_collection_type(query, context):
     
     # 获取可用账户（只显示session格式）
     accounts = list(db[Account.COLLECTION_NAME].find({
-        'status': 'active',
+        'status': AccountStatus.ACTIVE.value,
         'session_name': {'$regex': r'\.(session|session\+json)$'}
     }).limit(10))
     
@@ -1339,6 +1337,7 @@ async def toggle_filter(query, context):
 async def create_collection_now(query, context):
     """立即创建采集任务"""
     from bot import collection_manager
+    from bson import ObjectId
     
     try:
         name = context.user_data.get('collection_name')

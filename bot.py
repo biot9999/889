@@ -3074,10 +3074,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 writer.writerows(users)
                 
                 # Send as file
-                from telegram import InputFile
                 file_content = output.getvalue().encode('utf-8')
+                file_bytes = io.BytesIO(file_content)
+                file_bytes.name = f'collected_users_{collection_id}.csv'
                 await query.message.reply_document(
-                    document=file_content,
+                    document=file_bytes,
                     filename=f'collected_users_{collection_id}.csv',
                     caption=f"✅ 已导出 {len(users)} 个用户"
                 )
@@ -3100,10 +3101,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 writer.writerows(groups)
                 
                 # Send as file
-                from telegram import InputFile
                 file_content = output.getvalue().encode('utf-8')
+                file_bytes = io.BytesIO(file_content)
+                file_bytes.name = f'collected_groups_{collection_id}.csv'
                 await query.message.reply_document(
-                    document=file_content,
+                    document=file_bytes,
                     filename=f'collected_groups_{collection_id}.csv',
                     caption=f"✅ 已导出 {len(groups)} 个群组/频道"
                 )
