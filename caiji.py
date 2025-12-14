@@ -34,6 +34,13 @@ def init_db(database):
     _db = database
 
 
+def _get_db():
+    """获取数据库实例，如果未初始化则抛出异常"""
+    if _db is None:
+        raise RuntimeError("Database not initialized. Call init_db() first.")
+    return _db
+
+
 # ============================================================================
 # 常量
 # ============================================================================
@@ -966,9 +973,10 @@ COLLECTION_FILTER_CONFIG = 5
 async def show_collection_menu(query):
     """显示采集菜单"""
     # Use module-level _db
-    total_collections = _db[Collection.COLLECTION_NAME].count_documents({})
-    running_collections = _db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.RUNNING.value})
-    completed_collections = _db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.COMPLETED.value})
+    db = _get_db()
+    total_collections = db[Collection.COLLECTION_NAME].count_documents({})
+    running_collections = db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.RUNNING.value})
+    completed_collections = db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.COMPLETED.value})
     
     text = (
         "👥 <b>用户采集</b>\n\n"
@@ -990,11 +998,12 @@ async def show_collection_menu(query):
 async def show_collection_list(query, page=0):
     """显示采集任务列表"""
     # Use module-level _db
+    db = _get_db()
     limit = 5
     skip = page * limit
     
-    collections = list(_db[Collection.COLLECTION_NAME].find().sort('created_at', -1).skip(skip).limit(limit))
-    total = _db[Collection.COLLECTION_NAME].count_documents({})
+    collections = list(db[Collection.COLLECTION_NAME].find().sort('created_at', -1).skip(skip).limit(limit))
+    total = db[Collection.COLLECTION_NAME].count_documents({})
     
     if not collections:
         text = "📋 <b>采集列表</b>\n\n暂无采集任务"
@@ -1052,7 +1061,8 @@ async def show_collection_detail(query, collection_id):
     """显示采集任务详情"""
     from bson import ObjectId
     # Use module-level _db
-    coll_doc = _db[Collection.COLLECTION_NAME].find_one({'_id': ObjectId(collection_id)})
+    db = _get_db()
+    coll_doc = db[Collection.COLLECTION_NAME].find_one({'_id': ObjectId(collection_id)})
     if not coll_doc:
         await query.answer("❌ 采集任务不存在", show_alert=True)
         return
@@ -1175,7 +1185,8 @@ async def handle_collection_type(query, context):
     }.get(coll_type, '未知类型')
     
     # 获取可用账户（只显示session格式）
-    accounts = list(_db[Account.COLLECTION_NAME].find({
+    db = _get_db()
+    accounts = list(db[Account.COLLECTION_NAME].find({
         'status': AccountStatus.ACTIVE.value,
         'session_name': {'$regex': r'\.(session|session\+json)$'}
     }).limit(10))
@@ -1219,7 +1230,8 @@ async def handle_collection_account(query, context):
     context.user_data['collection_account_id'] = account_id
     
     # 获取账户信息
-    acc_doc = _db[Account.COLLECTION_NAME].find_one({'_id': ObjectId(account_id)})
+    db = _get_db()
+    acc_doc = db[Account.COLLECTION_NAME].find_one({'_id': ObjectId(account_id)})
     if not acc_doc:
         await query.answer("❌ 账户不存在", show_alert=True)
         return ConversationHandler.END
