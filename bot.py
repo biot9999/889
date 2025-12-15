@@ -374,9 +374,10 @@ async def should_stop_task_due_to_accounts(db_instance, task_id):
     Returns:
         tuple: (should_stop: bool, reason: str)
     """
-    # 统计可用账户
+    # 统计可用账户（只统计 messaging 类型的账户）
     active_count = db_instance[Account.COLLECTION_NAME].count_documents({
-        'status': AccountStatus.ACTIVE.value
+        'status': AccountStatus.ACTIVE.value,
+        'account_type': 'messaging'
     })
     
     if active_count == 0:
@@ -410,7 +411,8 @@ class Account:
     
     def __init__(self, phone, session_name, status=None, api_id=None, api_hash=None,
                  messages_sent_today=0, total_messages_sent=0, last_used=None,
-                 daily_limit=50, created_at=None, updated_at=None, proxy_id=None, _id=None):
+                 daily_limit=50, created_at=None, updated_at=None, proxy_id=None, 
+                 account_type='messaging', _id=None):
         self._id = _id
         self.phone = phone
         self.session_name = session_name
@@ -422,6 +424,7 @@ class Account:
         self.last_used = last_used
         self.daily_limit = daily_limit
         self.proxy_id = proxy_id  # Reference to Proxy document
+        self.account_type = account_type  # 'messaging' or 'collection'
         self.created_at = created_at or datetime.utcnow()
         self.updated_at = updated_at or datetime.utcnow()
     
@@ -438,6 +441,7 @@ class Account:
             'last_used': self.last_used,
             'daily_limit': self.daily_limit,
             'proxy_id': self.proxy_id,
+            'account_type': self.account_type,
             'created_at': self.created_at,
             'updated_at': self.updated_at
         }
@@ -461,6 +465,7 @@ class Account:
             last_used=doc.get('last_used'),
             daily_limit=doc.get('daily_limit', 50),
             proxy_id=doc.get('proxy_id'),
+            account_type=doc.get('account_type', 'messaging'),
             created_at=doc.get('created_at'),
             updated_at=doc.get('updated_at'),
             _id=doc.get('_id')
@@ -759,6 +764,7 @@ def init_db(mongodb_uri, database_name):
     db[Account.COLLECTION_NAME].create_index('session_name', unique=True)
     db[Account.COLLECTION_NAME].create_index('status')
     db[Account.COLLECTION_NAME].create_index('proxy_id')
+    db[Account.COLLECTION_NAME].create_index('account_type')
     
     db[Task.COLLECTION_NAME].create_index('status')
     db[Task.COLLECTION_NAME].create_index('account_id')
@@ -1109,7 +1115,7 @@ class AccountManager:
         
         return {'status': 'success', 'account': account, 'user': me}
     
-    async def import_session_zip(self, zip_path, api_id=None, api_hash=None):
+    async def import_session_zip(self, zip_path, api_id=None, api_hash=None, account_type='messaging'):
         """Import sessions from zip"""
         logger.info(f"Starting session import from: {zip_path}")
         api_id = api_id or Config.API_ID
@@ -1135,7 +1141,7 @@ class AccountManager:
             
             for idx, session_path in enumerate(session_files, 1):
                 logger.info(f"Verifying session {idx}/{len(session_files)}: {os.path.basename(session_path)}")
-                result = await self._verify_session(session_path, api_id, api_hash)
+                result = await self._verify_session(session_path, api_id, api_hash, account_type)
                 if result:
                     imported.append(result)
                     logger.info(f"Session verified successfully: {result['account'].phone}")
@@ -1148,7 +1154,7 @@ class AccountManager:
             logger.info(f"Cleaning up temporary directory: {temp_dir}")
             shutil.rmtree(temp_dir, ignore_errors=True)
     
-    async def _verify_session(self, session_path, api_id, api_hash):
+    async def _verify_session(self, session_path, api_id, api_hash, account_type='messaging'):
         """Verify session file"""
         logger.info(f"Connecting to Telegram with session: {os.path.basename(session_path)}")
         proxy = Config.get_proxy_dict()
@@ -1177,11 +1183,14 @@ class AccountManager:
                 session_name=session_name,
                 api_id=str(api_id),
                 api_hash=api_hash,
-                status=AccountStatus.ACTIVE.value  # 明确设置为 ACTIVE
+                status=AccountStatus.ACTIVE.value,  # 明确设置为 ACTIVE
+                account_type=account_type  # 设置账户类型
             )
             result = self.accounts_col.insert_one(account.to_dict())
             account._id = result.inserted_id
-            logger.info(f"Account saved to database: {phone} with status: {account.status}")
+            # Mask phone number in logs for privacy (show only last 4 digits)
+            masked_phone = f"***{phone[-4:]}" if phone and len(phone) >= 4 else "***"
+            logger.info(f"Account saved to database: {masked_phone} with status: {account.status}, type: {account.account_type}")
             
             # 验证状态
             saved_account = self.accounts_col.find_one({'_id': result.inserted_id})
@@ -3024,6 +3033,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'menu_collection':
         logger.info(f"User {user_id} accessing collection menu")
         await caiji.show_collection_menu(query)
+    elif data == 'collection_accounts_menu':
+        logger.info(f"User {user_id} accessing collection accounts menu")
+        await caiji.show_collection_accounts_menu(query)
+    elif data == 'collection_accounts_list':
+        logger.info(f"User {user_id} viewing collection accounts list")
+        await caiji.list_collection_accounts(query)
+    elif data == 'collection_accounts_add':
+        logger.info(f"User {user_id} adding collection account")
+        # 显示上传界面，但标记为采集账户类型
+        context.user_data['account_type'] = 'collection'
+        await show_add_account_menu(query)
     elif data == 'collection_upload_account':
         logger.info(f"User {user_id} uploading account from collection menu")
         await show_add_account_menu(query)
@@ -3214,7 +3234,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_answer_query(query, "📥 正在导出所有账户...", show_alert=False)
         
         try:
-            all_accounts = list(db[Account.COLLECTION_NAME].find())
+            # Only export messaging accounts
+            all_accounts = list(db[Account.COLLECTION_NAME].find({'account_type': 'messaging'}))
             account_ids = [str(acc['_id']) for acc in all_accounts]
             
             if not account_ids:
@@ -3338,8 +3359,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_answer_query(query, "⚠️ 正在导出受限账户...", show_alert=False)
         
         try:
+            # Only export limited messaging accounts
             limited_accounts = list(db[Account.COLLECTION_NAME].find({
-                'status': {'$in': [AccountStatus.LIMITED.value, AccountStatus.BANNED.value, AccountStatus.INACTIVE.value]}
+                'status': {'$in': [AccountStatus.LIMITED.value, AccountStatus.BANNED.value, AccountStatus.INACTIVE.value]},
+                'account_type': 'messaging'
             }))
             account_ids = [str(acc['_id']) for acc in limited_accounts]
             
@@ -3619,9 +3642,12 @@ async def show_messaging_menu(query):
 
 async def show_accounts_menu(query):
     """Show enhanced accounts menu with statistics"""
-    # 统计账户数量
-    total_accounts = db[Account.COLLECTION_NAME].count_documents({})
-    active_accounts = db[Account.COLLECTION_NAME].count_documents({'status': AccountStatus.ACTIVE.value})
+    # 统计账户数量（只统计 messaging 类型）
+    total_accounts = db[Account.COLLECTION_NAME].count_documents({'account_type': 'messaging'})
+    active_accounts = db[Account.COLLECTION_NAME].count_documents({
+        'status': AccountStatus.ACTIVE.value,
+        'account_type': 'messaging'
+    })
     
     keyboard = [
         [InlineKeyboardButton("📋 账号列表", callback_data='accounts_list')],
@@ -3731,10 +3757,11 @@ async def request_tdata_upload(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle file upload for session or tdata"""
     upload_type = context.user_data.get('upload_type', 'session')
+    account_type = context.user_data.get('account_type', 'messaging')  # 获取账户类型，默认 messaging
     # Determine which state to return based on upload type
     current_state = SESSION_UPLOAD if upload_type == 'session' else TDATA_UPLOAD
     
-    logger.info(f"User {update.effective_user.id} is uploading {upload_type} file")
+    logger.info(f"User {update.effective_user.id} is uploading {upload_type} file with account_type: {account_type}")
     
     if not update.message.document:
         logger.warning(f"User {update.effective_user.id} sent non-document message")
@@ -3760,8 +3787,8 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("⏳ 正在导入账户...")
         logger.info(f"Starting account import from: {zip_path}")
         
-        # Import accounts
-        imported = await account_manager.import_session_zip(zip_path)
+        # Import accounts - 传递账户类型
+        imported = await account_manager.import_session_zip(zip_path, account_type=account_type)
         
         if not imported:
             logger.warning(f"No accounts imported from {zip_path}")
@@ -3814,7 +3841,8 @@ async def check_all_accounts_status(progress_callback=None):
         progress_callback: Optional async function to call with progress updates
                           Should accept (current, total, stats) as parameters
     """
-    accounts = list(db[Account.COLLECTION_NAME].find())
+    # Only check messaging accounts
+    accounts = list(db[Account.COLLECTION_NAME].find({'account_type': 'messaging'}))
     
     # 增强版状态模式 - 支持多语言和更精确的分类
     status_patterns = {
@@ -4083,17 +4111,18 @@ async def export_accounts(account_ids, export_type='all'):
 
 async def list_accounts(query):
     """List accounts"""
-    account_docs = db[Account.COLLECTION_NAME].find()
+    # 只查询 messaging 类型的账户
+    account_docs = db[Account.COLLECTION_NAME].find({'account_type': 'messaging'})
     accounts = [Account.from_dict(doc) for doc in account_docs]
     
     if not accounts:
-        text = "📱 <b>账户列表</b>\n\n暂无账户"
+        text = "📱 <b>账户列表</b>\n\n暂无广告私信账户"
         keyboard = [
             [InlineKeyboardButton("➕ 添加账户", callback_data='accounts_add')],
             [InlineKeyboardButton("🔙 返回", callback_data='menu_accounts')]
         ]
     else:
-        text = f"📱 <b>账户列表</b>\n\n共 {len(accounts)} 个账户：\n\n"
+        text = f"📱 <b>账户列表</b>\n\n共 {len(accounts)} 个广告账户：\n\n"
         keyboard = []
         
         for account in accounts:
@@ -5627,6 +5656,17 @@ def main():
     logger.info(f"Initializing database: {Config.MONGODB_URI}")
     db = init_db(Config.MONGODB_URI, Config.MONGODB_DATABASE)
     logger.info("Database initialized successfully")
+    
+    # 数据迁移：为已存在的账户添加默认 account_type
+    logger.info("Running database migration for account_type...")
+    migration_result = db[Account.COLLECTION_NAME].update_many(
+        {'account_type': {'$exists': False}},
+        {'$set': {'account_type': 'messaging'}}
+    )
+    if migration_result.modified_count > 0:
+        logger.info(f"Migrated {migration_result.modified_count} existing accounts to messaging type")
+    else:
+        logger.info("No accounts needed migration")
     
     logger.info("Initializing caiji module database...")
     caiji.init_db(db)

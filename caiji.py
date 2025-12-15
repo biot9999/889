@@ -996,12 +996,14 @@ async def show_collection_menu(query):
     running_collections = db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.RUNNING.value})
     completed_collections = db[Collection.COLLECTION_NAME].count_documents({'status': CollectionStatus.COMPLETED.value})
     
-    # 统计可用账户（仅 session/session+json 格式）
+    # 统计采集账户（只统计 collection 类型）
     total_accounts = db[Account.COLLECTION_NAME].count_documents({
+        'account_type': 'collection',
         'session_name': {'$regex': r'\.(session|session\+json)$'}
     })
     active_accounts = db[Account.COLLECTION_NAME].count_documents({
         'status': AccountStatus.ACTIVE.value,
+        'account_type': 'collection',
         'session_name': {'$regex': r'\.(session|session\+json)$'}
     })
     
@@ -1010,18 +1012,86 @@ async def show_collection_menu(query):
         f"📊 采集任务: {total_collections}\n"
         f"🔄 运行中: {running_collections}\n"
         f"✅ 已完成: {completed_collections}\n\n"
-        f"📱 可用账户: {active_accounts}/{total_accounts}\n\n"
+        f"📱 采集账户: {active_accounts}/{total_accounts}\n\n"
         "选择操作："
     )
     
     keyboard = [
-        [InlineKeyboardButton("📤 上传账户", callback_data='collection_upload_account')],
+        [InlineKeyboardButton("📱 账户管理", callback_data='collection_accounts_menu')],
         [InlineKeyboardButton("📋 采集列表", callback_data='collection_list')],
         [InlineKeyboardButton("➕ 创建采集", callback_data='collection_create')],
         [InlineKeyboardButton("🔙 返回主菜单", callback_data='back_main')]
     ]
     
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def show_collection_accounts_menu(query):
+    """显示采集账户管理菜单"""
+    from bot import Account, AccountStatus
+    
+    # Use module-level _db
+    db = _get_db()
+    
+    # 统计采集账户
+    total_accounts = db[Account.COLLECTION_NAME].count_documents({
+        'account_type': 'collection',
+        'session_name': {'$regex': r'\.(session|session\+json)$'}
+    })
+    active_accounts = db[Account.COLLECTION_NAME].count_documents({
+        'status': AccountStatus.ACTIVE.value,
+        'account_type': 'collection',
+        'session_name': {'$regex': r'\.(session|session\+json)$'}
+    })
+    
+    text = (
+        "📱 <b>采集账户管理</b>\n\n"
+        f"当前状态：可用 {active_accounts}/{total_accounts} 个账号\n\n"
+        f"请选择操作："
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("📋 账号列表", callback_data='collection_accounts_list')],
+        [InlineKeyboardButton("➕ 添加账号", callback_data='collection_accounts_add')],
+        [InlineKeyboardButton("🔙 返回", callback_data='menu_collection')]
+    ]
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def list_collection_accounts(query):
+    """显示采集账户列表"""
+    from bot import Account, AccountStatus
+    
+    # Use module-level _db
+    db = _get_db()
+    
+    # 只查询 collection 类型的账户
+    account_docs = db[Account.COLLECTION_NAME].find({'account_type': 'collection'})
+    accounts = [Account.from_dict(doc) for doc in account_docs]
+    
+    if not accounts:
+        text = "📱 <b>采集账户列表</b>\n\n暂无采集账户"
+        keyboard = [
+            [InlineKeyboardButton("➕ 添加账户", callback_data='collection_accounts_add')],
+            [InlineKeyboardButton("🔙 返回", callback_data='collection_accounts_menu')]
+        ]
+    else:
+        text = f"📱 <b>采集账户列表</b>\n\n共 {len(accounts)} 个采集账户：\n\n"
+        keyboard = []
+        
+        for account in accounts:
+            status_emoji = {'active': '✅', 'banned': '🚫', 'limited': '⚠️', 'inactive': '❌'}.get(account.status, '❓')
+            text += (
+                f"{status_emoji} <b>{account.phone}</b>\n"
+                f"   状态: {account.status}\n"
+                f"   格式: {account.session_name.split('.')[-1]}\n\n"
+            )
+        
+        keyboard.append([InlineKeyboardButton("🔙 返回", callback_data='collection_accounts_menu')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
 
 
 async def show_collection_list(query, page=0):
@@ -1217,20 +1287,21 @@ async def handle_collection_type(update, context):
         'keyword_search': '关键词搜索'
     }.get(coll_type, '未知类型')
     
-    # 获取可用账户（只显示session格式）
+    # 获取采集专用账户（只显示 collection 类型的 session 格式账户）
     db = _get_db()
     accounts = list(db[Account.COLLECTION_NAME].find({
         'status': AccountStatus.ACTIVE.value,
+        'account_type': 'collection',
         'session_name': {'$regex': r'\.(session|session\+json)$'}
     }).limit(10))
     
     if not accounts:
         await query.edit_message_text(
-            "❌ 没有可用的账户\n\n"
-            "采集功能仅支持 session/session+json 格式账户\n"
-            "请先添加账户",
+            "❌ 没有可用的采集账户\n\n"
+            "采集功能需要专用的 session/session+json 格式账户\n"
+            "请先添加采集账户",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📤 上传账户", callback_data='collection_upload_account')],
+                [InlineKeyboardButton("📱 账户管理", callback_data='collection_accounts_menu')],
                 [InlineKeyboardButton("🔙 返回", callback_data='menu_collection')]
             ]),
             parse_mode='HTML'
