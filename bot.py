@@ -109,6 +109,26 @@ class Config:
     RESULTS_DIR = os.getenv('RESULTS_DIR', './results')
     LOGS_DIR = os.getenv('LOGS_DIR', './logs')
     
+    # Constants (moved from global scope)
+    POSTBOT_CODE_MIN_LENGTH = 10
+    POSTBOT_RESPONSE_WAIT_SECONDS = 2
+    SPAMBOT_QUERY_DELAY = 2
+    PROGRESS_MONITOR_INTERVAL = 10
+    TASK_STOP_TIMEOUT_SECONDS = 2.0
+    CONFIG_MESSAGE_DELETE_DELAY = 3
+    Config.AUTO_REFRESH_MIN_INTERVAL = 30
+    Config.AUTO_REFRESH_MAX_INTERVAL = 50
+    Config.AUTO_REFRESH_FAST_INTERVAL = 10
+    Config.AUTO_REFRESH_FAST_DURATION = 60
+    Config.MAX_AUTO_REFRESH_ERRORS = 5
+    Config.ACCOUNT_CHECK_LOOP_INTERVAL = 10
+    Config.CONSECUTIVE_FAILURES_THRESHOLD = 50
+    Config.STOP_CONFIRMATION_ITERATIONS = 50
+    Config.STOP_CONFIRMATION_SLEEP = 0.1
+    MAX_REPORT_RETRY_ATTEMPTS = 3
+    Config.ACCOUNT_STATUS_CACHE_DURATION = 300
+    ACCOUNT_STATUS_CHECK_CACHE_DURATION = 30
+    
     @classmethod
     def ensure_directories(cls):
         """Ensure all required directories exist"""
@@ -189,31 +209,23 @@ class SendMethod(enum.Enum):
     CHANNEL_FORWARD_HIDDEN = "channel_forward_hidden"  # 隐藏转发来源
 
 
+class FloodWaitStrategy(enum.Enum):
+    """FloodWait handling strategy"""
+    STOP_TASK = "stop_task"  # 停止任务
+    SWITCH_ACCOUNT = "switch_account"  # 切换账号
+    CONTINUE_WAIT = "continue_wait"  # 继续等待
+
+
+class MessageMode(enum.Enum):
+    """Message sending mode"""
+    NORMAL = "normal"  # 普通模式
+    EDIT = "edit"  # 编辑模式
+    REPLY = "reply"  # 回复模式
+
+
 # ============================================================================
 # 常量
 # ============================================================================
-# Postbot code validation
-POSTBOT_CODE_MIN_LENGTH = 10
-POSTBOT_RESPONSE_WAIT_SECONDS = 2
-
-# Task execution timing
-PROGRESS_MONITOR_INTERVAL = 10
-TASK_STOP_TIMEOUT_SECONDS = 2.0
-CONFIG_MESSAGE_DELETE_DELAY = 3
-
-# Auto-refresh and account checking
-AUTO_REFRESH_MIN_INTERVAL = 30  # seconds
-AUTO_REFRESH_MAX_INTERVAL = 50  # seconds
-AUTO_REFRESH_FAST_INTERVAL = 10  # seconds for first minute
-AUTO_REFRESH_FAST_DURATION = 60  # seconds to use fast interval
-MAX_AUTO_REFRESH_ERRORS = 5  # stop auto-refresh after N consecutive errors
-ACCOUNT_CHECK_LOOP_INTERVAL = 10  # check accounts every N loop iterations
-CONSECUTIVE_FAILURES_THRESHOLD = 50  # check accounts after N consecutive failures
-STOP_CONFIRMATION_ITERATIONS = 50  # wait iterations for task stop confirmation (50 * 0.1s = 5s)
-STOP_CONFIRMATION_SLEEP = 0.1  # seconds to sleep between confirmation checks
-MAX_REPORT_RETRY_ATTEMPTS = 3  # maximum attempts to send completion report
-ACCOUNT_STATUS_CACHE_DURATION = 300  # seconds (5 minutes) to cache spambot status
-
 # UI labels mapping
 SEND_METHOD_LABELS = {
     SendMethod.DIRECT: '📤 直接发送',
@@ -290,7 +302,7 @@ async def check_account_real_status(account_manager, account_id):
         if account_id_str in account_status_cache:
             cached = account_status_cache[account_id_str]
             cache_age = (datetime.now(timezone.utc) - cached['checked_at']).total_seconds()
-            if cache_age < ACCOUNT_STATUS_CACHE_DURATION:
+            if cache_age < Config.ACCOUNT_STATUS_CACHE_DURATION:
                 logger.debug(f"Using cached status for account {account_id}: {cached['status']}")
                 return cached['status']
     
@@ -482,7 +494,20 @@ class Task:
                  total_targets=0, sent_count=0, failed_count=0, created_at=None,
                  started_at=None, completed_at=None, updated_at=None, _id=None,
                  thread_count=1, pin_message=False, delete_dialog=False, 
-                 repeat_send=False, ignore_bidirectional_limit=0):
+                 repeat_send=False, ignore_bidirectional_limit=0,
+                 # New fields for edit mode
+                 message_mode='normal', edit_delay_min=5, edit_delay_max=15, edit_content=None,
+                 # New fields for reply mode
+                 reply_timeout=300, reply_keywords=None, reply_default=None,
+                 # New fields for batch pause
+                 batch_pause_count=0, batch_pause_min=0, batch_pause_max=5,
+                 # New field for FloodWait strategy
+                 flood_wait_strategy='switch_account',
+                 # New fields for voice call
+                 voice_call_enabled=False, voice_call_duration=10, 
+                 voice_call_wait_after=3, voice_call_send_if_failed=True,
+                 # Other new fields
+                 thread_start_interval=1, auto_switch_dead_account=True):
         self._id = _id
         self.name = name
         self.status = status or TaskStatus.PENDING.value
@@ -509,6 +534,29 @@ class Task:
         self.delete_dialog = delete_dialog
         self.repeat_send = repeat_send
         self.ignore_bidirectional_limit = ignore_bidirectional_limit
+        # Edit mode fields
+        self.message_mode = message_mode
+        self.edit_delay_min = edit_delay_min
+        self.edit_delay_max = edit_delay_max
+        self.edit_content = edit_content
+        # Reply mode fields
+        self.reply_timeout = reply_timeout
+        self.reply_keywords = reply_keywords or {}
+        self.reply_default = reply_default
+        # Batch pause fields
+        self.batch_pause_count = batch_pause_count
+        self.batch_pause_min = batch_pause_min
+        self.batch_pause_max = batch_pause_max
+        # FloodWait strategy
+        self.flood_wait_strategy = flood_wait_strategy
+        # Voice call fields
+        self.voice_call_enabled = voice_call_enabled
+        self.voice_call_duration = voice_call_duration
+        self.voice_call_wait_after = voice_call_wait_after
+        self.voice_call_send_if_failed = voice_call_send_if_failed
+        # Other fields
+        self.thread_start_interval = thread_start_interval
+        self.auto_switch_dead_account = auto_switch_dead_account
     
     def to_dict(self):
         """Convert to dictionary for MongoDB"""
@@ -536,7 +584,30 @@ class Task:
             'pin_message': self.pin_message,
             'delete_dialog': self.delete_dialog,
             'repeat_send': self.repeat_send,
-            'ignore_bidirectional_limit': self.ignore_bidirectional_limit
+            'ignore_bidirectional_limit': self.ignore_bidirectional_limit,
+            # Edit mode fields
+            'message_mode': self.message_mode,
+            'edit_delay_min': self.edit_delay_min,
+            'edit_delay_max': self.edit_delay_max,
+            'edit_content': self.edit_content,
+            # Reply mode fields
+            'reply_timeout': self.reply_timeout,
+            'reply_keywords': self.reply_keywords,
+            'reply_default': self.reply_default,
+            # Batch pause fields
+            'batch_pause_count': self.batch_pause_count,
+            'batch_pause_min': self.batch_pause_min,
+            'batch_pause_max': self.batch_pause_max,
+            # FloodWait strategy
+            'flood_wait_strategy': self.flood_wait_strategy,
+            # Voice call fields
+            'voice_call_enabled': self.voice_call_enabled,
+            'voice_call_duration': self.voice_call_duration,
+            'voice_call_wait_after': self.voice_call_wait_after,
+            'voice_call_send_if_failed': self.voice_call_send_if_failed,
+            # Other fields
+            'thread_start_interval': self.thread_start_interval,
+            'auto_switch_dead_account': self.auto_switch_dead_account
         }
         if self._id:
             doc['_id'] = self._id
@@ -572,7 +643,30 @@ class Task:
             pin_message=doc.get('pin_message', False),
             delete_dialog=doc.get('delete_dialog', False),
             repeat_send=doc.get('repeat_send', False),
-            ignore_bidirectional_limit=doc.get('ignore_bidirectional_limit', 0)
+            ignore_bidirectional_limit=doc.get('ignore_bidirectional_limit', 0),
+            # Edit mode fields
+            message_mode=doc.get('message_mode', 'normal'),
+            edit_delay_min=doc.get('edit_delay_min', 5),
+            edit_delay_max=doc.get('edit_delay_max', 15),
+            edit_content=doc.get('edit_content'),
+            # Reply mode fields
+            reply_timeout=doc.get('reply_timeout', 300),
+            reply_keywords=doc.get('reply_keywords', {}),
+            reply_default=doc.get('reply_default'),
+            # Batch pause fields
+            batch_pause_count=doc.get('batch_pause_count', 0),
+            batch_pause_min=doc.get('batch_pause_min', 0),
+            batch_pause_max=doc.get('batch_pause_max', 5),
+            # FloodWait strategy
+            flood_wait_strategy=doc.get('flood_wait_strategy', 'switch_account'),
+            # Voice call fields
+            voice_call_enabled=doc.get('voice_call_enabled', False),
+            voice_call_duration=doc.get('voice_call_duration', 10),
+            voice_call_wait_after=doc.get('voice_call_wait_after', 3),
+            voice_call_send_if_failed=doc.get('voice_call_send_if_failed', True),
+            # Other fields
+            thread_start_interval=doc.get('thread_start_interval', 1),
+            auto_switch_dead_account=doc.get('auto_switch_dead_account', True)
         )
 
 
@@ -1561,13 +1655,13 @@ class TaskManager:
                 pass
         
         # 5. Wait for confirmation that task has cleaned up
-        for i in range(STOP_CONFIRMATION_ITERATIONS):
+        for i in range(Config.STOP_CONFIRMATION_ITERATIONS):
             if task_id_str not in self.running_tasks:
                 logger.info(f"Task {task_id}: Confirmed stopped (iteration {i})")
                 break
-            await asyncio.sleep(STOP_CONFIRMATION_SLEEP)
+            await asyncio.sleep(Config.STOP_CONFIRMATION_SLEEP)
         else:
-            # Force cleanup after timeout (STOP_CONFIRMATION_ITERATIONS * STOP_CONFIRMATION_SLEEP seconds)
+            # Force cleanup after timeout (Config.STOP_CONFIRMATION_ITERATIONS * Config.STOP_CONFIRMATION_SLEEP seconds)
             logger.warning(f"Task {task_id}: Force cleanup after timeout")
             if task_id_str in self.running_tasks:
                 del self.running_tasks[task_id_str]
@@ -1785,7 +1879,7 @@ class TaskManager:
                     break
             
             # 每10轮检查账号
-            if batch_index > 0 and batch_index % ACCOUNT_CHECK_LOOP_INTERVAL == 0:
+            if batch_index > 0 and batch_index % Config.ACCOUNT_CHECK_LOOP_INTERVAL == 0:
                 if await self.check_and_stop_if_no_accounts(task_id):
                     logger.info("所有账号不可用，任务已停止")
                     break
@@ -1930,7 +2024,7 @@ class TaskManager:
             
             # 每10次循环检查账号
             loop_count += 1
-            if loop_count % ACCOUNT_CHECK_LOOP_INTERVAL == 0:
+            if loop_count % Config.ACCOUNT_CHECK_LOOP_INTERVAL == 0:
                 if await self.check_and_stop_if_no_accounts(task_id):
                     logger.info(f"[批次 {batch_idx}] 所有账号不可用，任务已停止")
                     break
@@ -2002,7 +2096,7 @@ class TaskManager:
                 logger.warning(f"[批次 {batch_idx}] ❌ 所有账户尝试后仍然失败: {target.username or target.user_id}")
                 
                 # 检查连续失败次数
-                if consecutive_failures >= CONSECUTIVE_FAILURES_THRESHOLD:
+                if consecutive_failures >= Config.CONSECUTIVE_FAILURES_THRESHOLD:
                     logger.warning(f"[批次 {batch_idx}] 连续失败 {consecutive_failures} 次，检查账号可用性")
                     # 检查账号可用性（无论是否有成功发送）
                     if await self.check_and_stop_if_no_accounts(task_id):
@@ -4519,7 +4613,7 @@ async def handle_postbot_code_input(update: Update, context: ContextTypes.DEFAUL
     
     # Validate postbot code format (must be like 693af80c53cb2)
     # Pattern: alphanumeric characters, minimum length defined by constant
-    if not re.match(rf'^[a-zA-Z0-9]{{{POSTBOT_CODE_MIN_LENGTH},}}$', code):
+    if not re.match(rf'^[a-zA-Z0-9]{{{Config.POSTBOT_CODE_MIN_LENGTH},}}$', code):
         await update.message.reply_text(
             "❌ <b>代码格式错误</b>\n\n"
             "Post代码格式应该类似：<code>693af80c53cb2</code>\n\n"
@@ -4749,7 +4843,7 @@ async def handle_thread_config(update: Update, context: ContextTypes.DEFAULT_TYP
         
         msg = await update.message.reply_text(f"✅ 线程数已设置为：{thread_count}")
         # Auto-delete after configured delay
-        await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)
+        await asyncio.sleep(Config.CONFIG_MESSAGE_DELETE_DELAY)
         try:
             # Delete confirmation message
             await msg.delete()
@@ -4800,7 +4894,7 @@ async def handle_interval_config(update: Update, context: ContextTypes.DEFAULT_T
         
         msg = await update.message.reply_text(f"✅ 发送间隔已设置为：{min_interval}-{max_interval} 秒")
         # Auto-delete after configured delay
-        await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)
+        await asyncio.sleep(Config.CONFIG_MESSAGE_DELETE_DELAY)
         try:
             # Delete confirmation message
             await msg.delete()
@@ -4840,7 +4934,7 @@ async def handle_bidirect_config(update: Update, context: ContextTypes.DEFAULT_T
         
         msg = await update.message.reply_text(f"✅ 无视双向次数已设置为：{limit}")
         # Auto-delete after configured delay
-        await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)
+        await asyncio.sleep(Config.CONFIG_MESSAGE_DELETE_DELAY)
         try:
             # Delete confirmation message
             await msg.delete()
@@ -5081,34 +5175,34 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                 error_count += 1
                 if "message is not modified" not in str(e).lower():
                     logger.error(f"Failed to update progress: {e}")
-                    if error_count >= MAX_AUTO_REFRESH_ERRORS:
+                    if error_count >= Config.MAX_AUTO_REFRESH_ERRORS:
                         break
             
             # 智能刷新间隔：前1分钟每10秒，后面30-50秒
             elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
-            if elapsed < AUTO_REFRESH_FAST_DURATION:
+            if elapsed < Config.AUTO_REFRESH_FAST_DURATION:
                 # 前1分钟使用快速间隔
-                interval = AUTO_REFRESH_FAST_INTERVAL
+                interval = Config.AUTO_REFRESH_FAST_INTERVAL
                 logger.debug(f"Auto-refresh: fast interval ({interval}s)")
             else:
                 # 1分钟后使用随机间隔
-                interval = random.randint(AUTO_REFRESH_MIN_INTERVAL, AUTO_REFRESH_MAX_INTERVAL)
+                interval = random.randint(Config.AUTO_REFRESH_MIN_INTERVAL, Config.AUTO_REFRESH_MAX_INTERVAL)
                 logger.debug(f"Auto-refresh: normal interval ({interval}s)")
             
             await asyncio.sleep(interval)
             
         except Exception as e:
             error_count += 1
-            logger.error(f"Error in auto refresh (count: {error_count}/{MAX_AUTO_REFRESH_ERRORS}): {e}")
+            logger.error(f"Error in auto refresh (count: {error_count}/{Config.MAX_AUTO_REFRESH_ERRORS}): {e}")
             
             # Stop after max errors to prevent infinite error loops
-            if error_count >= MAX_AUTO_REFRESH_ERRORS:
-                logger.error(f"Auto-refresh stopped after {MAX_AUTO_REFRESH_ERRORS} consecutive errors")
+            if error_count >= Config.MAX_AUTO_REFRESH_ERRORS:
+                logger.error(f"Auto-refresh stopped after {Config.MAX_AUTO_REFRESH_ERRORS} consecutive errors")
                 break
             
             # Use fast interval for error case during first minute, normal otherwise
             elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
-            interval = AUTO_REFRESH_FAST_INTERVAL if elapsed < AUTO_REFRESH_FAST_DURATION else random.randint(AUTO_REFRESH_MIN_INTERVAL, AUTO_REFRESH_MAX_INTERVAL)
+            interval = Config.AUTO_REFRESH_FAST_INTERVAL if elapsed < Config.AUTO_REFRESH_FAST_DURATION else random.randint(Config.AUTO_REFRESH_MIN_INTERVAL, Config.AUTO_REFRESH_MAX_INTERVAL)
             await asyncio.sleep(interval)
 
 
