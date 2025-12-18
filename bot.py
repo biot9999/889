@@ -109,6 +109,26 @@ class Config:
     RESULTS_DIR = os.getenv('RESULTS_DIR', './results')
     LOGS_DIR = os.getenv('LOGS_DIR', './logs')
     
+    # Constants (moved from global scope)
+    POSTBOT_CODE_MIN_LENGTH = 10
+    POSTBOT_RESPONSE_WAIT_SECONDS = 2
+    SPAMBOT_QUERY_DELAY = 2
+    PROGRESS_MONITOR_INTERVAL = 10
+    TASK_STOP_TIMEOUT_SECONDS = 2.0
+    CONFIG_MESSAGE_DELETE_DELAY = 3
+    Config.AUTO_REFRESH_MIN_INTERVAL = 30
+    Config.AUTO_REFRESH_MAX_INTERVAL = 50
+    Config.AUTO_REFRESH_FAST_INTERVAL = 10
+    Config.AUTO_REFRESH_FAST_DURATION = 60
+    Config.MAX_AUTO_REFRESH_ERRORS = 5
+    Config.ACCOUNT_CHECK_LOOP_INTERVAL = 10
+    Config.CONSECUTIVE_FAILURES_THRESHOLD = 50
+    Config.STOP_CONFIRMATION_ITERATIONS = 50
+    Config.STOP_CONFIRMATION_SLEEP = 0.1
+    Config.MAX_REPORT_RETRY_ATTEMPTS = 3
+    Config.ACCOUNT_STATUS_CACHE_DURATION = 300
+    ACCOUNT_STATUS_CHECK_CACHE_DURATION = 30
+    
     @classmethod
     def ensure_directories(cls):
         """Ensure all required directories exist"""
@@ -189,31 +209,23 @@ class SendMethod(enum.Enum):
     CHANNEL_FORWARD_HIDDEN = "channel_forward_hidden"  # 隐藏转发来源
 
 
+class FloodWaitStrategy(enum.Enum):
+    """FloodWait handling strategy"""
+    STOP_TASK = "stop_task"  # 停止任务
+    SWITCH_ACCOUNT = "switch_account"  # 切换账号
+    CONTINUE_WAIT = "continue_wait"  # 继续等待
+
+
+class MessageMode(enum.Enum):
+    """Message sending mode"""
+    NORMAL = "normal"  # 普通模式
+    EDIT = "edit"  # 编辑模式
+    REPLY = "reply"  # 回复模式
+
+
 # ============================================================================
 # 常量
 # ============================================================================
-# Postbot code validation
-POSTBOT_CODE_MIN_LENGTH = 10
-POSTBOT_RESPONSE_WAIT_SECONDS = 2
-
-# Task execution timing
-PROGRESS_MONITOR_INTERVAL = 10
-TASK_STOP_TIMEOUT_SECONDS = 2.0
-CONFIG_MESSAGE_DELETE_DELAY = 3
-
-# Auto-refresh and account checking
-AUTO_REFRESH_MIN_INTERVAL = 30  # seconds
-AUTO_REFRESH_MAX_INTERVAL = 50  # seconds
-AUTO_REFRESH_FAST_INTERVAL = 10  # seconds for first minute
-AUTO_REFRESH_FAST_DURATION = 60  # seconds to use fast interval
-MAX_AUTO_REFRESH_ERRORS = 5  # stop auto-refresh after N consecutive errors
-ACCOUNT_CHECK_LOOP_INTERVAL = 10  # check accounts every N loop iterations
-CONSECUTIVE_FAILURES_THRESHOLD = 50  # check accounts after N consecutive failures
-STOP_CONFIRMATION_ITERATIONS = 50  # wait iterations for task stop confirmation (50 * 0.1s = 5s)
-STOP_CONFIRMATION_SLEEP = 0.1  # seconds to sleep between confirmation checks
-MAX_REPORT_RETRY_ATTEMPTS = 3  # maximum attempts to send completion report
-ACCOUNT_STATUS_CACHE_DURATION = 300  # seconds (5 minutes) to cache spambot status
-
 # UI labels mapping
 SEND_METHOD_LABELS = {
     SendMethod.DIRECT: '📤 直接发送',
@@ -290,7 +302,7 @@ async def check_account_real_status(account_manager, account_id):
         if account_id_str in account_status_cache:
             cached = account_status_cache[account_id_str]
             cache_age = (datetime.now(timezone.utc) - cached['checked_at']).total_seconds()
-            if cache_age < ACCOUNT_STATUS_CACHE_DURATION:
+            if cache_age < Config.ACCOUNT_STATUS_CACHE_DURATION:
                 logger.debug(f"Using cached status for account {account_id}: {cached['status']}")
                 return cached['status']
     
@@ -482,7 +494,20 @@ class Task:
                  total_targets=0, sent_count=0, failed_count=0, created_at=None,
                  started_at=None, completed_at=None, updated_at=None, _id=None,
                  thread_count=1, pin_message=False, delete_dialog=False, 
-                 repeat_send=False, ignore_bidirectional_limit=0):
+                 repeat_send=False, ignore_bidirectional_limit=0,
+                 # New fields for edit mode
+                 message_mode='normal', edit_delay_min=5, edit_delay_max=15, edit_content=None,
+                 # New fields for reply mode
+                 reply_timeout=300, reply_keywords=None, reply_default=None,
+                 # New fields for batch pause
+                 batch_pause_count=0, batch_pause_min=0, batch_pause_max=5,
+                 # New field for FloodWait strategy
+                 flood_wait_strategy='switch_account',
+                 # New fields for voice call
+                 voice_call_enabled=False, voice_call_duration=10, 
+                 voice_call_wait_after=3, voice_call_send_if_failed=True,
+                 # Other new fields
+                 thread_start_interval=1, auto_switch_dead_account=True):
         self._id = _id
         self.name = name
         self.status = status or TaskStatus.PENDING.value
@@ -509,6 +534,29 @@ class Task:
         self.delete_dialog = delete_dialog
         self.repeat_send = repeat_send
         self.ignore_bidirectional_limit = ignore_bidirectional_limit
+        # Edit mode fields
+        self.message_mode = message_mode
+        self.edit_delay_min = edit_delay_min
+        self.edit_delay_max = edit_delay_max
+        self.edit_content = edit_content
+        # Reply mode fields
+        self.reply_timeout = reply_timeout
+        self.reply_keywords = reply_keywords or {}
+        self.reply_default = reply_default
+        # Batch pause fields
+        self.batch_pause_count = batch_pause_count
+        self.batch_pause_min = batch_pause_min
+        self.batch_pause_max = batch_pause_max
+        # FloodWait strategy
+        self.flood_wait_strategy = flood_wait_strategy
+        # Voice call fields
+        self.voice_call_enabled = voice_call_enabled
+        self.voice_call_duration = voice_call_duration
+        self.voice_call_wait_after = voice_call_wait_after
+        self.voice_call_send_if_failed = voice_call_send_if_failed
+        # Other fields
+        self.thread_start_interval = thread_start_interval
+        self.auto_switch_dead_account = auto_switch_dead_account
     
     def to_dict(self):
         """Convert to dictionary for MongoDB"""
@@ -536,7 +584,30 @@ class Task:
             'pin_message': self.pin_message,
             'delete_dialog': self.delete_dialog,
             'repeat_send': self.repeat_send,
-            'ignore_bidirectional_limit': self.ignore_bidirectional_limit
+            'ignore_bidirectional_limit': self.ignore_bidirectional_limit,
+            # Edit mode fields
+            'message_mode': self.message_mode,
+            'edit_delay_min': self.edit_delay_min,
+            'edit_delay_max': self.edit_delay_max,
+            'edit_content': self.edit_content,
+            # Reply mode fields
+            'reply_timeout': self.reply_timeout,
+            'reply_keywords': self.reply_keywords,
+            'reply_default': self.reply_default,
+            # Batch pause fields
+            'batch_pause_count': self.batch_pause_count,
+            'batch_pause_min': self.batch_pause_min,
+            'batch_pause_max': self.batch_pause_max,
+            # FloodWait strategy
+            'flood_wait_strategy': self.flood_wait_strategy,
+            # Voice call fields
+            'voice_call_enabled': self.voice_call_enabled,
+            'voice_call_duration': self.voice_call_duration,
+            'voice_call_wait_after': self.voice_call_wait_after,
+            'voice_call_send_if_failed': self.voice_call_send_if_failed,
+            # Other fields
+            'thread_start_interval': self.thread_start_interval,
+            'auto_switch_dead_account': self.auto_switch_dead_account
         }
         if self._id:
             doc['_id'] = self._id
@@ -572,7 +643,30 @@ class Task:
             pin_message=doc.get('pin_message', False),
             delete_dialog=doc.get('delete_dialog', False),
             repeat_send=doc.get('repeat_send', False),
-            ignore_bidirectional_limit=doc.get('ignore_bidirectional_limit', 0)
+            ignore_bidirectional_limit=doc.get('ignore_bidirectional_limit', 0),
+            # Edit mode fields
+            message_mode=doc.get('message_mode', 'normal'),
+            edit_delay_min=doc.get('edit_delay_min', 5),
+            edit_delay_max=doc.get('edit_delay_max', 15),
+            edit_content=doc.get('edit_content'),
+            # Reply mode fields
+            reply_timeout=doc.get('reply_timeout', 300),
+            reply_keywords=doc.get('reply_keywords', {}),
+            reply_default=doc.get('reply_default'),
+            # Batch pause fields
+            batch_pause_count=doc.get('batch_pause_count', 0),
+            batch_pause_min=doc.get('batch_pause_min', 0),
+            batch_pause_max=doc.get('batch_pause_max', 5),
+            # FloodWait strategy
+            flood_wait_strategy=doc.get('flood_wait_strategy', 'switch_account'),
+            # Voice call fields
+            voice_call_enabled=doc.get('voice_call_enabled', False),
+            voice_call_duration=doc.get('voice_call_duration', 10),
+            voice_call_wait_after=doc.get('voice_call_wait_after', 3),
+            voice_call_send_if_failed=doc.get('voice_call_send_if_failed', True),
+            # Other fields
+            thread_start_interval=doc.get('thread_start_interval', 1),
+            auto_switch_dead_account=doc.get('auto_switch_dead_account', True)
         )
 
 
@@ -1000,6 +1094,110 @@ def assign_proxies_to_accounts(db):
 
 
 # ============================================================================
+# 代理管理类
+# ============================================================================
+class ProxyManager:
+    """Manage proxy health scoring and selection"""
+    
+    def __init__(self, db):
+        self.db = db
+        self.proxies_col = db[Proxy.COLLECTION_NAME]
+    
+    def get_best_proxy(self):
+        """Get best proxy based on success rate and recency"""
+        try:
+            # Get all active proxies
+            proxies = list(self.proxies_col.find({'is_active': True}))
+            
+            if not proxies:
+                return None
+            
+            # Score proxies
+            scored_proxies = []
+            for proxy_doc in proxies:
+                proxy = Proxy.from_dict(proxy_doc)
+                score = self._calculate_proxy_score(proxy)
+                scored_proxies.append((score, proxy))
+            
+            # Sort by score (highest first)
+            scored_proxies.sort(key=lambda x: x[0], reverse=True)
+            
+            # Return best proxy
+            if scored_proxies:
+                return scored_proxies[0][1]
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"ProxyManager: Error getting best proxy: {e}")
+            return None
+    
+    def _calculate_proxy_score(self, proxy):
+        """Calculate proxy health score (0-100)"""
+        total_attempts = proxy.success_count + proxy.fail_count
+        
+        # No attempts yet, give neutral score
+        if total_attempts == 0:
+            return 50
+        
+        # Calculate success rate (0-100)
+        success_rate = (proxy.success_count / total_attempts) * 100
+        
+        # Time decay: prefer recently used proxies
+        if proxy.updated_at:
+            age_seconds = (datetime.utcnow() - proxy.updated_at).total_seconds()
+            age_hours = age_seconds / 3600
+            # Decay factor: 1.0 for fresh, 0.5 for 24h old, 0.1 for week old
+            time_factor = max(0.1, 1.0 - (age_hours / 168))  # 168 hours = 1 week
+        else:
+            time_factor = 0.5
+        
+        # Combined score
+        score = success_rate * time_factor
+        
+        return score
+    
+    def record_proxy_result(self, proxy_id, success):
+        """Record proxy operation result and auto-disable if needed"""
+        try:
+            if success:
+                self.proxies_col.update_one(
+                    {'_id': ObjectId(proxy_id)},
+                    {
+                        '$inc': {'success_count': 1},
+                        '$set': {'updated_at': datetime.utcnow()}
+                    }
+                )
+            else:
+                self.proxies_col.update_one(
+                    {'_id': ObjectId(proxy_id)},
+                    {
+                        '$inc': {'fail_count': 1},
+                        '$set': {'updated_at': datetime.utcnow()}
+                    }
+                )
+                
+                # Check if should disable proxy
+                proxy_doc = self.proxies_col.find_one({'_id': ObjectId(proxy_id)})
+                if proxy_doc:
+                    proxy = Proxy.from_dict(proxy_doc)
+                    total = proxy.success_count + proxy.fail_count
+                    
+                    # Disable if failure rate > 80% and at least 10 attempts
+                    if total >= 10:
+                        failure_rate = (proxy.fail_count / total) * 100
+                        if failure_rate > 80:
+                            self.proxies_col.update_one(
+                                {'_id': ObjectId(proxy_id)},
+                                {'$set': {'is_active': False, 'updated_at': datetime.utcnow()}}
+                            )
+                            logger.warning(f"ProxyManager: Disabled proxy {proxy.host}:{proxy.port} due to {failure_rate:.1f}% failure rate")
+                            
+        except Exception as e:
+            logger.error(f"ProxyManager: Error recording proxy result: {e}")
+
+
+# ============================================================================
 # 消息格式化类
 # ============================================================================
 class MessageFormatter:
@@ -1054,6 +1252,115 @@ class MessageFormatter:
 
 
 # ============================================================================
+# 编辑模式和回复模式类
+# ============================================================================
+class EditMode:
+    """Handle edit mode functionality for messages"""
+    
+    def __init__(self, task, account_manager):
+        self.task = task
+        self.account_manager = account_manager
+        self.sent_messages = {}  # {target_id: message_obj}
+    
+    async def send_and_schedule_edit(self, client, entity, target_id, initial_message, edit_content):
+        """Send initial message and schedule edit"""
+        try:
+            # Send initial message
+            sent_message = await client.send_message(entity, initial_message)
+            
+            # Store message for editing
+            self.sent_messages[target_id] = sent_message
+            
+            # Wait random delay
+            delay = random.randint(self.task.edit_delay_min, self.task.edit_delay_max)
+            logger.info(f"EditMode: Scheduled edit in {delay} seconds for target {target_id}")
+            await asyncio.sleep(delay)
+            
+            # Edit message
+            await client.edit_message(entity, sent_message, edit_content)
+            logger.info(f"EditMode: Message edited successfully for target {target_id}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"EditMode: Failed to edit message for target {target_id}: {e}")
+            return False
+
+
+class ReplyMode:
+    """Handle reply mode functionality for auto-replies"""
+    
+    def __init__(self, task, account_manager):
+        self.task = task
+        self.account_manager = account_manager
+        self.monitoring_tasks = {}  # {target_id: asyncio.Task}
+    
+    async def monitor_and_reply(self, client, entity, target_id, stop_event):
+        """Monitor for user replies and respond accordingly"""
+        try:
+            # Get initial message count
+            initial_messages = await client.get_messages(entity, limit=1)
+            last_message_id = initial_messages[0].id if initial_messages else 0
+            
+            start_time = datetime.utcnow()
+            timeout = timedelta(seconds=self.task.reply_timeout)
+            
+            while (datetime.utcnow() - start_time) < timeout:
+                if stop_event.is_set():
+                    logger.info(f"ReplyMode: Stop event detected for target {target_id}")
+                    break
+                
+                # Check for new messages
+                await asyncio.sleep(2)  # Check every 2 seconds
+                new_messages = await client.get_messages(entity, min_id=last_message_id, limit=10)
+                
+                for msg in reversed(new_messages):
+                    if msg.out:  # Skip our own messages
+                        continue
+                    
+                    # Check if message matches any keyword
+                    message_text = msg.message.lower() if msg.message else ""
+                    reply_sent = False
+                    
+                    for keyword, reply_text in self.task.reply_keywords.items():
+                        if keyword.lower() in message_text:
+                            await client.send_message(entity, reply_text)
+                            logger.info(f"ReplyMode: Sent keyword reply for '{keyword}' to target {target_id}")
+                            reply_sent = True
+                            break
+                    
+                    # Send default reply if no keyword matched
+                    if not reply_sent and self.task.reply_default:
+                        await client.send_message(entity, self.task.reply_default)
+                        logger.info(f"ReplyMode: Sent default reply to target {target_id}")
+                    
+                    last_message_id = msg.id
+            
+            logger.info(f"ReplyMode: Monitoring ended for target {target_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"ReplyMode: Error monitoring target {target_id}: {e}")
+            return False
+    
+    def start_monitoring(self, client, entity, target_id, stop_event):
+        """Start monitoring task in background"""
+        task = asyncio.create_task(self.monitor_and_reply(client, entity, target_id, stop_event))
+        self.monitoring_tasks[target_id] = task
+        return task
+    
+    async def stop_all_monitoring(self):
+        """Stop all monitoring tasks"""
+        for target_id, task in self.monitoring_tasks.items():
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self.monitoring_tasks.clear()
+
+
+# ============================================================================
 # 账户管理类
 # ============================================================================
 class AccountManager:
@@ -1063,6 +1370,7 @@ class AccountManager:
         self.db = db
         self.accounts_col = db[Account.COLLECTION_NAME]
         self.clients = {}
+        self.client_locks = {}  # Locks for preventing concurrent client creation
     
     async def send_code_request(self, phone, api_id=None, api_hash=None):
         """Send code to phone"""
@@ -1217,12 +1525,24 @@ class AccountManager:
             return None
     
     async def get_client(self, account_id):
-        """Get client for account with automatic proxy assignment"""
+        """Get client for account with automatic proxy assignment and lock protection"""
         account_id_str = str(account_id)
+        
+        # Check if already connected (fast path, no lock needed)
         if account_id_str in self.clients and self.clients[account_id_str].is_connected():
             return self.clients[account_id_str]
         
-        account_doc = self.accounts_col.find_one({'_id': ObjectId(account_id)})
+        # Create lock for this account if doesn't exist
+        if account_id_str not in self.client_locks:
+            self.client_locks[account_id_str] = asyncio.Lock()
+        
+        # Acquire lock to prevent concurrent client creation
+        async with self.client_locks[account_id_str]:
+            # Double-check if another coroutine already created the client
+            if account_id_str in self.clients and self.clients[account_id_str].is_connected():
+                return self.clients[account_id_str]
+            
+            account_doc = self.accounts_col.find_one({'_id': ObjectId(account_id)})
         if not account_doc:
             raise ValueError(f"Account {account_id} not found")
         
@@ -1393,12 +1713,32 @@ class AccountManager:
         docs = self.accounts_col.find({'status': AccountStatus.ACTIVE.value})
         return [Account.from_dict(doc) for doc in docs]
     
+    async def disconnect_client(self, account_id):
+        """Disconnect a specific client"""
+        account_id_str = str(account_id)
+        if account_id_str in self.clients:
+            client = self.clients[account_id_str]
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+                    logger.info(f"Disconnected client for account {account_id}")
+            except Exception as e:
+                logger.error(f"Error disconnecting client for account {account_id}: {e}")
+            finally:
+                del self.clients[account_id_str]
+                if account_id_str in self.client_locks:
+                    del self.client_locks[account_id_str]
+    
     async def disconnect_all(self):
         """Disconnect all clients"""
-        for client in self.clients.values():
-            if client.is_connected():
-                await client.disconnect()
+        for account_id, client in list(self.clients.items()):
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception as e:
+                logger.error(f"Error disconnecting client {account_id}: {e}")
         self.clients.clear()
+        self.client_locks.clear()
 
 
 # ============================================================================
@@ -1418,6 +1758,7 @@ class TaskManager:
         self.report_sent = set()  # Track which tasks have sent completion reports
         self.report_retry_count = {}  # Track report send retry attempts {task_id: count}
         self.bot_application = bot_application  # 用于发送完成报告
+        self._account_check_cache = {}  # Cache for check_and_stop_if_no_accounts {task_id: {'result': bool, 'checked_at': datetime}}
     
     def create_task(self, name, message_text, message_format, media_type=MediaType.TEXT,
                    media_path=None, send_method=SendMethod.DIRECT, postbot_code=None, 
@@ -1477,6 +1818,31 @@ class TaskManager:
             if line and not line.startswith('#'):
                 targets.append(line)
         return targets
+    
+    async def check_phone_numbers(self, phone_numbers, account_id):
+        """Check if phone numbers are registered on Telegram"""
+        client = await self.account_manager.get_client(str(account_id))
+        
+        registered = []
+        unregistered = []
+        
+        for phone in phone_numbers:
+            try:
+                # Try to get entity by phone number
+                entity = await client.get_entity(phone)
+                registered.append(phone)
+                logger.info(f"Phone {phone} is registered on Telegram")
+            except Exception as e:
+                unregistered.append(phone)
+                logger.info(f"Phone {phone} is not registered: {e}")
+        
+        return {
+            'registered': registered,
+            'unregistered': unregistered,
+            'total': len(phone_numbers),
+            'registered_count': len(registered),
+            'unregistered_count': len(unregistered)
+        }
     
     async def start_task(self, task_id):
         """Start task with dual stop mechanism"""
@@ -1561,13 +1927,13 @@ class TaskManager:
                 pass
         
         # 5. Wait for confirmation that task has cleaned up
-        for i in range(STOP_CONFIRMATION_ITERATIONS):
+        for i in range(Config.STOP_CONFIRMATION_ITERATIONS):
             if task_id_str not in self.running_tasks:
                 logger.info(f"Task {task_id}: Confirmed stopped (iteration {i})")
                 break
-            await asyncio.sleep(STOP_CONFIRMATION_SLEEP)
+            await asyncio.sleep(Config.STOP_CONFIRMATION_SLEEP)
         else:
-            # Force cleanup after timeout (STOP_CONFIRMATION_ITERATIONS * STOP_CONFIRMATION_SLEEP seconds)
+            # Force cleanup after timeout (Config.STOP_CONFIRMATION_ITERATIONS * Config.STOP_CONFIRMATION_SLEEP seconds)
             logger.warning(f"Task {task_id}: Force cleanup after timeout")
             if task_id_str in self.running_tasks:
                 del self.running_tasks[task_id_str]
@@ -1785,7 +2151,7 @@ class TaskManager:
                     break
             
             # 每10轮检查账号
-            if batch_index > 0 and batch_index % ACCOUNT_CHECK_LOOP_INTERVAL == 0:
+            if batch_index > 0 and batch_index % Config.ACCOUNT_CHECK_LOOP_INTERVAL == 0:
                 if await self.check_and_stop_if_no_accounts(task_id):
                     logger.info("所有账号不可用，任务已停止")
                     break
@@ -1828,7 +2194,7 @@ class TaskManager:
                     
                     # 发送消息
                     logger.info(f"账号 {account.phone} -> 用户 {target.username or target.user_id} ({target_idx + 1}/{len(targets)})")
-                    success = await self._send_message(task, target, account)
+                    success = await self._send_message_with_mode(task, target, account)
                     
                     if success:
                         self.tasks_col.update_one(
@@ -1890,6 +2256,12 @@ class TaskManager:
         for batch_idx, batch in enumerate(batches[:thread_count]):
             account = accounts[batch_idx % len(accounts)]
             logger.info(f"批次 {batch_idx + 1}: 分配账户 {account.phone}，处理 {len(batch)} 个目标")
+            
+            # Apply thread start interval (except for first batch)
+            if batch_idx > 0 and task.thread_start_interval > 0:
+                logger.info(f"批次 {batch_idx + 1}: 等待 {task.thread_start_interval} 秒后启动")
+                await asyncio.sleep(task.thread_start_interval)
+            
             concurrent_tasks.append(
                 self._process_batch_normal_mode(task_id, task, batch, accounts, batch_idx, stop_event)
             )
@@ -1930,7 +2302,7 @@ class TaskManager:
             
             # 每10次循环检查账号
             loop_count += 1
-            if loop_count % ACCOUNT_CHECK_LOOP_INTERVAL == 0:
+            if loop_count % Config.ACCOUNT_CHECK_LOOP_INTERVAL == 0:
                 if await self.check_and_stop_if_no_accounts(task_id):
                     logger.info(f"[批次 {batch_idx}] 所有账号不可用，任务已停止")
                     break
@@ -1965,7 +2337,7 @@ class TaskManager:
                 
                 # 发送消息
                 logger.info(f"[批次 {batch_idx}] 使用账户 {account.phone} 尝试发送")
-                success = await self._send_message(task, target, account)
+                success = await self._send_message_with_mode(task, target, account)
                 
                 if not success:
                     logger.warning(f"[批次 {batch_idx}] 账户 {account.phone} 发送失败，尝试下一个账户")
@@ -1987,6 +2359,17 @@ class TaskManager:
                     )
                     logger.info(f"[批次 {batch_idx}] ✅ 发送成功")
                     
+                    # Batch pause mechanism (if configured)
+                    if task.batch_pause_count > 0:
+                        # Get current sent count
+                        task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+                        if task_doc:
+                            current_sent = task_doc.get('sent_count', 0)
+                            if current_sent > 0 and current_sent % task.batch_pause_count == 0:
+                                pause_delay = random.randint(task.batch_pause_min, task.batch_pause_max)
+                                logger.info(f"[批次 {batch_idx}] 🛑 批次停顿: 已发送 {current_sent} 条，停顿 {pause_delay} 秒")
+                                await asyncio.sleep(pause_delay)
+                    
                     # 消息间隔
                     delay = random.randint(task.min_interval, task.max_interval)
                     await asyncio.sleep(delay)
@@ -2002,7 +2385,7 @@ class TaskManager:
                 logger.warning(f"[批次 {batch_idx}] ❌ 所有账户尝试后仍然失败: {target.username or target.user_id}")
                 
                 # 检查连续失败次数
-                if consecutive_failures >= CONSECUTIVE_FAILURES_THRESHOLD:
+                if consecutive_failures >= Config.CONSECUTIVE_FAILURES_THRESHOLD:
                     logger.warning(f"[批次 {batch_idx}] 连续失败 {consecutive_failures} 次，检查账号可用性")
                     # 检查账号可用性（无论是否有成功发送）
                     if await self.check_and_stop_if_no_accounts(task_id):
@@ -2042,7 +2425,7 @@ class TaskManager:
             
             # 发送消息
             logger.info(f"[批次 {batch_idx}] 正在发送消息到目标: {target.username or target.user_id}")
-            success = await self._send_message(task, target, account)
+            success = await self._send_message_with_mode(task, target, account)
             
             if success:
                 # 更新成功计数
@@ -2102,7 +2485,16 @@ class TaskManager:
         return available is not None
     
     async def check_and_stop_if_no_accounts(self, task_id):
-        """Check accounts and stop task if all unavailable - with detailed reason"""
+        """Check accounts and stop task if all unavailable - with detailed reason and 30s cache"""
+        # Check cache (30 seconds)
+        task_id_str = str(task_id)
+        if task_id_str in self._account_check_cache:
+            cached = self._account_check_cache[task_id_str]
+            cache_age = (datetime.utcnow() - cached['checked_at']).total_seconds()
+            if cache_age < Config.ACCOUNT_STATUS_CHECK_CACHE_DURATION:
+                logger.debug(f"Task {task_id}: Using cached account check result")
+                return cached['result']
+        
         if not await self.check_accounts_availability():
             logger.error(f"Task {task_id}: All accounts unavailable")
             
@@ -2165,7 +2557,19 @@ class TaskManager:
             # 生成报告
             await self._send_completion_reports(task_id)
             
+            # Cache result
+            self._account_check_cache[task_id_str] = {
+                'result': True,
+                'checked_at': datetime.utcnow()
+            }
+            
             return True
+        
+        # Cache result
+        self._account_check_cache[task_id_str] = {
+            'result': False,
+            'checked_at': datetime.utcnow()
+        }
         
         return False
     
@@ -2178,8 +2582,8 @@ class TaskManager:
         
         # Check retry limit
         retry_count = self.report_retry_count.get(task_id, 0)
-        if retry_count >= MAX_REPORT_RETRY_ATTEMPTS:
-            logger.error(f"任务 {task_id}: 达到最大重试次数 ({MAX_REPORT_RETRY_ATTEMPTS})，停止发送报告")
+        if retry_count >= Config.MAX_REPORT_RETRY_ATTEMPTS:
+            logger.error(f"任务 {task_id}: 达到最大重试次数 ({Config.MAX_REPORT_RETRY_ATTEMPTS})，停止发送报告")
             return
         
         self.report_sent.add(task_id)
@@ -2188,7 +2592,7 @@ class TaskManager:
             logger.info(f"========================================")
             logger.info(f"任务完成 - 开始生成报告")
             logger.info(f"任务ID: {task_id}")
-            logger.info(f"尝试次数: {retry_count + 1}/{MAX_REPORT_RETRY_ATTEMPTS}")
+            logger.info(f"尝试次数: {retry_count + 1}/{Config.MAX_REPORT_RETRY_ATTEMPTS}")
             logger.info(f"========================================")
             
             # Get task info for message count
@@ -2443,7 +2847,51 @@ class TaskManager:
             # Remove from report_sent and increment retry count
             self.report_sent.discard(task_id)
             self.report_retry_count[task_id] = retry_count + 1
-            logger.info(f"任务 {task_id}: 报告发送失败，将在下次尝试 (剩余重试: {MAX_REPORT_RETRY_ATTEMPTS - self.report_retry_count[task_id]})")
+            logger.info(f"任务 {task_id}: 报告发送失败，将在下次尝试 (剩余重试: {Config.Config.MAX_REPORT_RETRY_ATTEMPTS - self.report_retry_count[task_id]})")
+    
+    async def _send_with_voice_call(self, task, target, account):
+        """Send message with voice call"""
+        try:
+            client = await self.account_manager.get_client(str(account._id))
+            recipient = int(target.user_id) if target.user_id else target.username
+            
+            # Get entity
+            entity = await client.get_entity(recipient)
+            
+            # Make voice call
+            logger.info(f"VoiceCall: Initiating call to {recipient}")
+            try:
+                call = await client.call(entity, duration=task.voice_call_duration)
+                logger.info(f"VoiceCall: Call initiated successfully, waiting {task.voice_call_wait_after}s")
+                await asyncio.sleep(task.voice_call_wait_after)
+                
+                # Send message after call
+                return await self._send_message(task, target, account)
+                
+            except Exception as call_error:
+                logger.warning(f"VoiceCall: Failed to call {recipient}: {call_error}")
+                
+                # Send message anyway if configured
+                if task.voice_call_send_if_failed:
+                    logger.info(f"VoiceCall: Sending message despite call failure")
+                    return await self._send_message(task, target, account)
+                else:
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"VoiceCall: Error in voice call flow: {e}")
+            # Try to send message anyway
+            if task.voice_call_send_if_failed:
+                return await self._send_message(task, target, account)
+            return False
+    
+    async def _send_message_with_mode(self, task, target, account):
+        """Send message with appropriate mode (voice call, edit, reply, or normal)"""
+        # Check if voice call is enabled
+        if getattr(task, 'voice_call_enabled', False):
+            return await self._send_with_voice_call(task, target, account)
+        else:
+            return await self._send_message(task, target, account)
     
     async def _send_message(self, task, target, account):
         """发送消息 - 支持所有发送方式"""
@@ -2614,8 +3062,25 @@ class TaskManager:
                 )
             
             self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, error_msg)
-            await asyncio.sleep(e.seconds)
-            return False
+            
+            # Handle FloodWait based on strategy
+            strategy = getattr(task, 'flood_wait_strategy', 'switch_account')
+            
+            if strategy == FloodWaitStrategy.STOP_TASK.value:
+                logger.warning(f"FloodWait strategy: Stopping task")
+                # Mark task as stopped
+                self.tasks_col.update_one(
+                    {'_id': task._id},
+                    {'$set': {'status': TaskStatus.STOPPED.value, 'updated_at': datetime.utcnow()}}
+                )
+                return False
+            elif strategy == FloodWaitStrategy.CONTINUE_WAIT.value:
+                logger.info(f"FloodWait strategy: Waiting {e.seconds} seconds")
+                await asyncio.sleep(e.seconds)
+                return False
+            else:  # SWITCH_ACCOUNT (default)
+                logger.info(f"FloodWait strategy: Switching account")
+                return False
             
         except PeerFloodError:
             error_msg = "PeerFlood"
@@ -2647,6 +3112,18 @@ class TaskManager:
             
         except Exception as e:
             error_msg = str(e)
+            error_lower = error_msg.lower()
+            
+            # Check for dead account indicators
+            if task.auto_switch_dead_account:
+                dead_keywords = ['banned', 'deleted', 'deactivated', 'terminated']
+                if any(keyword in error_lower for keyword in dead_keywords):
+                    logger.error(f"Dead account detected for {account.phone}: {error_msg}")
+                    self.db[Account.COLLECTION_NAME].update_one(
+                        {'_id': account._id},
+                        {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
+                    )
+            
             self.targets_col.update_one(
                 {'_id': target._id},
                 {'$set': {'error_message': error_msg}}
@@ -2786,7 +3263,9 @@ class TaskManager:
  MESSAGE_INPUT, FORMAT_SELECT, SEND_METHOD_SELECT, MEDIA_SELECT, MEDIA_UPLOAD,
  TARGET_INPUT, TASK_NAME_INPUT, SESSION_UPLOAD, TDATA_UPLOAD, POSTBOT_CODE_INPUT,
  CHANNEL_LINK_INPUT, PREVIEW_CONFIG,
- CONFIG_THREAD_INPUT, CONFIG_INTERVAL_MIN_INPUT, CONFIG_BIDIRECT_INPUT) = range(18)
+ CONFIG_THREAD_INPUT, CONFIG_INTERVAL_MIN_INPUT, CONFIG_BIDIRECT_INPUT,
+ CONFIG_EDIT_MODE_INPUT, CONFIG_REPLY_MODE_INPUT, CONFIG_BATCH_PAUSE_INPUT,
+ CONFIG_VOICE_CALL_INPUT) = range(22)
 
 # Global managers
 account_manager = None
@@ -3500,9 +3979,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('cfg_toggle_'):
         # Handle toggle buttons for pin_message, delete_dialog, repeat_send
         parts = data.split('_')
-        toggle_type = parts[2]  # pin, delete, repeat
-        task_id = parts[3]
-        await toggle_task_config(query, task_id, toggle_type)
+        toggle_type = parts[2]  # pin, delete, repeat, dead
+        task_id = parts[3] if len(parts) > 3 else parts[-1]
+        
+        if toggle_type == 'dead':
+            # Special handling for dead account toggle (has 'account' in the middle)
+            await toggle_dead_account_switch(update, context)
+        else:
+            await toggle_task_config(query, task_id, toggle_type)
+    
+    # New configuration handlers
+    elif data.startswith('cfg_edit_mode_'):
+        await request_edit_mode_config(update, context)
+    elif data.startswith('set_mode_'):
+        await set_message_mode(update, context)
+    elif data.startswith('cfg_reply_mode_'):
+        await request_reply_mode_config(update, context)
+    elif data.startswith('cfg_batch_pause_'):
+        await request_batch_pause_config(update, context)
+    elif data.startswith('disable_batch_pause_'):
+        await disable_batch_pause(update, context)
+    elif data.startswith('cfg_flood_strategy_'):
+        await request_flood_strategy_config(update, context)
+    elif data.startswith('set_flood_'):
+        await set_flood_strategy(update, context)
+    elif data.startswith('cfg_voice_call_'):
+        await request_voice_call_config(update, context)
+    elif data.startswith('toggle_voice_'):
+        await toggle_voice_call(update, context)
+    elif data.startswith('cfg_thread_interval_'):
+        await request_thread_interval_config(update, context)
+    elif data.startswith('show_config_'):
+        task_id = data.split('_')[2]
+        await show_config_menu_handler(update, context, task_id)
+    
     elif data == 'noop':
         # No operation for info-only buttons
         await safe_answer_query(query)
@@ -4318,6 +4828,19 @@ async def show_task_config(query, task_id):
             InlineKeyboardButton(f"{'✔️' if task.delete_dialog else '❌'} 删除对话", callback_data=f'cfg_toggle_delete_{task_id}')
         ],
         [InlineKeyboardButton(f"{'✔️' if task.repeat_send else '❌'} 重复发送", callback_data=f'cfg_toggle_repeat_{task_id}')],
+        [
+            InlineKeyboardButton(f"✏️ 编辑模式", callback_data=f'cfg_edit_mode_{task_id}'),
+            InlineKeyboardButton(f"💬 回复模式", callback_data=f'cfg_reply_mode_{task_id}')
+        ],
+        [
+            InlineKeyboardButton(f"⏸️ 批次停顿", callback_data=f'cfg_batch_pause_{task_id}'),
+            InlineKeyboardButton(f"🌊 FloodWait策略", callback_data=f'cfg_flood_strategy_{task_id}')
+        ],
+        [
+            InlineKeyboardButton(f"📞 语音拨打", callback_data=f'cfg_voice_call_{task_id}'),
+            InlineKeyboardButton(f"⏲️ 线程启动间隔: {task.thread_start_interval}s", callback_data=f'cfg_thread_interval_{task_id}')
+        ],
+        [InlineKeyboardButton(f"{'✔️' if task.auto_switch_dead_account else '❌'} 死号自动换号", callback_data=f'cfg_toggle_dead_account_{task_id}')],
         [InlineKeyboardButton("✅ 配置完成", callback_data=f'task_detail_{task_id}')],
         [InlineKeyboardButton("🔙 返回", callback_data=f'task_detail_{task_id}')]
     ]
@@ -4519,7 +5042,7 @@ async def handle_postbot_code_input(update: Update, context: ContextTypes.DEFAUL
     
     # Validate postbot code format (must be like 693af80c53cb2)
     # Pattern: alphanumeric characters, minimum length defined by constant
-    if not re.match(rf'^[a-zA-Z0-9]{{{POSTBOT_CODE_MIN_LENGTH},}}$', code):
+    if not re.match(rf'^[a-zA-Z0-9]{{{Config.POSTBOT_CODE_MIN_LENGTH},}}$', code):
         await update.message.reply_text(
             "❌ <b>代码格式错误</b>\n\n"
             "Post代码格式应该类似：<code>693af80c53cb2</code>\n\n"
@@ -4749,7 +5272,7 @@ async def handle_thread_config(update: Update, context: ContextTypes.DEFAULT_TYP
         
         msg = await update.message.reply_text(f"✅ 线程数已设置为：{thread_count}")
         # Auto-delete after configured delay
-        await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)
+        await asyncio.sleep(Config.CONFIG_MESSAGE_DELETE_DELAY)
         try:
             # Delete confirmation message
             await msg.delete()
@@ -4800,7 +5323,7 @@ async def handle_interval_config(update: Update, context: ContextTypes.DEFAULT_T
         
         msg = await update.message.reply_text(f"✅ 发送间隔已设置为：{min_interval}-{max_interval} 秒")
         # Auto-delete after configured delay
-        await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)
+        await asyncio.sleep(Config.CONFIG_MESSAGE_DELETE_DELAY)
         try:
             # Delete confirmation message
             await msg.delete()
@@ -4840,7 +5363,7 @@ async def handle_bidirect_config(update: Update, context: ContextTypes.DEFAULT_T
         
         msg = await update.message.reply_text(f"✅ 无视双向次数已设置为：{limit}")
         # Auto-delete after configured delay
-        await asyncio.sleep(CONFIG_MESSAGE_DELETE_DELAY)
+        await asyncio.sleep(Config.CONFIG_MESSAGE_DELETE_DELAY)
         try:
             # Delete confirmation message
             await msg.delete()
@@ -4862,6 +5385,333 @@ async def handle_bidirect_config(update: Update, context: ContextTypes.DEFAULT_T
     except ValueError:
         await update.message.reply_text("❌ 请输入有效的数字：")
         return CONFIG_BIDIRECT_INPUT
+
+
+# ============================================================================
+# 新配置功能的回调处理器
+# ============================================================================
+
+async def request_edit_mode_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request edit mode configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    context.user_data['config_task_id'] = task_id
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    current_mode = getattr(task, 'message_mode', 'normal')
+    edit_delay_min = getattr(task, 'edit_delay_min', 5)
+    edit_delay_max = getattr(task, 'edit_delay_max', 15)
+    
+    keyboard = [
+        [InlineKeyboardButton("📤 普通模式", callback_data=f'set_mode_normal_{task_id}')],
+        [InlineKeyboardButton("✏️ 编辑模式", callback_data=f'set_mode_edit_{task_id}')],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'show_config_{task_id}')]
+    ]
+    
+    text = (
+        f"✏️ <b>编辑模式配置</b>\n\n"
+        f"当前模式: <b>{current_mode}</b>\n"
+        f"编辑延迟: {edit_delay_min}-{edit_delay_max}秒\n\n"
+        f"💡 编辑模式：先发送初始消息，延迟后编辑成目标内容\n"
+        f"⚠️ 可用于绕过某些风控机制\n\n"
+        f"请选择消息发送模式："
+    )
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def set_message_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set message mode"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    
+    parts = query.data.split('_')
+    mode = parts[2]  # normal or edit
+    task_id = parts[3]
+    
+    db[Task.COLLECTION_NAME].update_one(
+        {'_id': ObjectId(task_id)},
+        {'$set': {'message_mode': mode, 'updated_at': datetime.utcnow()}}
+    )
+    
+    await safe_answer_query(query, f"✅ 已设置为{mode}模式")
+    
+    # Redirect back to config menu
+    return await show_config_menu_handler(update, context, task_id)
+
+
+async def request_reply_mode_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request reply mode configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    reply_timeout = getattr(task, 'reply_timeout', 300)
+    reply_keywords = getattr(task, 'reply_keywords', {})
+    
+    text = (
+        f"💬 <b>回复模式配置</b>\n\n"
+        f"监听超时: {reply_timeout}秒\n"
+        f"关键词数量: {len(reply_keywords)}\n\n"
+        f"💡 回复模式：自动监听用户回复并根据关键词响应\n\n"
+        f"⚠️ 此功能暂未完全实现，敬请期待！"
+    )
+    
+    keyboard = [[InlineKeyboardButton("🔙 返回", callback_data=f'show_config_{task_id}')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def request_batch_pause_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request batch pause configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    context.user_data['config_task_id'] = task_id
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    batch_pause_count = getattr(task, 'batch_pause_count', 0)
+    batch_pause_min = getattr(task, 'batch_pause_min', 0)
+    batch_pause_max = getattr(task, 'batch_pause_max', 5)
+    
+    keyboard = [
+        [InlineKeyboardButton(f"📊 每{batch_pause_count}条停顿", callback_data=f'set_batch_count_{task_id}')],
+        [InlineKeyboardButton(f"⏱️ 停顿{batch_pause_min}-{batch_pause_max}秒", callback_data=f'set_batch_delay_{task_id}')],
+        [InlineKeyboardButton("❌ 禁用批次停顿", callback_data=f'disable_batch_pause_{task_id}')],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'show_config_{task_id}')]
+    ]
+    
+    text = (
+        f"⏸️ <b>批次停顿配置</b>\n\n"
+        f"当前设置:\n"
+        f"• 每 <b>{batch_pause_count}</b> 条消息停顿\n"
+        f"• 停顿 <b>{batch_pause_min}-{batch_pause_max}</b> 秒\n\n"
+        f"💡 防封策略：定期停顿可降低被检测风险\n"
+        f"⚠️ 设置为0表示禁用批次停顿\n\n"
+        f"请选择要配置的选项："
+    )
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def disable_batch_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Disable batch pause"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    
+    db[Task.COLLECTION_NAME].update_one(
+        {'_id': ObjectId(task_id)},
+        {'$set': {'batch_pause_count': 0, 'updated_at': datetime.utcnow()}}
+    )
+    
+    await safe_answer_query(query, "✅ 已禁用批次停顿")
+    return await show_config_menu_handler(update, context, task_id)
+
+
+async def request_flood_strategy_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request FloodWait strategy configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    current_strategy = getattr(task, 'flood_wait_strategy', 'switch_account')
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 切换账号 (推荐)", callback_data=f'set_flood_switch_{task_id}')],
+        [InlineKeyboardButton("⏳ 继续等待", callback_data=f'set_flood_wait_{task_id}')],
+        [InlineKeyboardButton("⛔ 停止任务", callback_data=f'set_flood_stop_{task_id}')],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'show_config_{task_id}')]
+    ]
+    
+    text = (
+        f"🌊 <b>FloodWait策略配置</b>\n\n"
+        f"当前策略: <b>{current_strategy}</b>\n\n"
+        f"💡 当遇到FloodWait错误时的处理方式：\n\n"
+        f"🔄 <b>切换账号</b>: 立即切换到下一个账号继续\n"
+        f"⏳ <b>继续等待</b>: 等待指定时间后继续使用当前账号\n"
+        f"⛔ <b>停止任务</b>: 遇到FloodWait时停止整个任务\n\n"
+        f"请选择FloodWait处理策略："
+    )
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def set_flood_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set FloodWait strategy"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    
+    parts = query.data.split('_')
+    strategy_type = parts[2]  # switch, wait, or stop
+    task_id = parts[3]
+    
+    strategy_map = {
+        'switch': 'switch_account',
+        'wait': 'continue_wait',
+        'stop': 'stop_task'
+    }
+    
+    strategy = strategy_map.get(strategy_type, 'switch_account')
+    
+    db[Task.COLLECTION_NAME].update_one(
+        {'_id': ObjectId(task_id)},
+        {'$set': {'flood_wait_strategy': strategy, 'updated_at': datetime.utcnow()}}
+    )
+    
+    await safe_answer_query(query, f"✅ FloodWait策略已设置")
+    return await show_config_menu_handler(update, context, task_id)
+
+
+async def request_voice_call_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request voice call configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    voice_enabled = getattr(task, 'voice_call_enabled', False)
+    voice_duration = getattr(task, 'voice_call_duration', 10)
+    voice_wait = getattr(task, 'voice_call_wait_after', 3)
+    
+    keyboard = [
+        [InlineKeyboardButton(f"{'✔️' if voice_enabled else '❌'} 启用语音拨打", callback_data=f'toggle_voice_{task_id}')],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'show_config_{task_id}')]
+    ]
+    
+    text = (
+        f"📞 <b>语音拨打配置</b>\n\n"
+        f"状态: <b>{'已启用' if voice_enabled else '已禁用'}</b>\n"
+        f"拨打时长: {voice_duration}秒\n"
+        f"拨打后等待: {voice_wait}秒\n\n"
+        f"💡 发送消息前先拨打语音电话\n"
+        f"⚠️ 可能增加互动率，但也可能被视为骚扰\n\n"
+        f"请选择操作："
+    )
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def toggle_voice_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle voice call enabled"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[2]
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    new_value = not getattr(task, 'voice_call_enabled', False)
+    
+    db[Task.COLLECTION_NAME].update_one(
+        {'_id': ObjectId(task_id)},
+        {'$set': {'voice_call_enabled': new_value, 'updated_at': datetime.utcnow()}}
+    )
+    
+    await safe_answer_query(query, f"✅ 语音拨打已{'启用' if new_value else '禁用'}")
+    return await request_voice_call_config(update, context)
+
+
+async def toggle_dead_account_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle auto switch dead account"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[4]
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    new_value = not getattr(task, 'auto_switch_dead_account', True)
+    
+    db[Task.COLLECTION_NAME].update_one(
+        {'_id': ObjectId(task_id)},
+        {'$set': {'auto_switch_dead_account': new_value, 'updated_at': datetime.utcnow()}}
+    )
+    
+    await safe_answer_query(query, f"✅ 死号自动换号已{'启用' if new_value else '禁用'}")
+    return await show_config_menu_handler(update, context, task_id)
+
+
+async def request_thread_interval_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request thread start interval configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    context.user_data['config_task_id'] = task_id
+    
+    prompt_msg = await query.message.reply_text(
+        "⏲️ <b>配置线程启动间隔</b>\n\n"
+        "请输入线程启动间隔（秒）：\n\n"
+        "💡 建议：0-5秒\n"
+        "⚠️ 间隔可以避免瞬间并发过高",
+        parse_mode='HTML'
+    )
+    context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
+    return CONFIG_EDIT_MODE_INPUT  # Reuse existing state
+
+
+async def show_config_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id=None):
+    """Helper to show config menu"""
+    if task_id is None:
+        query = update.callback_query
+        task_id = query.data.split('_')[2]
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    query = update.callback_query
+    text = (
+        f"⚙️ <b>配置 - {task.name}</b>\n\n"
+        f"当前配置如下，点击按钮进行调整："
+    )
+    
+    keyboard = [
+        [
+            InlineKeyboardButton(f"🧵 线程数: {task.thread_count}", callback_data=f'cfg_thread_{task_id}'),
+            InlineKeyboardButton(f"⏱️ 间隔: {task.min_interval}-{task.max_interval}s", callback_data=f'cfg_interval_{task_id}')
+        ],
+        [InlineKeyboardButton(f"🔄 无视双向: {task.ignore_bidirectional_limit}次", callback_data=f'cfg_bidirect_{task_id}')],
+        [
+            InlineKeyboardButton(f"{'✔️' if task.pin_message else '❌'} 置顶消息", callback_data=f'cfg_toggle_pin_{task_id}'),
+            InlineKeyboardButton(f"{'✔️' if task.delete_dialog else '❌'} 删除对话", callback_data=f'cfg_toggle_delete_{task_id}')
+        ],
+        [InlineKeyboardButton(f"{'✔️' if task.repeat_send else '❌'} 重复发送", callback_data=f'cfg_toggle_repeat_{task_id}')],
+        [
+            InlineKeyboardButton(f"✏️ 编辑模式", callback_data=f'cfg_edit_mode_{task_id}'),
+            InlineKeyboardButton(f"💬 回复模式", callback_data=f'cfg_reply_mode_{task_id}')
+        ],
+        [
+            InlineKeyboardButton(f"⏸️ 批次停顿", callback_data=f'cfg_batch_pause_{task_id}'),
+            InlineKeyboardButton(f"🌊 FloodWait策略", callback_data=f'cfg_flood_strategy_{task_id}')
+        ],
+        [
+            InlineKeyboardButton(f"📞 语音拨打", callback_data=f'cfg_voice_call_{task_id}'),
+            InlineKeyboardButton(f"⏲️ 线程启动间隔: {task.thread_start_interval}s", callback_data=f'cfg_thread_interval_{task_id}')
+        ],
+        [InlineKeyboardButton(f"{'✔️' if task.auto_switch_dead_account else '❌'} 死号自动换号", callback_data=f'cfg_toggle_dead_account_{task_id}')],
+        [InlineKeyboardButton("✅ 配置完成", callback_data=f'task_detail_{task_id}')],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'task_detail_{task_id}')]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
 
 
 async def start_task_handler(query, task_id, context):
@@ -5081,34 +5931,34 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                 error_count += 1
                 if "message is not modified" not in str(e).lower():
                     logger.error(f"Failed to update progress: {e}")
-                    if error_count >= MAX_AUTO_REFRESH_ERRORS:
+                    if error_count >= Config.MAX_AUTO_REFRESH_ERRORS:
                         break
             
             # 智能刷新间隔：前1分钟每10秒，后面30-50秒
             elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
-            if elapsed < AUTO_REFRESH_FAST_DURATION:
+            if elapsed < Config.AUTO_REFRESH_FAST_DURATION:
                 # 前1分钟使用快速间隔
-                interval = AUTO_REFRESH_FAST_INTERVAL
+                interval = Config.AUTO_REFRESH_FAST_INTERVAL
                 logger.debug(f"Auto-refresh: fast interval ({interval}s)")
             else:
                 # 1分钟后使用随机间隔
-                interval = random.randint(AUTO_REFRESH_MIN_INTERVAL, AUTO_REFRESH_MAX_INTERVAL)
+                interval = random.randint(Config.AUTO_REFRESH_MIN_INTERVAL, Config.AUTO_REFRESH_MAX_INTERVAL)
                 logger.debug(f"Auto-refresh: normal interval ({interval}s)")
             
             await asyncio.sleep(interval)
             
         except Exception as e:
             error_count += 1
-            logger.error(f"Error in auto refresh (count: {error_count}/{MAX_AUTO_REFRESH_ERRORS}): {e}")
+            logger.error(f"Error in auto refresh (count: {error_count}/{Config.MAX_AUTO_REFRESH_ERRORS}): {e}")
             
             # Stop after max errors to prevent infinite error loops
-            if error_count >= MAX_AUTO_REFRESH_ERRORS:
-                logger.error(f"Auto-refresh stopped after {MAX_AUTO_REFRESH_ERRORS} consecutive errors")
+            if error_count >= Config.MAX_AUTO_REFRESH_ERRORS:
+                logger.error(f"Auto-refresh stopped after {Config.MAX_AUTO_REFRESH_ERRORS} consecutive errors")
                 break
             
             # Use fast interval for error case during first minute, normal otherwise
             elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
-            interval = AUTO_REFRESH_FAST_INTERVAL if elapsed < AUTO_REFRESH_FAST_DURATION else random.randint(AUTO_REFRESH_MIN_INTERVAL, AUTO_REFRESH_MAX_INTERVAL)
+            interval = Config.AUTO_REFRESH_FAST_INTERVAL if elapsed < Config.AUTO_REFRESH_FAST_DURATION else random.randint(Config.AUTO_REFRESH_MIN_INTERVAL, Config.AUTO_REFRESH_MAX_INTERVAL)
             await asyncio.sleep(interval)
 
 
