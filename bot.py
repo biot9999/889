@@ -242,6 +242,31 @@ MEDIA_TYPE_LABELS = {
     MediaType.FORWARD: '📡 转发'
 }
 
+# FloodWait strategy mappings
+FLOOD_STRATEGY_FULL_TO_SHORT = {
+    'switch_account': 'switch',
+    'continue_wait': 'wait',
+    'stop_task': 'stop'
+}
+
+FLOOD_STRATEGY_SHORT_TO_FULL = {
+    'switch': 'switch_account',
+    'wait': 'continue_wait',
+    'stop': 'stop_task'
+}
+
+FLOOD_STRATEGY_DISPLAY = {
+    'switch_account': '🔄 切换账号',
+    'continue_wait': '⏳ 继续等待',
+    'stop_task': '⛔ 停止任务'
+}
+
+FLOOD_STRATEGY_DISPLAY_SHORT = {
+    'switch': '切换账号',
+    'wait': '继续等待',
+    'stop': '停止任务'
+}
+
 
 # ============================================================================
 # 辅助函数
@@ -3995,18 +4020,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"User {user_id} configuring task {task_id}")
         await show_task_config(query, task_id)
     elif data.startswith('cfg_toggle_'):
-        # Handle toggle buttons for pin_message, delete_dialog, repeat_send, dead, force
+        # Handle toggle buttons: pin, delete, repeat (generic), dead, force (special handlers)
         parts = data.split('_')
         toggle_type = parts[2]  # pin, delete, repeat, dead, force
         task_id = parts[3] if len(parts) > 3 else parts[-1]
         
         if toggle_type == 'dead':
-            # Special handling for dead account toggle (has 'account' in the middle)
+            # Special handling: dead account toggle has 'account' in callback data (cfg_toggle_dead_account_)
             await toggle_dead_account_switch(update, context)
         elif toggle_type == 'force':
-            # Special handling for force private mode toggle
+            # Special handling: force private mode toggle has 'private' in callback data (cfg_toggle_force_private_)
             await toggle_force_private_mode(update, context)
         else:
+            # Generic handling for pin, delete, repeat
             await toggle_task_config(query, task_id, toggle_type)
     
     # New configuration handlers
@@ -5471,6 +5497,9 @@ async def set_message_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = parts[2]  # normal or edit
     task_id = parts[3]
     
+    # Map mode to display name
+    mode_display = "普通" if mode == "normal" else "编辑"
+    
     result = db[Task.COLLECTION_NAME].update_one(
         {'_id': ObjectId(task_id)},
         {'$set': {'message_mode': mode, 'updated_at': datetime.utcnow()}}
@@ -5478,10 +5507,8 @@ async def set_message_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if result.modified_count > 0:
         logger.info(f"Task {task_id}: Message mode updated to {mode}")
-        mode_display = "普通" if mode == "normal" else "编辑"
         await safe_answer_query(query, f"✅ 已设置为{mode_display}模式")
     else:
-        mode_display = "普通" if mode == "normal" else "编辑"
         await safe_answer_query(query, f"✅ 已设置为{mode_display}模式（值未变更）")
     
     # Redirect back to config menu
@@ -5722,13 +5749,6 @@ async def request_flood_strategy_config(update: Update, context: ContextTypes.DE
     
     current_strategy = getattr(task, 'flood_wait_strategy', 'switch_account')
     
-    # Map strategy to display name
-    strategy_display = {
-        'switch_account': '🔄 切换账号',
-        'continue_wait': '⏳ 继续等待',
-        'stop_task': '⛔ 停止任务'
-    }
-    
     keyboard = [
         [InlineKeyboardButton("🔄 切换账号 (推荐)", callback_data=f'set_flood_switch_{task_id}')],
         [InlineKeyboardButton("⏳ 继续等待", callback_data=f'set_flood_wait_{task_id}')],
@@ -5738,7 +5758,7 @@ async def request_flood_strategy_config(update: Update, context: ContextTypes.DE
     
     text = (
         f"🌊 <b>FloodWait策略配置</b>\n\n"
-        f"当前策略: <b>{strategy_display.get(current_strategy, current_strategy)}</b>\n\n"
+        f"当前策略: <b>{FLOOD_STRATEGY_DISPLAY.get(current_strategy, current_strategy)}</b>\n\n"
         f"💡 <b>什么是FloodWait？</b>\n"
         f"当Telegram检测到账号发送消息过于频繁时，会返回FloodWait错误，要求等待一段时间。\n\n"
         f"<b>策略说明：</b>\n\n"
@@ -5770,19 +5790,7 @@ async def set_flood_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE)
     strategy_type = parts[2]  # switch, wait, or stop
     task_id = parts[3]
     
-    strategy_map = {
-        'switch': 'switch_account',
-        'wait': 'continue_wait',
-        'stop': 'stop_task'
-    }
-    
-    strategy_display = {
-        'switch': '切换账号',
-        'wait': '继续等待',
-        'stop': '停止任务'
-    }
-    
-    strategy = strategy_map.get(strategy_type, 'switch_account')
+    strategy = FLOOD_STRATEGY_SHORT_TO_FULL.get(strategy_type, 'switch_account')
     
     result = db[Task.COLLECTION_NAME].update_one(
         {'_id': ObjectId(task_id)},
@@ -5791,9 +5799,9 @@ async def set_flood_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     if result.modified_count > 0:
         logger.info(f"Task {task_id}: FloodWait strategy updated to {strategy}")
-        await safe_answer_query(query, f"✅ FloodWait策略已设置为：{strategy_display.get(strategy_type, strategy)}")
+        await safe_answer_query(query, f"✅ FloodWait策略已设置为：{FLOOD_STRATEGY_DISPLAY_SHORT.get(strategy_type, strategy)}")
     else:
-        await safe_answer_query(query, f"✅ FloodWait策略已设置为：{strategy_display.get(strategy_type, strategy)}（值未变更）")
+        await safe_answer_query(query, f"✅ FloodWait策略已设置为：{FLOOD_STRATEGY_DISPLAY_SHORT.get(strategy_type, strategy)}（值未变更）")
     
     return await show_config_menu_handler(update, context, task_id)
 
@@ -5924,17 +5932,22 @@ async def toggle_dead_account_switch(update: Update, context: ContextTypes.DEFAU
     """Toggle auto switch dead account"""
     query = update.callback_query
     await safe_answer_query(query)
-    task_id = query.data.split('_')[4]
+    # Callback data format: cfg_toggle_dead_account_{task_id}
+    # Extract task_id from the last part
+    task_id = query.data.split('_')[-1]
     
     task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
     task = Task.from_dict(task_doc)
     
     new_value = not getattr(task, 'auto_switch_dead_account', True)
     
-    db[Task.COLLECTION_NAME].update_one(
+    result = db[Task.COLLECTION_NAME].update_one(
         {'_id': ObjectId(task_id)},
         {'$set': {'auto_switch_dead_account': new_value, 'updated_at': datetime.utcnow()}}
     )
+    
+    if result.modified_count > 0:
+        logger.info(f"Task {task_id}: Auto switch dead account {'enabled' if new_value else 'disabled'}")
     
     await safe_answer_query(query, f"✅ 死号自动换号已{'启用' if new_value else '禁用'}")
     return await show_config_menu_handler(update, context, task_id)
@@ -6117,7 +6130,9 @@ async def toggle_force_private_mode(update: Update, context: ContextTypes.DEFAUL
     """Toggle force private mode"""
     query = update.callback_query
     await safe_answer_query(query)
-    task_id = query.data.split('_')[4]
+    # Callback data format: cfg_toggle_force_private_{task_id}
+    # Extract task_id from the last part
+    task_id = query.data.split('_')[-1]
     
     task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
     task = Task.from_dict(task_doc)
