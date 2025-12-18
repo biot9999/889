@@ -125,7 +125,7 @@ class Config:
     Config.CONSECUTIVE_FAILURES_THRESHOLD = 50
     Config.STOP_CONFIRMATION_ITERATIONS = 50
     Config.STOP_CONFIRMATION_SLEEP = 0.1
-    MAX_REPORT_RETRY_ATTEMPTS = 3
+    Config.MAX_REPORT_RETRY_ATTEMPTS = 3
     Config.ACCOUNT_STATUS_CACHE_DURATION = 300
     ACCOUNT_STATUS_CHECK_CACHE_DURATION = 30
     
@@ -2582,8 +2582,8 @@ class TaskManager:
         
         # Check retry limit
         retry_count = self.report_retry_count.get(task_id, 0)
-        if retry_count >= MAX_REPORT_RETRY_ATTEMPTS:
-            logger.error(f"任务 {task_id}: 达到最大重试次数 ({MAX_REPORT_RETRY_ATTEMPTS})，停止发送报告")
+        if retry_count >= Config.MAX_REPORT_RETRY_ATTEMPTS:
+            logger.error(f"任务 {task_id}: 达到最大重试次数 ({Config.MAX_REPORT_RETRY_ATTEMPTS})，停止发送报告")
             return
         
         self.report_sent.add(task_id)
@@ -2592,7 +2592,7 @@ class TaskManager:
             logger.info(f"========================================")
             logger.info(f"任务完成 - 开始生成报告")
             logger.info(f"任务ID: {task_id}")
-            logger.info(f"尝试次数: {retry_count + 1}/{MAX_REPORT_RETRY_ATTEMPTS}")
+            logger.info(f"尝试次数: {retry_count + 1}/{Config.MAX_REPORT_RETRY_ATTEMPTS}")
             logger.info(f"========================================")
             
             # Get task info for message count
@@ -2847,7 +2847,7 @@ class TaskManager:
             # Remove from report_sent and increment retry count
             self.report_sent.discard(task_id)
             self.report_retry_count[task_id] = retry_count + 1
-            logger.info(f"任务 {task_id}: 报告发送失败，将在下次尝试 (剩余重试: {Config.MAX_REPORT_RETRY_ATTEMPTS - self.report_retry_count[task_id]})")
+            logger.info(f"任务 {task_id}: 报告发送失败，将在下次尝试 (剩余重试: {Config.Config.MAX_REPORT_RETRY_ATTEMPTS - self.report_retry_count[task_id]})")
     
     async def _send_with_voice_call(self, task, target, account):
         """Send message with voice call"""
