@@ -507,7 +507,9 @@ class Task:
                  voice_call_enabled=False, voice_call_duration=10, 
                  voice_call_wait_after=3, voice_call_send_if_failed=True,
                  # Other new fields
-                 thread_start_interval=1, auto_switch_dead_account=True):
+                 thread_start_interval=1, auto_switch_dead_account=True,
+                 # New fields for retry and limits
+                 daily_limit=50, retry_count=3, retry_interval=60, force_private_mode=False):
         self._id = _id
         self.name = name
         self.status = status or TaskStatus.PENDING.value
@@ -557,6 +559,11 @@ class Task:
         # Other fields
         self.thread_start_interval = thread_start_interval
         self.auto_switch_dead_account = auto_switch_dead_account
+        # Retry and limit fields
+        self.daily_limit = daily_limit
+        self.retry_count = retry_count
+        self.retry_interval = retry_interval
+        self.force_private_mode = force_private_mode
     
     def to_dict(self):
         """Convert to dictionary for MongoDB"""
@@ -607,7 +614,12 @@ class Task:
             'voice_call_send_if_failed': self.voice_call_send_if_failed,
             # Other fields
             'thread_start_interval': self.thread_start_interval,
-            'auto_switch_dead_account': self.auto_switch_dead_account
+            'auto_switch_dead_account': self.auto_switch_dead_account,
+            # Retry and limit fields
+            'daily_limit': self.daily_limit,
+            'retry_count': self.retry_count,
+            'retry_interval': self.retry_interval,
+            'force_private_mode': self.force_private_mode
         }
         if self._id:
             doc['_id'] = self._id
@@ -666,7 +678,12 @@ class Task:
             voice_call_send_if_failed=doc.get('voice_call_send_if_failed', True),
             # Other fields
             thread_start_interval=doc.get('thread_start_interval', 1),
-            auto_switch_dead_account=doc.get('auto_switch_dead_account', True)
+            auto_switch_dead_account=doc.get('auto_switch_dead_account', True),
+            # Retry and limit fields
+            daily_limit=doc.get('daily_limit', 50),
+            retry_count=doc.get('retry_count', 3),
+            retry_interval=doc.get('retry_interval', 60),
+            force_private_mode=doc.get('force_private_mode', False)
         )
 
 
@@ -3265,7 +3282,8 @@ class TaskManager:
  CHANNEL_LINK_INPUT, PREVIEW_CONFIG,
  CONFIG_THREAD_INPUT, CONFIG_INTERVAL_MIN_INPUT, CONFIG_BIDIRECT_INPUT,
  CONFIG_EDIT_MODE_INPUT, CONFIG_REPLY_MODE_INPUT, CONFIG_BATCH_PAUSE_INPUT,
- CONFIG_VOICE_CALL_INPUT) = range(22)
+ CONFIG_VOICE_CALL_INPUT, CONFIG_DAILY_LIMIT_INPUT, CONFIG_RETRY_INPUT,
+ CONFIG_THREAD_INTERVAL_INPUT) = range(25)
 
 # Global managers
 account_manager = None
@@ -3977,14 +3995,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"User {user_id} configuring task {task_id}")
         await show_task_config(query, task_id)
     elif data.startswith('cfg_toggle_'):
-        # Handle toggle buttons for pin_message, delete_dialog, repeat_send
+        # Handle toggle buttons for pin_message, delete_dialog, repeat_send, dead, force
         parts = data.split('_')
-        toggle_type = parts[2]  # pin, delete, repeat, dead
+        toggle_type = parts[2]  # pin, delete, repeat, dead, force
         task_id = parts[3] if len(parts) > 3 else parts[-1]
         
         if toggle_type == 'dead':
             # Special handling for dead account toggle (has 'account' in the middle)
             await toggle_dead_account_switch(update, context)
+        elif toggle_type == 'force':
+            # Special handling for force private mode toggle
+            await toggle_force_private_mode(update, context)
         else:
             await toggle_task_config(query, task_id, toggle_type)
     
@@ -4005,6 +4026,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await set_flood_strategy(update, context)
     elif data.startswith('cfg_voice_call_'):
         await request_voice_call_config(update, context)
+    elif data.startswith('set_voice_'):
+        await set_voice_call_mode(update, context)
     elif data.startswith('toggle_voice_'):
         await toggle_voice_call(update, context)
     elif data.startswith('cfg_thread_interval_'):
@@ -4766,9 +4789,17 @@ async def show_task_detail(query, task_id):
             f"🧵 多账号线程数: {task.thread_count}\n"
             f"⏱️ 发送间隔: {task.min_interval}-{task.max_interval}秒\n"
             f"🔄 无视双向次数: {task.ignore_bidirectional_limit}\n"
+            f"📊 单账号日限: {task.daily_limit}条\n"
+            f"🔄 重试次数: {task.retry_count}次 (间隔{task.retry_interval}秒)\n"
             f"📌 置顶消息: {'✔️' if task.pin_message else '❌'}\n"
             f"🗑️ 删除对话框: {'✔️' if task.delete_dialog else '❌'}\n"
             f"🔁 重复发送: {'✔️' if task.repeat_send else '❌'}\n"
+            f"✏️ 消息模式: {task.message_mode}\n"
+            f"🌊 FloodWait策略: {task.flood_wait_strategy}\n"
+            f"📞 语音拨打: {'✔️' if task.voice_call_enabled else '❌'}\n"
+            f"⏲️ 线程启动间隔: {task.thread_start_interval}秒\n"
+            f"🔄 死号自动换号: {'✔️' if task.auto_switch_dead_account else '❌'}\n"
+            f"💬 强制私信模式: {'✔️' if task.force_private_mode else '❌'}\n"
         )
         
         if task.started_at:
@@ -4840,7 +4871,14 @@ async def show_task_config(query, task_id):
             InlineKeyboardButton(f"📞 语音拨打", callback_data=f'cfg_voice_call_{task_id}'),
             InlineKeyboardButton(f"⏲️ 线程启动间隔: {task.thread_start_interval}s", callback_data=f'cfg_thread_interval_{task_id}')
         ],
-        [InlineKeyboardButton(f"{'✔️' if task.auto_switch_dead_account else '❌'} 死号自动换号", callback_data=f'cfg_toggle_dead_account_{task_id}')],
+        [
+            InlineKeyboardButton(f"📊 单账号日限: {task.daily_limit}条", callback_data=f'cfg_daily_limit_{task_id}'),
+            InlineKeyboardButton(f"🔄 重试: {task.retry_count}次", callback_data=f'cfg_retry_{task_id}')
+        ],
+        [
+            InlineKeyboardButton(f"{'✔️' if task.auto_switch_dead_account else '❌'} 死号自动换号", callback_data=f'cfg_toggle_dead_account_{task_id}'),
+            InlineKeyboardButton(f"{'✔️' if task.force_private_mode else '❌'} 强制私信模式", callback_data=f'cfg_toggle_force_private_{task_id}')
+        ],
         [InlineKeyboardButton("✅ 配置完成", callback_data=f'task_detail_{task_id}')],
         [InlineKeyboardButton("🔙 返回", callback_data=f'task_detail_{task_id}')]
     ]
@@ -5433,12 +5471,18 @@ async def set_message_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = parts[2]  # normal or edit
     task_id = parts[3]
     
-    db[Task.COLLECTION_NAME].update_one(
+    result = db[Task.COLLECTION_NAME].update_one(
         {'_id': ObjectId(task_id)},
         {'$set': {'message_mode': mode, 'updated_at': datetime.utcnow()}}
     )
     
-    await safe_answer_query(query, f"✅ 已设置为{mode}模式")
+    if result.modified_count > 0:
+        logger.info(f"Task {task_id}: Message mode updated to {mode}")
+        mode_display = "普通" if mode == "normal" else "编辑"
+        await safe_answer_query(query, f"✅ 已设置为{mode_display}模式")
+    else:
+        mode_display = "普通" if mode == "normal" else "编辑"
+        await safe_answer_query(query, f"✅ 已设置为{mode_display}模式（值未变更）")
     
     # Redirect back to config menu
     return await show_config_menu_handler(update, context, task_id)
@@ -5449,24 +5493,172 @@ async def request_reply_mode_config(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     await safe_answer_query(query)
     task_id = query.data.split('_')[3]
+    context.user_data['config_task_id'] = task_id
     
     task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
     task = Task.from_dict(task_doc)
     
     reply_timeout = getattr(task, 'reply_timeout', 300)
     reply_keywords = getattr(task, 'reply_keywords', {})
+    reply_default = getattr(task, 'reply_default', '')
     
-    text = (
+    # Format existing keywords for display
+    keywords_display = "\n".join([f"  • {k} → {v}" for k, v in reply_keywords.items()]) if reply_keywords else "  （无）"
+    
+    prompt_msg = await query.message.reply_text(
         f"💬 <b>回复模式配置</b>\n\n"
-        f"监听超时: {reply_timeout}秒\n"
-        f"关键词数量: {len(reply_keywords)}\n\n"
-        f"💡 回复模式：自动监听用户回复并根据关键词响应\n\n"
-        f"⚠️ 此功能暂未完全实现，敬请期待！"
+        f"当前设置:\n"
+        f"• 监听超时: {reply_timeout}秒\n"
+        f"• 关键词数量: {len(reply_keywords)}个\n"
+        f"• 默认回复: {reply_default or '（无）'}\n\n"
+        f"<b>已配置的关键词:</b>\n{keywords_display}\n\n"
+        f"💡 <b>配置格式:</b>\n"
+        f"关键词1=回复内容1;关键词2=回复内容2;...\n\n"
+        f"💡 <b>示例:</b>\n"
+        f"你好=你好啊！;价格=请联系我们;帮助=请问有什么可以帮到您?\n\n"
+        f"💡 <b>默认回复:</b> 如果用户回复不匹配任何关键词，发送默认回复\n"
+        f"输入格式: default=默认回复内容\n\n"
+        f"⚠️ 发送 'clear' 可清空所有配置\n"
+        f"⚠️ 直接发送 '返回' 取消配置",
+        parse_mode='HTML'
     )
+    context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
+    return CONFIG_REPLY_MODE_INPUT
+
+
+async def handle_reply_mode_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle reply mode configuration input"""
+    task_id = context.user_data.get('config_task_id')
+    if not task_id:
+        await update.message.reply_text("❌ 配置会话已过期，请重新开始")
+        return ConversationHandler.END
     
-    keyboard = [[InlineKeyboardButton("🔙 返回", callback_data=f'show_config_{task_id}')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    user_input = update.message.text.strip()
+    
+    # Handle cancel
+    if user_input == '返回':
+        await update.message.reply_text("❌ 已取消配置")
+        return ConversationHandler.END
+    
+    # Handle clear
+    if user_input.lower() == 'clear':
+        result = db[Task.COLLECTION_NAME].update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {
+                'reply_keywords': {},
+                'reply_default': '',
+                'updated_at': datetime.utcnow()
+            }}
+        )
+        
+        if result.modified_count > 0:
+            logger.info(f"Task {task_id}: Reply mode config cleared")
+        
+        msg = await update.message.reply_text("✅ 回复模式配置已清空")
+        
+        # Auto-cleanup
+        await asyncio.sleep(Config.CONFIG_MESSAGE_DELETE_DELAY)
+        try:
+            await update.message.delete()
+            await msg.delete()
+            if 'config_prompt_msg_id' in context.user_data:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=context.user_data['config_prompt_msg_id']
+                )
+        except Exception as e:
+            logger.debug(f"Failed to delete config messages: {e}")
+        
+        return ConversationHandler.END
+    
+    try:
+        # Parse the input
+        reply_keywords = {}
+        reply_default = None
+        
+        # Split by semicolon
+        pairs = user_input.split(';')
+        
+        for pair in pairs:
+            pair = pair.strip()
+            if not pair:
+                continue
+            
+            if '=' not in pair:
+                await update.message.reply_text(
+                    f"❌ 格式错误：'{pair}' 缺少等号\n"
+                    f"正确格式：关键词=回复内容"
+                )
+                return CONFIG_REPLY_MODE_INPUT
+            
+            key, value = pair.split('=', 1)
+            key = key.strip()
+            value = value.strip()
+            
+            if not key or not value:
+                await update.message.reply_text(
+                    f"❌ 格式错误：关键词和回复内容不能为空\n"
+                    f"错误项：'{pair}'"
+                )
+                return CONFIG_REPLY_MODE_INPUT
+            
+            # Check if it's default reply
+            if key.lower() == 'default':
+                reply_default = value
+            else:
+                reply_keywords[key] = value
+        
+        # Update database
+        update_dict = {
+            'reply_keywords': reply_keywords,
+            'updated_at': datetime.utcnow()
+        }
+        
+        if reply_default is not None:
+            update_dict['reply_default'] = reply_default
+        
+        result = db[Task.COLLECTION_NAME].update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': update_dict}
+        )
+        
+        # Build success message
+        success_msg = f"✅ 回复模式配置成功！\n\n"
+        if reply_keywords:
+            success_msg += f"📝 配置了 {len(reply_keywords)} 个关键词:\n"
+            for k, v in reply_keywords.items():
+                success_msg += f"  • {k} → {v}\n"
+        if reply_default:
+            success_msg += f"\n💬 默认回复: {reply_default}"
+        
+        if result.modified_count > 0:
+            logger.info(f"Task {task_id}: Reply mode configured with {len(reply_keywords)} keywords")
+        
+        msg = await update.message.reply_text(success_msg)
+        
+        # Auto-cleanup
+        await asyncio.sleep(Config.CONFIG_MESSAGE_DELETE_DELAY)
+        try:
+            await update.message.delete()
+            await msg.delete()
+            if 'config_prompt_msg_id' in context.user_data:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=context.user_data['config_prompt_msg_id']
+                )
+        except Exception as e:
+            logger.debug(f"Failed to delete config messages: {e}")
+        
+        return ConversationHandler.END
+        
+    except Exception as e:
+        logger.error(f"Error parsing reply mode config: {e}")
+        await update.message.reply_text(
+            f"❌ 配置格式错误，请按照示例格式重新输入\n"
+            f"示例: 你好=你好啊！;价格=请联系我们"
+        )
+        return CONFIG_REPLY_MODE_INPUT
+
 
 
 async def request_batch_pause_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5530,6 +5722,13 @@ async def request_flood_strategy_config(update: Update, context: ContextTypes.DE
     
     current_strategy = getattr(task, 'flood_wait_strategy', 'switch_account')
     
+    # Map strategy to display name
+    strategy_display = {
+        'switch_account': '🔄 切换账号',
+        'continue_wait': '⏳ 继续等待',
+        'stop_task': '⛔ 停止任务'
+    }
+    
     keyboard = [
         [InlineKeyboardButton("🔄 切换账号 (推荐)", callback_data=f'set_flood_switch_{task_id}')],
         [InlineKeyboardButton("⏳ 继续等待", callback_data=f'set_flood_wait_{task_id}')],
@@ -5539,11 +5738,22 @@ async def request_flood_strategy_config(update: Update, context: ContextTypes.DE
     
     text = (
         f"🌊 <b>FloodWait策略配置</b>\n\n"
-        f"当前策略: <b>{current_strategy}</b>\n\n"
-        f"💡 当遇到FloodWait错误时的处理方式：\n\n"
-        f"🔄 <b>切换账号</b>: 立即切换到下一个账号继续\n"
-        f"⏳ <b>继续等待</b>: 等待指定时间后继续使用当前账号\n"
-        f"⛔ <b>停止任务</b>: 遇到FloodWait时停止整个任务\n\n"
+        f"当前策略: <b>{strategy_display.get(current_strategy, current_strategy)}</b>\n\n"
+        f"💡 <b>什么是FloodWait？</b>\n"
+        f"当Telegram检测到账号发送消息过于频繁时，会返回FloodWait错误，要求等待一段时间。\n\n"
+        f"<b>策略说明：</b>\n\n"
+        f"🔄 <b>切换账号（推荐）</b>\n"
+        f"  ├─ 遇到FloodWait立即切换到下一个账号\n"
+        f"  ├─ 最大化发送效率\n"
+        f"  └─ 适合多账号场景\n\n"
+        f"⏳ <b>继续等待</b>\n"
+        f"  ├─ 等待Telegram指定的时间后继续\n"
+        f"  ├─ 保持使用当前账号\n"
+        f"  └─ 适合单账号或等待时间较短的情况\n\n"
+        f"⛔ <b>停止任务</b>\n"
+        f"  ├─ 遇到FloodWait立即停止整个任务\n"
+        f"  ├─ 最保守的策略\n"
+        f"  └─ 适合需要人工介入的场景\n\n"
         f"请选择FloodWait处理策略："
     )
     
@@ -5566,14 +5776,25 @@ async def set_flood_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE)
         'stop': 'stop_task'
     }
     
+    strategy_display = {
+        'switch': '切换账号',
+        'wait': '继续等待',
+        'stop': '停止任务'
+    }
+    
     strategy = strategy_map.get(strategy_type, 'switch_account')
     
-    db[Task.COLLECTION_NAME].update_one(
+    result = db[Task.COLLECTION_NAME].update_one(
         {'_id': ObjectId(task_id)},
         {'$set': {'flood_wait_strategy': strategy, 'updated_at': datetime.utcnow()}}
     )
     
-    await safe_answer_query(query, f"✅ FloodWait策略已设置")
+    if result.modified_count > 0:
+        logger.info(f"Task {task_id}: FloodWait strategy updated to {strategy}")
+        await safe_answer_query(query, f"✅ FloodWait策略已设置为：{strategy_display.get(strategy_type, strategy)}")
+    else:
+        await safe_answer_query(query, f"✅ FloodWait策略已设置为：{strategy_display.get(strategy_type, strategy)}（值未变更）")
+    
     return await show_config_menu_handler(update, context, task_id)
 
 
@@ -5589,28 +5810,95 @@ async def request_voice_call_config(update: Update, context: ContextTypes.DEFAUL
     voice_enabled = getattr(task, 'voice_call_enabled', False)
     voice_duration = getattr(task, 'voice_call_duration', 10)
     voice_wait = getattr(task, 'voice_call_wait_after', 3)
+    voice_send_if_failed = getattr(task, 'voice_call_send_if_failed', True)
     
     keyboard = [
-        [InlineKeyboardButton(f"{'✔️' if voice_enabled else '❌'} 启用语音拨打", callback_data=f'toggle_voice_{task_id}')],
+        [InlineKeyboardButton("❌ 禁用", callback_data=f'set_voice_disabled_{task_id}')],
+        [InlineKeyboardButton("📞 失败继续发", callback_data=f'set_voice_continue_{task_id}')],
+        [InlineKeyboardButton("📞 失败不发", callback_data=f'set_voice_strict_{task_id}')],
         [InlineKeyboardButton("🔙 返回", callback_data=f'show_config_{task_id}')]
     ]
     
+    # Determine current mode
+    if not voice_enabled:
+        current_mode = "❌ 禁用"
+    elif voice_send_if_failed:
+        current_mode = "📞 失败继续发"
+    else:
+        current_mode = "📞 失败不发"
+    
     text = (
         f"📞 <b>语音拨打配置</b>\n\n"
-        f"状态: <b>{'已启用' if voice_enabled else '已禁用'}</b>\n"
+        f"当前模式: <b>{current_mode}</b>\n"
         f"拨打时长: {voice_duration}秒\n"
         f"拨打后等待: {voice_wait}秒\n\n"
-        f"💡 发送消息前先拨打语音电话\n"
-        f"⚠️ 可能增加互动率，但也可能被视为骚扰\n\n"
-        f"请选择操作："
+        f"<b>模式说明：</b>\n\n"
+        f"❌ <b>禁用</b>\n"
+        f"  └─ 不拨打语音电话，直接发送消息\n\n"
+        f"📞 <b>失败继续发（推荐）</b>\n"
+        f"  ├─ 发送消息前先拨打语音电话\n"
+        f"  ├─ 如果拨打失败，仍然发送消息\n"
+        f"  └─ 兼顾互动率和送达率\n\n"
+        f"📞 <b>失败不发</b>\n"
+        f"  ├─ 发送消息前先拨打语音电话\n"
+        f"  ├─ 如果拨打失败，跳过该用户\n"
+        f"  └─ 仅对能接通的用户发送\n\n"
+        f"💡 拨打语音电话可能增加互动率\n"
+        f"⚠️ 过度拨打可能被视为骚扰\n\n"
+        f"请选择语音拨打模式："
     )
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
 
 
+async def set_voice_call_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set voice call mode"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    
+    parts = query.data.split('_')
+    mode = parts[2]  # disabled, continue, or strict
+    task_id = parts[3]
+    
+    # Configure based on mode
+    if mode == 'disabled':
+        voice_enabled = False
+        voice_send_if_failed = True
+        mode_display = "禁用"
+    elif mode == 'continue':
+        voice_enabled = True
+        voice_send_if_failed = True
+        mode_display = "失败继续发"
+    elif mode == 'strict':
+        voice_enabled = True
+        voice_send_if_failed = False
+        mode_display = "失败不发"
+    else:
+        voice_enabled = False
+        voice_send_if_failed = True
+        mode_display = "禁用"
+    
+    result = db[Task.COLLECTION_NAME].update_one(
+        {'_id': ObjectId(task_id)},
+        {'$set': {
+            'voice_call_enabled': voice_enabled,
+            'voice_call_send_if_failed': voice_send_if_failed,
+            'updated_at': datetime.utcnow()
+        }}
+    )
+    
+    if result.modified_count > 0:
+        logger.info(f"Task {task_id}: Voice call mode set to {mode}")
+        await safe_answer_query(query, f"✅ 语音拨打模式已设置为：{mode_display}")
+    else:
+        await safe_answer_query(query, f"✅ 语音拨打模式已设置为：{mode_display}（值未变更）")
+    
+    return await request_voice_call_config(update, context)
+
+
 async def toggle_voice_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle voice call enabled"""
+    """Toggle voice call enabled (deprecated - use set_voice_call_mode instead)"""
     query = update.callback_query
     await safe_answer_query(query)
     task_id = query.data.split('_')[2]
@@ -5620,10 +5908,13 @@ async def toggle_voice_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     new_value = not getattr(task, 'voice_call_enabled', False)
     
-    db[Task.COLLECTION_NAME].update_one(
+    result = db[Task.COLLECTION_NAME].update_one(
         {'_id': ObjectId(task_id)},
         {'$set': {'voice_call_enabled': new_value, 'updated_at': datetime.utcnow()}}
     )
+    
+    if result.modified_count > 0:
+        logger.info(f"Task {task_id}: Voice call {'enabled' if new_value else 'disabled'}")
     
     await safe_answer_query(query, f"✅ 语音拨打已{'启用' if new_value else '禁用'}")
     return await request_voice_call_config(update, context)
@@ -5664,7 +5955,233 @@ async def request_thread_interval_config(update: Update, context: ContextTypes.D
         parse_mode='HTML'
     )
     context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
-    return CONFIG_EDIT_MODE_INPUT  # Reuse existing state
+    return CONFIG_THREAD_INTERVAL_INPUT
+
+
+async def request_daily_limit_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request daily limit configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    context.user_data['config_task_id'] = task_id
+    
+    prompt_msg = await query.message.reply_text(
+        "📊 <b>配置单账号日限</b>\n\n"
+        "请输入每个账号每天最多发送的消息数量：\n\n"
+        "💡 建议范围：1-200条\n"
+        "💡 默认值：50条\n"
+        "⚠️ 设置过高可能导致封号风险增加",
+        parse_mode='HTML'
+    )
+    context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
+    return CONFIG_DAILY_LIMIT_INPUT
+
+
+async def handle_daily_limit_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle daily limit configuration input"""
+    task_id = context.user_data.get('config_task_id')
+    if not task_id:
+        await update.message.reply_text("❌ 配置会话已过期，请重新开始")
+        return ConversationHandler.END
+    
+    try:
+        daily_limit = int(update.message.text.strip())
+        
+        if daily_limit < 1 or daily_limit > 200:
+            await update.message.reply_text("❌ 日限必须在 1-200 之间，请重新输入：")
+            return CONFIG_DAILY_LIMIT_INPUT
+        
+        # Update database
+        result = db[Task.COLLECTION_NAME].update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {'daily_limit': daily_limit, 'updated_at': datetime.utcnow()}}
+        )
+        
+        # Verify update
+        if result.modified_count > 0:
+            logger.info(f"Task {task_id}: Daily limit updated to {daily_limit}")
+            msg = await update.message.reply_text(f"✅ 单账号日限已设置为：{daily_limit}条")
+        else:
+            msg = await update.message.reply_text(f"✅ 单账号日限已设置为：{daily_limit}条（值未变更）")
+        
+        # Auto-cleanup
+        await asyncio.sleep(Config.CONFIG_MESSAGE_DELETE_DELAY)
+        try:
+            await update.message.delete()
+            await msg.delete()
+            if 'config_prompt_msg_id' in context.user_data:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=context.user_data['config_prompt_msg_id']
+                )
+        except Exception as e:
+            logger.debug(f"Failed to delete config messages: {e}")
+        
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text("❌ 请输入有效的数字（1-200）：")
+        return CONFIG_DAILY_LIMIT_INPUT
+
+
+async def request_retry_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request retry configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[2]
+    context.user_data['config_task_id'] = task_id
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    prompt_msg = await query.message.reply_text(
+        "🔄 <b>配置重试策略</b>\n\n"
+        f"当前设置: {task.retry_count}次，间隔{task.retry_interval}秒\n\n"
+        "请输入重试次数和间隔时间（秒），用空格分隔：\n\n"
+        "💡 格式：重试次数 间隔时间\n"
+        "💡 例如：3 60（重试3次，每次间隔60秒）\n"
+        "💡 建议：1-10次，间隔30-300秒\n"
+        "⚠️ 重试过于频繁可能被检测为异常行为",
+        parse_mode='HTML'
+    )
+    context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
+    return CONFIG_RETRY_INPUT
+
+
+async def handle_retry_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle retry configuration input"""
+    task_id = context.user_data.get('config_task_id')
+    if not task_id:
+        await update.message.reply_text("❌ 配置会话已过期，请重新开始")
+        return ConversationHandler.END
+    
+    try:
+        parts = update.message.text.strip().split()
+        if len(parts) != 2:
+            await update.message.reply_text("❌ 格式错误，请输入两个数字（重试次数 间隔时间）：")
+            return CONFIG_RETRY_INPUT
+        
+        retry_count = int(parts[0])
+        retry_interval = int(parts[1])
+        
+        if retry_count < 0 or retry_count > 10:
+            await update.message.reply_text("❌ 重试次数必须在 0-10 之间，请重新输入：")
+            return CONFIG_RETRY_INPUT
+        
+        if retry_interval < 10 or retry_interval > 300:
+            await update.message.reply_text("❌ 间隔时间必须在 10-300秒 之间，请重新输入：")
+            return CONFIG_RETRY_INPUT
+        
+        # Update database
+        result = db[Task.COLLECTION_NAME].update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {
+                'retry_count': retry_count,
+                'retry_interval': retry_interval,
+                'updated_at': datetime.utcnow()
+            }}
+        )
+        
+        # Verify update
+        if result.modified_count > 0:
+            logger.info(f"Task {task_id}: Retry config updated to {retry_count} times, {retry_interval}s interval")
+            msg = await update.message.reply_text(
+                f"✅ 重试策略已设置为：{retry_count}次，间隔{retry_interval}秒"
+            )
+        else:
+            msg = await update.message.reply_text(
+                f"✅ 重试策略已设置为：{retry_count}次，间隔{retry_interval}秒（值未变更）"
+            )
+        
+        # Auto-cleanup
+        await asyncio.sleep(Config.CONFIG_MESSAGE_DELETE_DELAY)
+        try:
+            await update.message.delete()
+            await msg.delete()
+            if 'config_prompt_msg_id' in context.user_data:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=context.user_data['config_prompt_msg_id']
+                )
+        except Exception as e:
+            logger.debug(f"Failed to delete config messages: {e}")
+        
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text("❌ 请输入有效的数字：")
+        return CONFIG_RETRY_INPUT
+
+
+async def toggle_force_private_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle force private mode"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[4]
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    new_value = not getattr(task, 'force_private_mode', False)
+    
+    result = db[Task.COLLECTION_NAME].update_one(
+        {'_id': ObjectId(task_id)},
+        {'$set': {'force_private_mode': new_value, 'updated_at': datetime.utcnow()}}
+    )
+    
+    if result.modified_count > 0:
+        logger.info(f"Task {task_id}: Force private mode {'enabled' if new_value else 'disabled'}")
+    
+    await safe_answer_query(query, f"✅ 强制私信模式已{'启用' if new_value else '禁用'}")
+    return await show_config_menu_handler(update, context, task_id)
+
+
+async def handle_thread_interval_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle thread interval configuration input"""
+    task_id = context.user_data.get('config_task_id')
+    if not task_id:
+        await update.message.reply_text("❌ 配置会话已过期，请重新开始")
+        return ConversationHandler.END
+    
+    try:
+        interval = int(update.message.text.strip())
+        
+        if interval < 0 or interval > 60:
+            await update.message.reply_text("❌ 间隔时间必须在 0-60秒 之间，请重新输入：")
+            return CONFIG_THREAD_INTERVAL_INPUT
+        
+        # Update database
+        result = db[Task.COLLECTION_NAME].update_one(
+            {'_id': ObjectId(task_id)},
+            {'$set': {'thread_start_interval': interval, 'updated_at': datetime.utcnow()}}
+        )
+        
+        # Verify update
+        if result.modified_count > 0:
+            logger.info(f"Task {task_id}: Thread start interval updated to {interval}s")
+            msg = await update.message.reply_text(f"✅ 线程启动间隔已设置为：{interval}秒")
+        else:
+            msg = await update.message.reply_text(f"✅ 线程启动间隔已设置为：{interval}秒（值未变更）")
+        
+        # Auto-cleanup
+        await asyncio.sleep(Config.CONFIG_MESSAGE_DELETE_DELAY)
+        try:
+            await update.message.delete()
+            await msg.delete()
+            if 'config_prompt_msg_id' in context.user_data:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=context.user_data['config_prompt_msg_id']
+                )
+        except Exception as e:
+            logger.debug(f"Failed to delete config messages: {e}")
+        
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text("❌ 请输入有效的数字（0-60）：")
+        return CONFIG_THREAD_INTERVAL_INPUT
+
 
 
 async def show_config_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id=None):
@@ -6588,12 +7105,20 @@ def main():
         entry_points=[
             CallbackQueryHandler(request_thread_config, pattern='^cfg_thread_'),
             CallbackQueryHandler(request_interval_config, pattern='^cfg_interval_'),
-            CallbackQueryHandler(request_bidirect_config, pattern='^cfg_bidirect_')
+            CallbackQueryHandler(request_bidirect_config, pattern='^cfg_bidirect_'),
+            CallbackQueryHandler(request_thread_interval_config, pattern='^cfg_thread_interval_'),
+            CallbackQueryHandler(request_daily_limit_config, pattern='^cfg_daily_limit_'),
+            CallbackQueryHandler(request_retry_config, pattern='^cfg_retry_'),
+            CallbackQueryHandler(request_reply_mode_config, pattern='^cfg_reply_mode_')
         ],
         states={
             CONFIG_THREAD_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_thread_config)],
             CONFIG_INTERVAL_MIN_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_interval_config)],
-            CONFIG_BIDIRECT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bidirect_config)]
+            CONFIG_BIDIRECT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bidirect_config)],
+            CONFIG_THREAD_INTERVAL_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_thread_interval_config)],
+            CONFIG_DAILY_LIMIT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_daily_limit_config)],
+            CONFIG_RETRY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_retry_config)],
+            CONFIG_REPLY_MODE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_mode_config)]
         },
         fallbacks=[CommandHandler("start", start)]
     )
