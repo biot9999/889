@@ -1266,6 +1266,7 @@ class AccountManager:
         self.db = db
         self.accounts_col = db[Account.COLLECTION_NAME]
         self.clients = {}
+        self.client_locks = {}  # Locks for preventing concurrent client creation
     
     async def send_code_request(self, phone, api_id=None, api_hash=None):
         """Send code to phone"""
@@ -1420,12 +1421,24 @@ class AccountManager:
             return None
     
     async def get_client(self, account_id):
-        """Get client for account with automatic proxy assignment"""
+        """Get client for account with automatic proxy assignment and lock protection"""
         account_id_str = str(account_id)
+        
+        # Check if already connected (fast path, no lock needed)
         if account_id_str in self.clients and self.clients[account_id_str].is_connected():
             return self.clients[account_id_str]
         
-        account_doc = self.accounts_col.find_one({'_id': ObjectId(account_id)})
+        # Create lock for this account if doesn't exist
+        if account_id_str not in self.client_locks:
+            self.client_locks[account_id_str] = asyncio.Lock()
+        
+        # Acquire lock to prevent concurrent client creation
+        async with self.client_locks[account_id_str]:
+            # Double-check if another coroutine already created the client
+            if account_id_str in self.clients and self.clients[account_id_str].is_connected():
+                return self.clients[account_id_str]
+            
+            account_doc = self.accounts_col.find_one({'_id': ObjectId(account_id)})
         if not account_doc:
             raise ValueError(f"Account {account_id} not found")
         
@@ -1596,12 +1609,32 @@ class AccountManager:
         docs = self.accounts_col.find({'status': AccountStatus.ACTIVE.value})
         return [Account.from_dict(doc) for doc in docs]
     
+    async def disconnect_client(self, account_id):
+        """Disconnect a specific client"""
+        account_id_str = str(account_id)
+        if account_id_str in self.clients:
+            client = self.clients[account_id_str]
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+                    logger.info(f"Disconnected client for account {account_id}")
+            except Exception as e:
+                logger.error(f"Error disconnecting client for account {account_id}: {e}")
+            finally:
+                del self.clients[account_id_str]
+                if account_id_str in self.client_locks:
+                    del self.client_locks[account_id_str]
+    
     async def disconnect_all(self):
         """Disconnect all clients"""
-        for client in self.clients.values():
-            if client.is_connected():
-                await client.disconnect()
+        for account_id, client in list(self.clients.items()):
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception as e:
+                logger.error(f"Error disconnecting client {account_id}: {e}")
         self.clients.clear()
+        self.client_locks.clear()
 
 
 # ============================================================================
@@ -1621,6 +1654,7 @@ class TaskManager:
         self.report_sent = set()  # Track which tasks have sent completion reports
         self.report_retry_count = {}  # Track report send retry attempts {task_id: count}
         self.bot_application = bot_application  # 用于发送完成报告
+        self._account_check_cache = {}  # Cache for check_and_stop_if_no_accounts {task_id: {'result': bool, 'checked_at': datetime}}
     
     def create_task(self, name, message_text, message_format, media_type=MediaType.TEXT,
                    media_path=None, send_method=SendMethod.DIRECT, postbot_code=None, 
@@ -2347,7 +2381,16 @@ class TaskManager:
         return available is not None
     
     async def check_and_stop_if_no_accounts(self, task_id):
-        """Check accounts and stop task if all unavailable - with detailed reason"""
+        """Check accounts and stop task if all unavailable - with detailed reason and 30s cache"""
+        # Check cache (30 seconds)
+        task_id_str = str(task_id)
+        if task_id_str in self._account_check_cache:
+            cached = self._account_check_cache[task_id_str]
+            cache_age = (datetime.utcnow() - cached['checked_at']).total_seconds()
+            if cache_age < Config.ACCOUNT_STATUS_CHECK_CACHE_DURATION:
+                logger.debug(f"Task {task_id}: Using cached account check result")
+                return cached['result']
+        
         if not await self.check_accounts_availability():
             logger.error(f"Task {task_id}: All accounts unavailable")
             
@@ -2410,7 +2453,19 @@ class TaskManager:
             # 生成报告
             await self._send_completion_reports(task_id)
             
+            # Cache result
+            self._account_check_cache[task_id_str] = {
+                'result': True,
+                'checked_at': datetime.utcnow()
+            }
+            
             return True
+        
+        # Cache result
+        self._account_check_cache[task_id_str] = {
+            'result': False,
+            'checked_at': datetime.utcnow()
+        }
         
         return False
     
