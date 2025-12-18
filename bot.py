@@ -1094,6 +1094,110 @@ def assign_proxies_to_accounts(db):
 
 
 # ============================================================================
+# 代理管理类
+# ============================================================================
+class ProxyManager:
+    """Manage proxy health scoring and selection"""
+    
+    def __init__(self, db):
+        self.db = db
+        self.proxies_col = db[Proxy.COLLECTION_NAME]
+    
+    def get_best_proxy(self):
+        """Get best proxy based on success rate and recency"""
+        try:
+            # Get all active proxies
+            proxies = list(self.proxies_col.find({'is_active': True}))
+            
+            if not proxies:
+                return None
+            
+            # Score proxies
+            scored_proxies = []
+            for proxy_doc in proxies:
+                proxy = Proxy.from_dict(proxy_doc)
+                score = self._calculate_proxy_score(proxy)
+                scored_proxies.append((score, proxy))
+            
+            # Sort by score (highest first)
+            scored_proxies.sort(key=lambda x: x[0], reverse=True)
+            
+            # Return best proxy
+            if scored_proxies:
+                return scored_proxies[0][1]
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"ProxyManager: Error getting best proxy: {e}")
+            return None
+    
+    def _calculate_proxy_score(self, proxy):
+        """Calculate proxy health score (0-100)"""
+        total_attempts = proxy.success_count + proxy.fail_count
+        
+        # No attempts yet, give neutral score
+        if total_attempts == 0:
+            return 50
+        
+        # Calculate success rate (0-100)
+        success_rate = (proxy.success_count / total_attempts) * 100
+        
+        # Time decay: prefer recently used proxies
+        if proxy.updated_at:
+            age_seconds = (datetime.utcnow() - proxy.updated_at).total_seconds()
+            age_hours = age_seconds / 3600
+            # Decay factor: 1.0 for fresh, 0.5 for 24h old, 0.1 for week old
+            time_factor = max(0.1, 1.0 - (age_hours / 168))  # 168 hours = 1 week
+        else:
+            time_factor = 0.5
+        
+        # Combined score
+        score = success_rate * time_factor
+        
+        return score
+    
+    def record_proxy_result(self, proxy_id, success):
+        """Record proxy operation result and auto-disable if needed"""
+        try:
+            if success:
+                self.proxies_col.update_one(
+                    {'_id': ObjectId(proxy_id)},
+                    {
+                        '$inc': {'success_count': 1},
+                        '$set': {'updated_at': datetime.utcnow()}
+                    }
+                )
+            else:
+                self.proxies_col.update_one(
+                    {'_id': ObjectId(proxy_id)},
+                    {
+                        '$inc': {'fail_count': 1},
+                        '$set': {'updated_at': datetime.utcnow()}
+                    }
+                )
+                
+                # Check if should disable proxy
+                proxy_doc = self.proxies_col.find_one({'_id': ObjectId(proxy_id)})
+                if proxy_doc:
+                    proxy = Proxy.from_dict(proxy_doc)
+                    total = proxy.success_count + proxy.fail_count
+                    
+                    # Disable if failure rate > 80% and at least 10 attempts
+                    if total >= 10:
+                        failure_rate = (proxy.fail_count / total) * 100
+                        if failure_rate > 80:
+                            self.proxies_col.update_one(
+                                {'_id': ObjectId(proxy_id)},
+                                {'$set': {'is_active': False, 'updated_at': datetime.utcnow()}}
+                            )
+                            logger.warning(f"ProxyManager: Disabled proxy {proxy.host}:{proxy.port} due to {failure_rate:.1f}% failure rate")
+                            
+        except Exception as e:
+            logger.error(f"ProxyManager: Error recording proxy result: {e}")
+
+
+# ============================================================================
 # 消息格式化类
 # ============================================================================
 class MessageFormatter:
@@ -3159,7 +3263,9 @@ class TaskManager:
  MESSAGE_INPUT, FORMAT_SELECT, SEND_METHOD_SELECT, MEDIA_SELECT, MEDIA_UPLOAD,
  TARGET_INPUT, TASK_NAME_INPUT, SESSION_UPLOAD, TDATA_UPLOAD, POSTBOT_CODE_INPUT,
  CHANNEL_LINK_INPUT, PREVIEW_CONFIG,
- CONFIG_THREAD_INPUT, CONFIG_INTERVAL_MIN_INPUT, CONFIG_BIDIRECT_INPUT) = range(18)
+ CONFIG_THREAD_INPUT, CONFIG_INTERVAL_MIN_INPUT, CONFIG_BIDIRECT_INPUT,
+ CONFIG_EDIT_MODE_INPUT, CONFIG_REPLY_MODE_INPUT, CONFIG_BATCH_PAUSE_INPUT,
+ CONFIG_VOICE_CALL_INPUT) = range(22)
 
 # Global managers
 account_manager = None
@@ -3873,9 +3979,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('cfg_toggle_'):
         # Handle toggle buttons for pin_message, delete_dialog, repeat_send
         parts = data.split('_')
-        toggle_type = parts[2]  # pin, delete, repeat
-        task_id = parts[3]
-        await toggle_task_config(query, task_id, toggle_type)
+        toggle_type = parts[2]  # pin, delete, repeat, dead
+        task_id = parts[3] if len(parts) > 3 else parts[-1]
+        
+        if toggle_type == 'dead':
+            # Special handling for dead account toggle (has 'account' in the middle)
+            await toggle_dead_account_switch(update, context)
+        else:
+            await toggle_task_config(query, task_id, toggle_type)
+    
+    # New configuration handlers
+    elif data.startswith('cfg_edit_mode_'):
+        await request_edit_mode_config(update, context)
+    elif data.startswith('set_mode_'):
+        await set_message_mode(update, context)
+    elif data.startswith('cfg_reply_mode_'):
+        await request_reply_mode_config(update, context)
+    elif data.startswith('cfg_batch_pause_'):
+        await request_batch_pause_config(update, context)
+    elif data.startswith('disable_batch_pause_'):
+        await disable_batch_pause(update, context)
+    elif data.startswith('cfg_flood_strategy_'):
+        await request_flood_strategy_config(update, context)
+    elif data.startswith('set_flood_'):
+        await set_flood_strategy(update, context)
+    elif data.startswith('cfg_voice_call_'):
+        await request_voice_call_config(update, context)
+    elif data.startswith('toggle_voice_'):
+        await toggle_voice_call(update, context)
+    elif data.startswith('cfg_thread_interval_'):
+        await request_thread_interval_config(update, context)
+    elif data.startswith('show_config_'):
+        task_id = data.split('_')[2]
+        await show_config_menu_handler(update, context, task_id)
+    
     elif data == 'noop':
         # No operation for info-only buttons
         await safe_answer_query(query)
@@ -4691,6 +4828,19 @@ async def show_task_config(query, task_id):
             InlineKeyboardButton(f"{'✔️' if task.delete_dialog else '❌'} 删除对话", callback_data=f'cfg_toggle_delete_{task_id}')
         ],
         [InlineKeyboardButton(f"{'✔️' if task.repeat_send else '❌'} 重复发送", callback_data=f'cfg_toggle_repeat_{task_id}')],
+        [
+            InlineKeyboardButton(f"✏️ 编辑模式", callback_data=f'cfg_edit_mode_{task_id}'),
+            InlineKeyboardButton(f"💬 回复模式", callback_data=f'cfg_reply_mode_{task_id}')
+        ],
+        [
+            InlineKeyboardButton(f"⏸️ 批次停顿", callback_data=f'cfg_batch_pause_{task_id}'),
+            InlineKeyboardButton(f"🌊 FloodWait策略", callback_data=f'cfg_flood_strategy_{task_id}')
+        ],
+        [
+            InlineKeyboardButton(f"📞 语音拨打", callback_data=f'cfg_voice_call_{task_id}'),
+            InlineKeyboardButton(f"⏲️ 线程启动间隔: {task.thread_start_interval}s", callback_data=f'cfg_thread_interval_{task_id}')
+        ],
+        [InlineKeyboardButton(f"{'✔️' if task.auto_switch_dead_account else '❌'} 死号自动换号", callback_data=f'cfg_toggle_dead_account_{task_id}')],
         [InlineKeyboardButton("✅ 配置完成", callback_data=f'task_detail_{task_id}')],
         [InlineKeyboardButton("🔙 返回", callback_data=f'task_detail_{task_id}')]
     ]
@@ -5235,6 +5385,333 @@ async def handle_bidirect_config(update: Update, context: ContextTypes.DEFAULT_T
     except ValueError:
         await update.message.reply_text("❌ 请输入有效的数字：")
         return CONFIG_BIDIRECT_INPUT
+
+
+# ============================================================================
+# 新配置功能的回调处理器
+# ============================================================================
+
+async def request_edit_mode_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request edit mode configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    context.user_data['config_task_id'] = task_id
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    current_mode = getattr(task, 'message_mode', 'normal')
+    edit_delay_min = getattr(task, 'edit_delay_min', 5)
+    edit_delay_max = getattr(task, 'edit_delay_max', 15)
+    
+    keyboard = [
+        [InlineKeyboardButton("📤 普通模式", callback_data=f'set_mode_normal_{task_id}')],
+        [InlineKeyboardButton("✏️ 编辑模式", callback_data=f'set_mode_edit_{task_id}')],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'show_config_{task_id}')]
+    ]
+    
+    text = (
+        f"✏️ <b>编辑模式配置</b>\n\n"
+        f"当前模式: <b>{current_mode}</b>\n"
+        f"编辑延迟: {edit_delay_min}-{edit_delay_max}秒\n\n"
+        f"💡 编辑模式：先发送初始消息，延迟后编辑成目标内容\n"
+        f"⚠️ 可用于绕过某些风控机制\n\n"
+        f"请选择消息发送模式："
+    )
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def set_message_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set message mode"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    
+    parts = query.data.split('_')
+    mode = parts[2]  # normal or edit
+    task_id = parts[3]
+    
+    db[Task.COLLECTION_NAME].update_one(
+        {'_id': ObjectId(task_id)},
+        {'$set': {'message_mode': mode, 'updated_at': datetime.utcnow()}}
+    )
+    
+    await safe_answer_query(query, f"✅ 已设置为{mode}模式")
+    
+    # Redirect back to config menu
+    return await show_config_menu_handler(update, context, task_id)
+
+
+async def request_reply_mode_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request reply mode configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    reply_timeout = getattr(task, 'reply_timeout', 300)
+    reply_keywords = getattr(task, 'reply_keywords', {})
+    
+    text = (
+        f"💬 <b>回复模式配置</b>\n\n"
+        f"监听超时: {reply_timeout}秒\n"
+        f"关键词数量: {len(reply_keywords)}\n\n"
+        f"💡 回复模式：自动监听用户回复并根据关键词响应\n\n"
+        f"⚠️ 此功能暂未完全实现，敬请期待！"
+    )
+    
+    keyboard = [[InlineKeyboardButton("🔙 返回", callback_data=f'show_config_{task_id}')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def request_batch_pause_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request batch pause configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    context.user_data['config_task_id'] = task_id
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    batch_pause_count = getattr(task, 'batch_pause_count', 0)
+    batch_pause_min = getattr(task, 'batch_pause_min', 0)
+    batch_pause_max = getattr(task, 'batch_pause_max', 5)
+    
+    keyboard = [
+        [InlineKeyboardButton(f"📊 每{batch_pause_count}条停顿", callback_data=f'set_batch_count_{task_id}')],
+        [InlineKeyboardButton(f"⏱️ 停顿{batch_pause_min}-{batch_pause_max}秒", callback_data=f'set_batch_delay_{task_id}')],
+        [InlineKeyboardButton("❌ 禁用批次停顿", callback_data=f'disable_batch_pause_{task_id}')],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'show_config_{task_id}')]
+    ]
+    
+    text = (
+        f"⏸️ <b>批次停顿配置</b>\n\n"
+        f"当前设置:\n"
+        f"• 每 <b>{batch_pause_count}</b> 条消息停顿\n"
+        f"• 停顿 <b>{batch_pause_min}-{batch_pause_max}</b> 秒\n\n"
+        f"💡 防封策略：定期停顿可降低被检测风险\n"
+        f"⚠️ 设置为0表示禁用批次停顿\n\n"
+        f"请选择要配置的选项："
+    )
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def disable_batch_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Disable batch pause"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    
+    db[Task.COLLECTION_NAME].update_one(
+        {'_id': ObjectId(task_id)},
+        {'$set': {'batch_pause_count': 0, 'updated_at': datetime.utcnow()}}
+    )
+    
+    await safe_answer_query(query, "✅ 已禁用批次停顿")
+    return await show_config_menu_handler(update, context, task_id)
+
+
+async def request_flood_strategy_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request FloodWait strategy configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    current_strategy = getattr(task, 'flood_wait_strategy', 'switch_account')
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 切换账号 (推荐)", callback_data=f'set_flood_switch_{task_id}')],
+        [InlineKeyboardButton("⏳ 继续等待", callback_data=f'set_flood_wait_{task_id}')],
+        [InlineKeyboardButton("⛔ 停止任务", callback_data=f'set_flood_stop_{task_id}')],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'show_config_{task_id}')]
+    ]
+    
+    text = (
+        f"🌊 <b>FloodWait策略配置</b>\n\n"
+        f"当前策略: <b>{current_strategy}</b>\n\n"
+        f"💡 当遇到FloodWait错误时的处理方式：\n\n"
+        f"🔄 <b>切换账号</b>: 立即切换到下一个账号继续\n"
+        f"⏳ <b>继续等待</b>: 等待指定时间后继续使用当前账号\n"
+        f"⛔ <b>停止任务</b>: 遇到FloodWait时停止整个任务\n\n"
+        f"请选择FloodWait处理策略："
+    )
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def set_flood_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set FloodWait strategy"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    
+    parts = query.data.split('_')
+    strategy_type = parts[2]  # switch, wait, or stop
+    task_id = parts[3]
+    
+    strategy_map = {
+        'switch': 'switch_account',
+        'wait': 'continue_wait',
+        'stop': 'stop_task'
+    }
+    
+    strategy = strategy_map.get(strategy_type, 'switch_account')
+    
+    db[Task.COLLECTION_NAME].update_one(
+        {'_id': ObjectId(task_id)},
+        {'$set': {'flood_wait_strategy': strategy, 'updated_at': datetime.utcnow()}}
+    )
+    
+    await safe_answer_query(query, f"✅ FloodWait策略已设置")
+    return await show_config_menu_handler(update, context, task_id)
+
+
+async def request_voice_call_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request voice call configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    voice_enabled = getattr(task, 'voice_call_enabled', False)
+    voice_duration = getattr(task, 'voice_call_duration', 10)
+    voice_wait = getattr(task, 'voice_call_wait_after', 3)
+    
+    keyboard = [
+        [InlineKeyboardButton(f"{'✔️' if voice_enabled else '❌'} 启用语音拨打", callback_data=f'toggle_voice_{task_id}')],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'show_config_{task_id}')]
+    ]
+    
+    text = (
+        f"📞 <b>语音拨打配置</b>\n\n"
+        f"状态: <b>{'已启用' if voice_enabled else '已禁用'}</b>\n"
+        f"拨打时长: {voice_duration}秒\n"
+        f"拨打后等待: {voice_wait}秒\n\n"
+        f"💡 发送消息前先拨打语音电话\n"
+        f"⚠️ 可能增加互动率，但也可能被视为骚扰\n\n"
+        f"请选择操作："
+    )
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def toggle_voice_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle voice call enabled"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[2]
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    new_value = not getattr(task, 'voice_call_enabled', False)
+    
+    db[Task.COLLECTION_NAME].update_one(
+        {'_id': ObjectId(task_id)},
+        {'$set': {'voice_call_enabled': new_value, 'updated_at': datetime.utcnow()}}
+    )
+    
+    await safe_answer_query(query, f"✅ 语音拨打已{'启用' if new_value else '禁用'}")
+    return await request_voice_call_config(update, context)
+
+
+async def toggle_dead_account_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle auto switch dead account"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[4]
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    new_value = not getattr(task, 'auto_switch_dead_account', True)
+    
+    db[Task.COLLECTION_NAME].update_one(
+        {'_id': ObjectId(task_id)},
+        {'$set': {'auto_switch_dead_account': new_value, 'updated_at': datetime.utcnow()}}
+    )
+    
+    await safe_answer_query(query, f"✅ 死号自动换号已{'启用' if new_value else '禁用'}")
+    return await show_config_menu_handler(update, context, task_id)
+
+
+async def request_thread_interval_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Request thread start interval configuration"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    task_id = query.data.split('_')[3]
+    context.user_data['config_task_id'] = task_id
+    
+    prompt_msg = await query.message.reply_text(
+        "⏲️ <b>配置线程启动间隔</b>\n\n"
+        "请输入线程启动间隔（秒）：\n\n"
+        "💡 建议：0-5秒\n"
+        "⚠️ 间隔可以避免瞬间并发过高",
+        parse_mode='HTML'
+    )
+    context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
+    return CONFIG_EDIT_MODE_INPUT  # Reuse existing state
+
+
+async def show_config_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id=None):
+    """Helper to show config menu"""
+    if task_id is None:
+        query = update.callback_query
+        task_id = query.data.split('_')[2]
+    
+    task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
+    task = Task.from_dict(task_doc)
+    
+    query = update.callback_query
+    text = (
+        f"⚙️ <b>配置 - {task.name}</b>\n\n"
+        f"当前配置如下，点击按钮进行调整："
+    )
+    
+    keyboard = [
+        [
+            InlineKeyboardButton(f"🧵 线程数: {task.thread_count}", callback_data=f'cfg_thread_{task_id}'),
+            InlineKeyboardButton(f"⏱️ 间隔: {task.min_interval}-{task.max_interval}s", callback_data=f'cfg_interval_{task_id}')
+        ],
+        [InlineKeyboardButton(f"🔄 无视双向: {task.ignore_bidirectional_limit}次", callback_data=f'cfg_bidirect_{task_id}')],
+        [
+            InlineKeyboardButton(f"{'✔️' if task.pin_message else '❌'} 置顶消息", callback_data=f'cfg_toggle_pin_{task_id}'),
+            InlineKeyboardButton(f"{'✔️' if task.delete_dialog else '❌'} 删除对话", callback_data=f'cfg_toggle_delete_{task_id}')
+        ],
+        [InlineKeyboardButton(f"{'✔️' if task.repeat_send else '❌'} 重复发送", callback_data=f'cfg_toggle_repeat_{task_id}')],
+        [
+            InlineKeyboardButton(f"✏️ 编辑模式", callback_data=f'cfg_edit_mode_{task_id}'),
+            InlineKeyboardButton(f"💬 回复模式", callback_data=f'cfg_reply_mode_{task_id}')
+        ],
+        [
+            InlineKeyboardButton(f"⏸️ 批次停顿", callback_data=f'cfg_batch_pause_{task_id}'),
+            InlineKeyboardButton(f"🌊 FloodWait策略", callback_data=f'cfg_flood_strategy_{task_id}')
+        ],
+        [
+            InlineKeyboardButton(f"📞 语音拨打", callback_data=f'cfg_voice_call_{task_id}'),
+            InlineKeyboardButton(f"⏲️ 线程启动间隔: {task.thread_start_interval}s", callback_data=f'cfg_thread_interval_{task_id}')
+        ],
+        [InlineKeyboardButton(f"{'✔️' if task.auto_switch_dead_account else '❌'} 死号自动换号", callback_data=f'cfg_toggle_dead_account_{task_id}')],
+        [InlineKeyboardButton("✅ 配置完成", callback_data=f'task_detail_{task_id}')],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'task_detail_{task_id}')]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
 
 
 async def start_task_handler(query, task_id, context):
