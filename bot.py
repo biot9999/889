@@ -1148,6 +1148,115 @@ class MessageFormatter:
 
 
 # ============================================================================
+# 编辑模式和回复模式类
+# ============================================================================
+class EditMode:
+    """Handle edit mode functionality for messages"""
+    
+    def __init__(self, task, account_manager):
+        self.task = task
+        self.account_manager = account_manager
+        self.sent_messages = {}  # {target_id: message_obj}
+    
+    async def send_and_schedule_edit(self, client, entity, target_id, initial_message, edit_content):
+        """Send initial message and schedule edit"""
+        try:
+            # Send initial message
+            sent_message = await client.send_message(entity, initial_message)
+            
+            # Store message for editing
+            self.sent_messages[target_id] = sent_message
+            
+            # Wait random delay
+            delay = random.randint(self.task.edit_delay_min, self.task.edit_delay_max)
+            logger.info(f"EditMode: Scheduled edit in {delay} seconds for target {target_id}")
+            await asyncio.sleep(delay)
+            
+            # Edit message
+            await client.edit_message(entity, sent_message, edit_content)
+            logger.info(f"EditMode: Message edited successfully for target {target_id}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"EditMode: Failed to edit message for target {target_id}: {e}")
+            return False
+
+
+class ReplyMode:
+    """Handle reply mode functionality for auto-replies"""
+    
+    def __init__(self, task, account_manager):
+        self.task = task
+        self.account_manager = account_manager
+        self.monitoring_tasks = {}  # {target_id: asyncio.Task}
+    
+    async def monitor_and_reply(self, client, entity, target_id, stop_event):
+        """Monitor for user replies and respond accordingly"""
+        try:
+            # Get initial message count
+            initial_messages = await client.get_messages(entity, limit=1)
+            last_message_id = initial_messages[0].id if initial_messages else 0
+            
+            start_time = datetime.utcnow()
+            timeout = timedelta(seconds=self.task.reply_timeout)
+            
+            while (datetime.utcnow() - start_time) < timeout:
+                if stop_event.is_set():
+                    logger.info(f"ReplyMode: Stop event detected for target {target_id}")
+                    break
+                
+                # Check for new messages
+                await asyncio.sleep(2)  # Check every 2 seconds
+                new_messages = await client.get_messages(entity, min_id=last_message_id, limit=10)
+                
+                for msg in reversed(new_messages):
+                    if msg.out:  # Skip our own messages
+                        continue
+                    
+                    # Check if message matches any keyword
+                    message_text = msg.message.lower() if msg.message else ""
+                    reply_sent = False
+                    
+                    for keyword, reply_text in self.task.reply_keywords.items():
+                        if keyword.lower() in message_text:
+                            await client.send_message(entity, reply_text)
+                            logger.info(f"ReplyMode: Sent keyword reply for '{keyword}' to target {target_id}")
+                            reply_sent = True
+                            break
+                    
+                    # Send default reply if no keyword matched
+                    if not reply_sent and self.task.reply_default:
+                        await client.send_message(entity, self.task.reply_default)
+                        logger.info(f"ReplyMode: Sent default reply to target {target_id}")
+                    
+                    last_message_id = msg.id
+            
+            logger.info(f"ReplyMode: Monitoring ended for target {target_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"ReplyMode: Error monitoring target {target_id}: {e}")
+            return False
+    
+    def start_monitoring(self, client, entity, target_id, stop_event):
+        """Start monitoring task in background"""
+        task = asyncio.create_task(self.monitor_and_reply(client, entity, target_id, stop_event))
+        self.monitoring_tasks[target_id] = task
+        return task
+    
+    async def stop_all_monitoring(self):
+        """Stop all monitoring tasks"""
+        for target_id, task in self.monitoring_tasks.items():
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self.monitoring_tasks.clear()
+
+
+# ============================================================================
 # 账户管理类
 # ============================================================================
 class AccountManager:
@@ -1572,6 +1681,31 @@ class TaskManager:
                 targets.append(line)
         return targets
     
+    async def check_phone_numbers(self, phone_numbers, account_id):
+        """Check if phone numbers are registered on Telegram"""
+        client = await self.account_manager.get_client(str(account_id))
+        
+        registered = []
+        unregistered = []
+        
+        for phone in phone_numbers:
+            try:
+                # Try to get entity by phone number
+                entity = await client.get_entity(phone)
+                registered.append(phone)
+                logger.info(f"Phone {phone} is registered on Telegram")
+            except Exception as e:
+                unregistered.append(phone)
+                logger.info(f"Phone {phone} is not registered: {e}")
+        
+        return {
+            'registered': registered,
+            'unregistered': unregistered,
+            'total': len(phone_numbers),
+            'registered_count': len(registered),
+            'unregistered_count': len(unregistered)
+        }
+    
     async def start_task(self, task_id):
         """Start task with dual stop mechanism"""
         task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
@@ -1922,7 +2056,7 @@ class TaskManager:
                     
                     # 发送消息
                     logger.info(f"账号 {account.phone} -> 用户 {target.username or target.user_id} ({target_idx + 1}/{len(targets)})")
-                    success = await self._send_message(task, target, account)
+                    success = await self._send_message_with_mode(task, target, account)
                     
                     if success:
                         self.tasks_col.update_one(
@@ -1984,6 +2118,12 @@ class TaskManager:
         for batch_idx, batch in enumerate(batches[:thread_count]):
             account = accounts[batch_idx % len(accounts)]
             logger.info(f"批次 {batch_idx + 1}: 分配账户 {account.phone}，处理 {len(batch)} 个目标")
+            
+            # Apply thread start interval (except for first batch)
+            if batch_idx > 0 and task.thread_start_interval > 0:
+                logger.info(f"批次 {batch_idx + 1}: 等待 {task.thread_start_interval} 秒后启动")
+                await asyncio.sleep(task.thread_start_interval)
+            
             concurrent_tasks.append(
                 self._process_batch_normal_mode(task_id, task, batch, accounts, batch_idx, stop_event)
             )
@@ -2059,7 +2199,7 @@ class TaskManager:
                 
                 # 发送消息
                 logger.info(f"[批次 {batch_idx}] 使用账户 {account.phone} 尝试发送")
-                success = await self._send_message(task, target, account)
+                success = await self._send_message_with_mode(task, target, account)
                 
                 if not success:
                     logger.warning(f"[批次 {batch_idx}] 账户 {account.phone} 发送失败，尝试下一个账户")
@@ -2080,6 +2220,17 @@ class TaskManager:
                         }
                     )
                     logger.info(f"[批次 {batch_idx}] ✅ 发送成功")
+                    
+                    # Batch pause mechanism (if configured)
+                    if task.batch_pause_count > 0:
+                        # Get current sent count
+                        task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+                        if task_doc:
+                            current_sent = task_doc.get('sent_count', 0)
+                            if current_sent > 0 and current_sent % task.batch_pause_count == 0:
+                                pause_delay = random.randint(task.batch_pause_min, task.batch_pause_max)
+                                logger.info(f"[批次 {batch_idx}] 🛑 批次停顿: 已发送 {current_sent} 条，停顿 {pause_delay} 秒")
+                                await asyncio.sleep(pause_delay)
                     
                     # 消息间隔
                     delay = random.randint(task.min_interval, task.max_interval)
@@ -2136,7 +2287,7 @@ class TaskManager:
             
             # 发送消息
             logger.info(f"[批次 {batch_idx}] 正在发送消息到目标: {target.username or target.user_id}")
-            success = await self._send_message(task, target, account)
+            success = await self._send_message_with_mode(task, target, account)
             
             if success:
                 # 更新成功计数
@@ -2537,7 +2688,51 @@ class TaskManager:
             # Remove from report_sent and increment retry count
             self.report_sent.discard(task_id)
             self.report_retry_count[task_id] = retry_count + 1
-            logger.info(f"任务 {task_id}: 报告发送失败，将在下次尝试 (剩余重试: {MAX_REPORT_RETRY_ATTEMPTS - self.report_retry_count[task_id]})")
+            logger.info(f"任务 {task_id}: 报告发送失败，将在下次尝试 (剩余重试: {Config.MAX_REPORT_RETRY_ATTEMPTS - self.report_retry_count[task_id]})")
+    
+    async def _send_with_voice_call(self, task, target, account):
+        """Send message with voice call"""
+        try:
+            client = await self.account_manager.get_client(str(account._id))
+            recipient = int(target.user_id) if target.user_id else target.username
+            
+            # Get entity
+            entity = await client.get_entity(recipient)
+            
+            # Make voice call
+            logger.info(f"VoiceCall: Initiating call to {recipient}")
+            try:
+                call = await client.call(entity, duration=task.voice_call_duration)
+                logger.info(f"VoiceCall: Call initiated successfully, waiting {task.voice_call_wait_after}s")
+                await asyncio.sleep(task.voice_call_wait_after)
+                
+                # Send message after call
+                return await self._send_message(task, target, account)
+                
+            except Exception as call_error:
+                logger.warning(f"VoiceCall: Failed to call {recipient}: {call_error}")
+                
+                # Send message anyway if configured
+                if task.voice_call_send_if_failed:
+                    logger.info(f"VoiceCall: Sending message despite call failure")
+                    return await self._send_message(task, target, account)
+                else:
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"VoiceCall: Error in voice call flow: {e}")
+            # Try to send message anyway
+            if task.voice_call_send_if_failed:
+                return await self._send_message(task, target, account)
+            return False
+    
+    async def _send_message_with_mode(self, task, target, account):
+        """Send message with appropriate mode (voice call, edit, reply, or normal)"""
+        # Check if voice call is enabled
+        if getattr(task, 'voice_call_enabled', False):
+            return await self._send_with_voice_call(task, target, account)
+        else:
+            return await self._send_message(task, target, account)
     
     async def _send_message(self, task, target, account):
         """发送消息 - 支持所有发送方式"""
@@ -2708,8 +2903,25 @@ class TaskManager:
                 )
             
             self._log_message(str(task._id), str(account._id), str(target._id), task.message_text, False, error_msg)
-            await asyncio.sleep(e.seconds)
-            return False
+            
+            # Handle FloodWait based on strategy
+            strategy = getattr(task, 'flood_wait_strategy', 'switch_account')
+            
+            if strategy == FloodWaitStrategy.STOP_TASK.value:
+                logger.warning(f"FloodWait strategy: Stopping task")
+                # Mark task as stopped
+                self.tasks_col.update_one(
+                    {'_id': task._id},
+                    {'$set': {'status': TaskStatus.STOPPED.value, 'updated_at': datetime.utcnow()}}
+                )
+                return False
+            elif strategy == FloodWaitStrategy.CONTINUE_WAIT.value:
+                logger.info(f"FloodWait strategy: Waiting {e.seconds} seconds")
+                await asyncio.sleep(e.seconds)
+                return False
+            else:  # SWITCH_ACCOUNT (default)
+                logger.info(f"FloodWait strategy: Switching account")
+                return False
             
         except PeerFloodError:
             error_msg = "PeerFlood"
@@ -2741,6 +2953,18 @@ class TaskManager:
             
         except Exception as e:
             error_msg = str(e)
+            error_lower = error_msg.lower()
+            
+            # Check for dead account indicators
+            if task.auto_switch_dead_account:
+                dead_keywords = ['banned', 'deleted', 'deactivated', 'terminated']
+                if any(keyword in error_lower for keyword in dead_keywords):
+                    logger.error(f"Dead account detected for {account.phone}: {error_msg}")
+                    self.db[Account.COLLECTION_NAME].update_one(
+                        {'_id': account._id},
+                        {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
+                    )
+            
             self.targets_col.update_one(
                 {'_id': target._id},
                 {'$set': {'error_message': error_msg}}
