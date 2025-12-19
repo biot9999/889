@@ -1762,6 +1762,30 @@ class AccountManager:
         self.clients[account_id_str] = client
         return client
     
+    def _update_account_status(self, account_id, phone, new_status, reason, verify=False):
+        """
+        Helper method to update account status with logging and optional verification.
+        
+        Args:
+            account_id: Account ID
+            phone: Phone number (for logging)
+            new_status: New status value (e.g., AccountStatus.ACTIVE.value)
+            reason: Reason for status change (for logging)
+            verify: Whether to verify the update (default: False for performance)
+        """
+        status_emoji = '✅' if new_status == AccountStatus.ACTIVE.value else '❌'
+        logger.info(f"{status_emoji} Account {phone}: {reason}, updating status to {new_status}")
+        
+        self.accounts_col.update_one(
+            {'_id': ObjectId(account_id)},
+            {'$set': {'status': new_status, 'updated_at': datetime.utcnow()}}
+        )
+        
+        # Optional verification (can be disabled for performance in production)
+        if verify or logger.isEnabledFor(logging.DEBUG):
+            updated_doc = self.accounts_col.find_one({'_id': ObjectId(account_id)})
+            logger.debug(f"{status_emoji} Database verified: {phone} status = {updated_doc['status']}")
+    
     async def check_account_status(self, account_id):
         """
         Check account status by attempting to connect and get user info.
@@ -1788,40 +1812,25 @@ class AccountManager:
             
             if me and me.id:
                 # ✅ SUCCESS: Account can be accessed → Mark as ACTIVE
-                logger.info(f"✅ Account {account.phone} is WORKING - user_id: {me.id}, marking as ACTIVE")
-                self.accounts_col.update_one(
-                    {'_id': ObjectId(account_id)},
-                    {'$set': {'status': AccountStatus.ACTIVE.value, 'updated_at': datetime.utcnow()}}
+                self._update_account_status(
+                    account_id, account.phone, AccountStatus.ACTIVE.value,
+                    f"get_me() succeeded (user_id: {me.id})", verify=True
                 )
-                
-                # Verify the update
-                updated_doc = self.accounts_col.find_one({'_id': ObjectId(account_id)})
-                logger.info(f"✅ Database updated: {account.phone} status = {updated_doc['status']}")
                 return True
             else:
                 # ❌ FAILURE: get_me() returned None → Mark as BANNED
-                logger.warning(f"❌ Account {account.phone} get_me() returned None, marking as BANNED")
-                self.accounts_col.update_one(
-                    {'_id': ObjectId(account_id)},
-                    {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
+                self._update_account_status(
+                    account_id, account.phone, AccountStatus.BANNED.value,
+                    "get_me() returned None", verify=True
                 )
-                
-                # Verify the update
-                updated_doc = self.accounts_col.find_one({'_id': ObjectId(account_id)})
-                logger.info(f"❌ Database updated: {account.phone} status = {updated_doc['status']}")
                 return False
                 
         except Exception as e:
             # ❌ EXCEPTION: Cannot access account → Mark as BANNED
-            logger.error(f"❌ Account {account.phone} check failed with error: {e}, marking as BANNED")
-            self.accounts_col.update_one(
-                {'_id': ObjectId(account_id)},
-                {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
+            self._update_account_status(
+                account_id, account.phone, AccountStatus.BANNED.value,
+                f"check failed with error: {e}", verify=True
             )
-            
-            # Verify the update
-            updated_doc = self.accounts_col.find_one({'_id': ObjectId(account_id)})
-            logger.info(f"❌ Database updated: {account.phone} status = {updated_doc['status']}")
             return False
     
     def get_active_accounts(self):
@@ -5099,9 +5108,10 @@ async def check_all_accounts_status(progress_callback=None):
                         {'$set': {'status': new_status, 'updated_at': datetime.utcnow()}}
                     )
                     
-                    # 验证更新
-                    updated_doc = db[Account.COLLECTION_NAME].find_one({'_id': account._id})
-                    logger.info(f"✅ Database verified: {account.phone} status = {updated_doc['status']}")
+                    # 验证更新 (only in debug mode for performance)
+                    if logger.isEnabledFor(logging.DEBUG):
+                        updated_doc = db[Account.COLLECTION_NAME].find_one({'_id': account._id})
+                        logger.debug(f"✅ Database verified: {account.phone} status = {updated_doc['status']}")
                 else:
                     # 没有收到回复，可能是无法对话
                     logger.warning(f"❌ Account {account.phone}: No response from @spambot, marking as BANNED")
@@ -5110,9 +5120,10 @@ async def check_all_accounts_status(progress_callback=None):
                         {'_id': account._id},
                         {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
                     )
-                    # 验证更新
-                    updated_doc = db[Account.COLLECTION_NAME].find_one({'_id': account._id})
-                    logger.info(f"❌ Database verified: {account.phone} status = {updated_doc['status']}")
+                    # 验证更新 (only in debug mode for performance)
+                    if logger.isEnabledFor(logging.DEBUG):
+                        updated_doc = db[Account.COLLECTION_NAME].find_one({'_id': account._id})
+                        logger.debug(f"❌ Database verified: {account.phone} status = {updated_doc['status']}")
                     
             except Exception as e:
                 # 无法连接或对话的账户认为是封禁/死亡账户
@@ -5122,9 +5133,10 @@ async def check_all_accounts_status(progress_callback=None):
                     {'_id': account._id},
                     {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
                 )
-                # 验证更新
-                updated_doc = db[Account.COLLECTION_NAME].find_one({'_id': account._id})
-                logger.info(f"❌ Database verified: {account.phone} status = {updated_doc['status']}")
+                # 验证更新 (only in debug mode for performance)
+                if logger.isEnabledFor(logging.DEBUG):
+                    updated_doc = db[Account.COLLECTION_NAME].find_one({'_id': account._id})
+                    logger.debug(f"❌ Database verified: {account.phone} status = {updated_doc['status']}")
             finally:
                 processed_count += 1
                 # Report progress every 5 accounts
