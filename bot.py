@@ -164,6 +164,14 @@ class Config:
 
 
 # ============================================================================
+# 常量定义
+# ============================================================================
+# Error message truncation lengths for target.last_error
+ERROR_MESSAGE_SHORT_LENGTH = 50  # For short error previews
+ERROR_MESSAGE_LONG_LENGTH = 100  # For detailed error messages
+
+
+# ============================================================================
 # 枚举类型
 # ============================================================================
 class AccountStatus(enum.Enum):
@@ -2701,18 +2709,22 @@ class TaskManager:
         """获取账号可用的目标列表（优先未尝试的）"""
         
         # 优先级1：从未被任何账号尝试过的目标
-        never_tried = [
-            t for t in targets 
-            if not t.is_sent and not getattr(t, 'failed_accounts', [])
-        ]
-        
+        never_tried = []
         # 优先级2：被其他账号失败但当前账号未尝试的目标
-        failed_by_others = [
-            t for t in targets
-            if not t.is_sent 
-            and getattr(t, 'failed_accounts', [])
-            and account_id not in getattr(t, 'failed_accounts', [])
-        ]
+        failed_by_others = []
+        
+        for t in targets:
+            if t.is_sent:
+                continue
+            
+            failed_accounts = getattr(t, 'failed_accounts', [])
+            
+            if not failed_accounts:
+                # 从未被任何账号尝试过
+                never_tried.append(t)
+            elif account_id not in failed_accounts:
+                # 其他账号失败但当前账号未尝试
+                failed_by_others.append(t)
         
         # 合并列表（优先级排序）
         available = never_tried + failed_by_others
@@ -2951,6 +2963,7 @@ class TaskManager:
     async def export_failed_targets_csv(self, task_id):
         """导出失败用户列表为CSV"""
         import io
+        import csv
         
         failed_targets = list(self.targets_col.find({
             'task_id': str(task_id),
@@ -2961,9 +2974,14 @@ class TaskManager:
         if not failed_targets:
             return None
         
-        # 生成CSV内容
-        csv_content = "用户名,用户ID,失败原因,尝试次数,失败账号数\n"
+        # 使用StringIO和CSV writer来正确处理转义
+        output = io.StringIO()
+        writer = csv.writer(output)
         
+        # 写入标题
+        writer.writerow(['用户名', '用户ID', '失败原因', '尝试次数', '失败账号数'])
+        
+        # 写入数据
         for target in failed_targets:
             username = target.get('username', '')
             user_id = target.get('user_id', '')
@@ -2971,13 +2989,10 @@ class TaskManager:
             retry_count = target.get('retry_count', 0)
             failed_accounts_count = len(target.get('failed_accounts', []))
             
-            # Escape commas in fields
-            username = username.replace(',', '，')
-            last_error = last_error.replace(',', '，')
-            
-            csv_content += f"{username},{user_id},{last_error},{retry_count},{failed_accounts_count}\n"
+            writer.writerow([username, user_id, last_error, retry_count, failed_accounts_count])
         
         # 创建文件对象
+        csv_content = output.getvalue()
         file = io.BytesIO(csv_content.encode('utf-8-sig'))
         file.name = f"failed_targets_{task_id}.csv"
         
@@ -3355,9 +3370,9 @@ class TaskManager:
                 
                 # Set target.last_error
                 if "No user has" in error_msg or "user not found" in error_msg.lower():
-                    target.last_error = f"用户不存在: {error_msg[:50]}"
+                    target.last_error = f"用户不存在: {error_msg[:ERROR_MESSAGE_SHORT_LENGTH]}"
                 else:
-                    target.last_error = f"无法获取用户信息: {error_msg[:100]}"
+                    target.last_error = f"无法获取用户信息: {error_msg[:ERROR_MESSAGE_LONG_LENGTH]}"
                 
                 self.targets_col.update_one(
                     {'_id': target._id},
@@ -3577,11 +3592,11 @@ class TaskManager:
             
             # Set target.last_error based on error message
             if "No user has" in error_msg or "user not found" in error_lower:
-                target.last_error = f"用户不存在: {error_msg[:50]}"
+                target.last_error = f"用户不存在: {error_msg[:ERROR_MESSAGE_SHORT_LENGTH]}"
             elif "ALLOW_PAYMENT_REQUIRED" in error_msg:
                 target.last_error = "双向限制（需先添加好友）"
             else:
-                target.last_error = f"其他错误：{error_msg[:100]}"
+                target.last_error = f"其他错误：{error_msg[:ERROR_MESSAGE_LONG_LENGTH]}"
             
             # Check for dead account indicators
             if task.auto_switch_dead_account:
