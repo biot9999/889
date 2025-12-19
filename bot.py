@@ -167,8 +167,12 @@ class Config:
 # 常量定义
 # ============================================================================
 # Error message truncation lengths for target.last_error
-ERROR_MESSAGE_SHORT_LENGTH = 50  # For short error previews
-ERROR_MESSAGE_LONG_LENGTH = 100  # For detailed error messages
+ERROR_MESSAGE_SHORT_LENGTH = 50  # For short error previews (e.g., user not found errors)
+ERROR_MESSAGE_LONG_LENGTH = 100  # For detailed error messages (e.g., full exception text)
+
+# Default values for force send mode
+DEFAULT_CONSECUTIVE_FAILURE_LIMIT = 30  # Default consecutive failures before switching account
+DEFAULT_ERROR_MESSAGE = "未知错误"  # Default error message when error is not set
 
 
 # ============================================================================
@@ -2540,7 +2544,7 @@ class TaskManager:
     async def _execute_force_send_mode(self, task_id, task, targets, accounts, stop_event):
         """执行强制私信模式：连续失败计数，达到上限后停用账号并切换"""
         # 使用 ignore_bidirectional_limit 作为连续失败上限
-        consecutive_limit = task.ignore_bidirectional_limit if task.ignore_bidirectional_limit > 0 else 30
+        consecutive_limit = task.ignore_bidirectional_limit if task.ignore_bidirectional_limit > 0 else DEFAULT_CONSECUTIVE_FAILURE_LIMIT
         
         logger.info("=" * 80)
         logger.info("执行模式：强制私信模式")
@@ -2656,7 +2660,7 @@ class TaskManager:
                         {
                             '$addToSet': {'failed_accounts': str(account._id)},
                             '$set': {
-                                'last_error': getattr(target, 'last_error', 'Unknown error'),
+                                'last_error': getattr(target, 'last_error', DEFAULT_ERROR_MESSAGE),
                                 'last_account_id': str(account._id),
                                 'updated_at': datetime.utcnow()
                             },
@@ -2933,7 +2937,7 @@ class TaskManager:
         # 按失败原因分类
         failed_by_reason = {}
         for target in failed_targets:
-            reason = target.get('last_error', '未知错误')
+            reason = target.get('last_error', DEFAULT_ERROR_MESSAGE)
             if reason not in failed_by_reason:
                 failed_by_reason[reason] = []
             failed_by_reason[reason].append(target)
@@ -2985,13 +2989,13 @@ class TaskManager:
         for target in failed_targets:
             username = target.get('username', '')
             user_id = target.get('user_id', '')
-            last_error = target.get('last_error', '未知')
+            last_error = target.get('last_error', DEFAULT_ERROR_MESSAGE)
             retry_count = target.get('retry_count', 0)
             failed_accounts_count = len(target.get('failed_accounts', []))
             
             writer.writerow([username, user_id, last_error, retry_count, failed_accounts_count])
         
-        # 创建文件对象
+        # 创建文件对象 (using utf-8-sig encoding for Excel compatibility - adds BOM)
         csv_content = output.getvalue()
         file = io.BytesIO(csv_content.encode('utf-8-sig'))
         file.name = f"failed_targets_{task_id}.csv"
