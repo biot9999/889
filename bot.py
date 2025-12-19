@@ -164,6 +164,18 @@ class Config:
 
 
 # ============================================================================
+# 常量定义
+# ============================================================================
+# Error message truncation lengths for target.last_error
+ERROR_MESSAGE_SHORT_LENGTH = 50  # For short error previews (e.g., user not found errors)
+ERROR_MESSAGE_LONG_LENGTH = 100  # For detailed error messages (e.g., full exception text)
+
+# Default values for force send mode
+DEFAULT_CONSECUTIVE_FAILURE_LIMIT = 30  # Default consecutive failures before switching account
+DEFAULT_ERROR_MESSAGE = "未知错误"  # Default error message when error is not set
+
+
+# ============================================================================
 # 枚举类型
 # ============================================================================
 class AccountStatus(enum.Enum):
@@ -718,7 +730,9 @@ class Target:
     
     def __init__(self, task_id, username=None, user_id=None, first_name=None,
                  last_name=None, is_sent=False, is_valid=True, error_message=None,
-                 created_at=None, sent_at=None, _id=None):
+                 created_at=None, sent_at=None, _id=None,
+                 failed_accounts=None, last_error=None, retry_count=0, 
+                 last_account_id=None, updated_at=None):
         self._id = _id
         self.task_id = task_id
         self.username = username
@@ -730,6 +744,12 @@ class Target:
         self.error_message = error_message
         self.created_at = created_at or datetime.utcnow()
         self.sent_at = sent_at
+        # New fields for force send mode
+        self.failed_accounts = failed_accounts or []
+        self.last_error = last_error
+        self.retry_count = retry_count
+        self.last_account_id = last_account_id
+        self.updated_at = updated_at or datetime.utcnow()
     
     def to_dict(self):
         """Convert to dictionary for MongoDB"""
@@ -743,7 +763,12 @@ class Target:
             'is_valid': self.is_valid,
             'error_message': self.error_message,
             'created_at': self.created_at,
-            'sent_at': self.sent_at
+            'sent_at': self.sent_at,
+            'failed_accounts': self.failed_accounts,
+            'last_error': self.last_error,
+            'retry_count': self.retry_count,
+            'last_account_id': self.last_account_id,
+            'updated_at': self.updated_at
         }
         if self._id:
             doc['_id'] = self._id
@@ -765,7 +790,12 @@ class Target:
             error_message=doc.get('error_message'),
             created_at=doc.get('created_at'),
             sent_at=doc.get('sent_at'),
-            _id=doc.get('_id')
+            _id=doc.get('_id'),
+            failed_accounts=doc.get('failed_accounts', []),
+            last_error=doc.get('last_error'),
+            retry_count=doc.get('retry_count', 0),
+            last_account_id=doc.get('last_account_id'),
+            updated_at=doc.get('updated_at')
         )
 
 
@@ -2147,10 +2177,15 @@ class TaskManager:
                     stats_text = "\n".join([f"  • {status}: {count}" for status, count in status_stats.items()])
                     raise ValueError(f"❌ 没有可用的活跃账户！\n\n账户状态统计：\n{stats_text}\n\n请检查账户状态或添加新账户。")
             
-            # 根据重复发送模式选择不同的执行逻辑
-            if task.repeat_send:
+            # 根据任务模式选择不同的执行逻辑
+            if task.force_private_mode:
+                # 强制私信模式：连续失败计数
+                await self._execute_force_send_mode(task_id, task, targets, accounts, stop_event)
+            elif task.repeat_send:
+                # 重复发送模式：所有账号轮流给所有用户发送
                 await self._execute_repeat_send_mode(task_id, task, targets, accounts, stop_event)
             else:
+                # 正常模式：每个用户按顺序尝试账号
                 await self._execute_normal_mode(task_id, task, targets, accounts, stop_event)
             
             # Check if stopped before generating report
@@ -2506,6 +2541,207 @@ class TaskManager:
         
         logger.info(f"[批次 {batch_idx}] 批次处理完成")
     
+    async def _execute_force_send_mode(self, task_id, task, targets, accounts, stop_event):
+        """执行强制私信模式：连续失败计数，达到上限后停用账号并切换"""
+        # 使用 ignore_bidirectional_limit 作为连续失败上限
+        consecutive_limit = task.ignore_bidirectional_limit if task.ignore_bidirectional_limit > 0 else DEFAULT_CONSECUTIVE_FAILURE_LIMIT
+        
+        logger.info("=" * 80)
+        logger.info("执行模式：强制私信模式")
+        logger.info(f"目标用户数: {len(targets)}")
+        logger.info(f"可用账号数: {len(accounts)}")
+        logger.info(f"连续失败上限: {consecutive_limit}次")
+        logger.info("=" * 80)
+        
+        for account_idx, account in enumerate(accounts):
+            # Check stop event
+            if stop_event.is_set():
+                logger.info(f"Task {task_id}: Stop signal received")
+                break
+            
+            # Check database status
+            task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+            if task_doc:
+                task_status = Task.from_dict(task_doc).status
+                if task_status != TaskStatus.RUNNING.value:
+                    logger.info(f"Task {task_id}: Status is {task_status}, not RUNNING")
+                    break
+            
+            consecutive_failures = 0  # 连续失败计数器
+            
+            logger.info(f"📱 账号 {account.phone} ({account_idx + 1}/{len(accounts)}) 开始工作")
+            
+            # 获取该账号应该发送的目标列表
+            available_targets = self._get_available_targets_for_account(
+                task_id,
+                str(account._id),
+                targets
+            )
+            
+            if not available_targets:
+                logger.info(f"账号 {account.phone} 没有可用目标，跳过")
+                continue
+            
+            logger.info(f"账号 {account.phone} 有 {len(available_targets)} 个可用目标")
+            
+            for idx, target in enumerate(available_targets):
+                # Check stop signal
+                if stop_event.is_set():
+                    logger.info(f"账号 {account.phone}: Stop signal detected")
+                    break
+                
+                # Check daily limit
+                account_doc = self.db[Account.COLLECTION_NAME].find_one({'_id': account._id})
+                if account_doc:
+                    account = Account.from_dict(account_doc)
+                    if account.messages_sent_today >= account.daily_limit:
+                        logger.warning(f"账号 {account.phone} 达到每日限额")
+                        break
+                    
+                    # Reset daily counter if needed
+                    if account.last_used and account.last_used.date() < datetime.utcnow().date():
+                        self.db[Account.COLLECTION_NAME].update_one(
+                            {'_id': account._id},
+                            {'$set': {'messages_sent_today': 0, 'updated_at': datetime.utcnow()}}
+                        )
+                        account.messages_sent_today = 0
+                
+                # 发送消息
+                logger.info(f"[{idx+1}/{len(available_targets)}] 账号 {account.phone} -> {target.username or target.user_id}")
+                success = await self._send_message_with_stop_check(task, target, account, stop_event)
+                
+                if success:
+                    # ✅ 成功 → 计数器归零
+                    consecutive_failures = 0
+                    logger.info(
+                        f"✅ [{idx+1}/{len(available_targets)}] "
+                        f"账号 {account.phone} 成功发送给 {target.username or target.user_id}，"
+                        f"连续失败计数归零"
+                    )
+                    
+                    # 更新目标状态
+                    self.targets_col.update_one(
+                        {'_id': target._id},
+                        {'$set': {
+                            'is_sent': True,
+                            'sent_at': datetime.utcnow(),
+                            'last_account_id': str(account._id),
+                            'updated_at': datetime.utcnow()
+                        }}
+                    )
+                    
+                    # 更新任务计数
+                    self.tasks_col.update_one(
+                        {'_id': ObjectId(task_id)},
+                        {'$inc': {'sent_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                    )
+                    
+                    # 更新账号统计
+                    self.db[Account.COLLECTION_NAME].update_one(
+                        {'_id': account._id},
+                        {
+                            '$inc': {'messages_sent_today': 1, 'total_messages_sent': 1},
+                            '$set': {'last_used': datetime.utcnow(), 'updated_at': datetime.utcnow()}
+                        }
+                    )
+                    
+                else:
+                    # ❌ 失败 → 计数器+1
+                    consecutive_failures += 1
+                    logger.warning(
+                        f"❌ [{idx+1}/{len(available_targets)}] "
+                        f"账号 {account.phone} 发送失败给 {target.username or target.user_id}，"
+                        f"连续失败: {consecutive_failures}/{consecutive_limit}"
+                    )
+                    
+                    # 更新目标失败记录
+                    self.targets_col.update_one(
+                        {'_id': target._id},
+                        {
+                            '$addToSet': {'failed_accounts': str(account._id)},
+                            '$set': {
+                                'last_error': getattr(target, 'last_error', DEFAULT_ERROR_MESSAGE),
+                                'last_account_id': str(account._id),
+                                'updated_at': datetime.utcnow()
+                            },
+                            '$inc': {'retry_count': 1}
+                        }
+                    )
+                    
+                    # 更新任务失败计数
+                    self.tasks_col.update_one(
+                        {'_id': ObjectId(task_id)},
+                        {'$inc': {'failed_count': 1}, '$set': {'updated_at': datetime.utcnow()}}
+                    )
+                    
+                    # 检查是否达到连续失败上限
+                    if consecutive_failures >= consecutive_limit:
+                        logger.error(
+                            f"🛑 账号 {account.phone} 连续失败 {consecutive_failures} 次，停用该账号"
+                        )
+                        
+                        # 标记账号为受限
+                        self.db[Account.COLLECTION_NAME].update_one(
+                            {'_id': account._id},
+                            {'$set': {
+                                'status': AccountStatus.LIMITED.value,
+                                'updated_at': datetime.utcnow()
+                            }}
+                        )
+                        
+                        break  # 跳出内层循环，换下一个账号
+                
+                # 消息间隔
+                delay = random.randint(task.min_interval, task.max_interval)
+                interrupted = await self._sleep_with_stop_check(delay, stop_event, task_id)
+                if interrupted:
+                    logger.info(f"账号 {account.phone}: Stop signal during interval")
+                    break
+            
+            # 如果账号正常结束（没有达到连续失败上限）
+            if consecutive_failures < consecutive_limit:
+                logger.info(f"✅ 账号 {account.phone} 正常完成工作")
+            
+            # Check stop signal before next account
+            if stop_event.is_set():
+                logger.info(f"Task {task_id}: Stop signal before next account")
+                break
+        
+        logger.info(f"Task {task_id}: Force send mode completed")
+    
+    def _get_available_targets_for_account(self, task_id, account_id, targets):
+        """获取账号可用的目标列表（优先未尝试的）"""
+        
+        # 优先级1：从未被任何账号尝试过的目标
+        never_tried = []
+        # 优先级2：被其他账号失败但当前账号未尝试的目标
+        failed_by_others = []
+        
+        for t in targets:
+            if t.is_sent:
+                continue
+            
+            failed_accounts = getattr(t, 'failed_accounts', [])
+            
+            if not failed_accounts:
+                # 从未被任何账号尝试过
+                never_tried.append(t)
+            elif account_id not in failed_accounts:
+                # 其他账号失败但当前账号未尝试
+                failed_by_others.append(t)
+        
+        # 合并列表（优先级排序）
+        available = never_tried + failed_by_others
+        
+        logger.info(
+            f"账号 {account_id[-8:]} 可用目标分布：\n"
+            f"  - 从未尝试: {len(never_tried)}\n"
+            f"  - 其他账号失败: {len(failed_by_others)}\n"
+            f"  - 总计: {len(available)}"
+        )
+        
+        return available
+    
     async def _process_batch(self, task_id, task, targets, account, batch_idx):
         """处理一批目标 - 使用单个账户"""
         logger.info(f"[批次 {batch_idx}] 开始处理 {len(targets)} 个目标，使用账户: {account.phone}")
@@ -2684,6 +2920,87 @@ class TaskManager:
         }
         
         return False
+    
+    async def generate_failed_targets_report(self, task_id):
+        """生成失败用户报告（按失败原因分类）"""
+        
+        # 查询所有失败的目标（有重试但未成功）
+        failed_targets = list(self.targets_col.find({
+            'task_id': str(task_id),
+            'is_sent': False,
+            'retry_count': {'$gt': 0}  # 至少被尝试过一次
+        }))
+        
+        if not failed_targets:
+            return "✅ 没有失败的用户"
+        
+        # 按失败原因分类
+        failed_by_reason = {}
+        for target in failed_targets:
+            reason = target.get('last_error', DEFAULT_ERROR_MESSAGE)
+            if reason not in failed_by_reason:
+                failed_by_reason[reason] = []
+            failed_by_reason[reason].append(target)
+        
+        # 生成报告
+        report_lines = [
+            f"❌ <b>失败用户报告</b>",
+            f"",
+            f"总计失败: {len(failed_targets)} 个用户",
+            f""
+        ]
+        
+        for reason, targets_list in failed_by_reason.items():
+            report_lines.append(f"<b>{reason}</b>: {len(targets_list)}个")
+            
+            # 列出用户名（最多显示5个）
+            usernames = [t.get('username', t.get('user_id', 'Unknown')) for t in targets_list[:5]]
+            report_lines.append(f"  用户: {', '.join(usernames)}")
+            
+            if len(targets_list) > 5:
+                report_lines.append(f"  ... 还有 {len(targets_list) - 5} 个")
+            
+            report_lines.append("")
+        
+        return "\n".join(report_lines)
+    
+    async def export_failed_targets_csv(self, task_id):
+        """导出失败用户列表为CSV"""
+        import io
+        import csv
+        
+        failed_targets = list(self.targets_col.find({
+            'task_id': str(task_id),
+            'is_sent': False,
+            'retry_count': {'$gt': 0}
+        }))
+        
+        if not failed_targets:
+            return None
+        
+        # 使用StringIO和CSV writer来正确处理转义
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # 写入标题
+        writer.writerow(['用户名', '用户ID', '失败原因', '尝试次数', '失败账号数'])
+        
+        # 写入数据
+        for target in failed_targets:
+            username = target.get('username', '')
+            user_id = target.get('user_id', '')
+            last_error = target.get('last_error', DEFAULT_ERROR_MESSAGE)
+            retry_count = target.get('retry_count', 0)
+            failed_accounts_count = len(target.get('failed_accounts', []))
+            
+            writer.writerow([username, user_id, last_error, retry_count, failed_accounts_count])
+        
+        # 创建文件对象 (using utf-8-sig encoding for Excel compatibility - adds BOM)
+        csv_content = output.getvalue()
+        file = io.BytesIO(csv_content.encode('utf-8-sig'))
+        file.name = f"failed_targets_{task_id}.csv"
+        
+        return file
     
     async def _send_completion_reports(self, task_id):
         """生成并自动发送完成报告 - 任务完成后自动执行，防止重复发送"""
@@ -2948,6 +3265,26 @@ class TaskManager:
                     except Exception as e:
                         logger.error(f"发送文件失败 {filename}: {e}")
                 
+                # 发送失败用户报告（如果启用了强制私信模式）
+                task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+                if task_doc:
+                    task = Task.from_dict(task_doc)
+                    if task.force_private_mode:
+                        try:
+                            # 导出失败用户CSV
+                            logger.info("导出失败用户CSV...")
+                            csv_file = await self.export_failed_targets_csv(task_id)
+                            if csv_file:
+                                await self.bot_application.bot.send_document(
+                                    chat_id=Config.ADMIN_USER_ID,
+                                    document=csv_file,
+                                    caption=f"📄 失败用户列表详情",
+                                    filename=csv_file.name
+                                )
+                                logger.info("失败用户CSV已发送")
+                        except Exception as e:
+                            logger.error(f"发送失败报告出错: {e}")
+                
                 logger.info("========================================")
                 logger.info("所有报告文件已发送完成")
                 logger.info("========================================")
@@ -3022,7 +3359,15 @@ class TaskManager:
                 entity = await client.get_entity(recipient)
                 logger.info(f"用户实体获取成功")
             except Exception as e:
+                error_msg = str(e)
                 logger.error(f"获取用户实体失败 {recipient}: {e}")
+                
+                # Set target.last_error
+                if "No user has" in error_msg or "user not found" in error_msg.lower():
+                    target.last_error = f"用户不存在: {error_msg[:ERROR_MESSAGE_SHORT_LENGTH]}"
+                else:
+                    target.last_error = f"无法获取用户信息: {error_msg[:ERROR_MESSAGE_LONG_LENGTH]}"
+                
                 self.targets_col.update_one(
                     {'_id': target._id},
                     {'$set': {'is_valid': False, 'error_message': str(e)}}
@@ -3141,6 +3486,17 @@ class TaskManager:
             
         except (UserPrivacyRestrictedError, UserIsBlockedError, ChatWriteForbiddenError, UserNotMutualContactError) as e:
             error_msg = f"Privacy error: {type(e).__name__}"
+            if isinstance(e, UserIsBlockedError):
+                target.last_error = "账户被封禁"
+            elif isinstance(e, ChatWriteForbiddenError):
+                target.last_error = "账户隐私限制（对方设置了隐私保护）"
+            elif isinstance(e, UserPrivacyRestrictedError):
+                target.last_error = "双向限制（需先添加好友）"
+            elif isinstance(e, UserNotMutualContactError):
+                target.last_error = "双向限制（需先添加好友）"
+            else:
+                target.last_error = error_msg
+            
             self.targets_col.update_one(
                 {'_id': target._id},
                 {'$set': {'error_message': error_msg}}
@@ -3150,6 +3506,7 @@ class TaskManager:
             
         except FloodWaitError as e:
             error_msg = f"FloodWait: {e.seconds}s"
+            target.last_error = f"账户已被限流（需等待{e.seconds}秒）"
             logger.warning(f"Account {account.phone} hit FloodWait, checking real status...")
             
             # 实时检查账户状态
@@ -3196,6 +3553,7 @@ class TaskManager:
             
         except PeerFloodError:
             error_msg = "PeerFlood"
+            target.last_error = "账户已被限流（对方无法接收消息）"
             logger.warning(f"Account {account.phone} hit PeerFlood, checking real status...")
             
             # 实时检查账户状态
@@ -3225,6 +3583,14 @@ class TaskManager:
         except Exception as e:
             error_msg = str(e)
             error_lower = error_msg.lower()
+            
+            # Set target.last_error based on error message
+            if "No user has" in error_msg or "user not found" in error_lower:
+                target.last_error = f"用户不存在: {error_msg[:ERROR_MESSAGE_SHORT_LENGTH]}"
+            elif "ALLOW_PAYMENT_REQUIRED" in error_msg:
+                target.last_error = "双向限制（需先添加好友）"
+            else:
+                target.last_error = f"其他错误：{error_msg[:ERROR_MESSAGE_LONG_LENGTH]}"
             
             # Check for dead account indicators
             if task.auto_switch_dead_account:
@@ -4118,6 +4484,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await toggle_task_config(query, task_id, toggle_type)
     
     # New configuration handlers
+    elif data.startswith('cfg_thread_') and not data.startswith('cfg_thread_interval_'):
+        await request_thread_config(update, context)
+    elif data.startswith('cfg_interval_'):
+        await request_interval_config(update, context)
+    elif data.startswith('cfg_bidirect_'):
+        await request_bidirect_config(update, context)
+    elif data.startswith('cfg_daily_limit_'):
+        await request_daily_limit_config(update, context)
+    elif data.startswith('cfg_retry_'):
+        await request_retry_config(update, context)
     elif data.startswith('cfg_edit_mode_'):
         await request_edit_mode_config(update, context)
     elif data.startswith('set_mode_'):
@@ -4978,7 +5354,9 @@ async def show_task_detail(query, task_id):
             f"  • 线程数: {task.thread_count}\n"
             f"  • 间隔: {task.min_interval}-{task.max_interval}秒\n"
             f"  • 日限: {task.daily_limit}条/账号\n"
+            f"  • 无视双向: {task.ignore_bidirectional_limit}次\n"
             f"  • 重复发送: {'✔️' if task.repeat_send else '❌'}\n"
+            f"  • 强制私信模式: {'✔️' if task.force_private_mode else '❌'}\n"
             f"  • 置顶消息: {'✔️' if task.pin_message else '❌'}\n"
             f"  • 删除对话: {'✔️' if task.delete_dialog else '❌'}\n"
         )
@@ -5006,6 +5384,31 @@ async def show_task_detail(query, task_id):
             InlineKeyboardButton("🔄 刷新进度", callback_data=f'task_detail_{task_id}'),
             InlineKeyboardButton("⏸️ 停止任务", callback_data=f'task_stop_{task_id}')
         ])
+        
+        # Start auto-refresh for running tasks if not already running
+        if not hasattr(task_manager, 'refresh_tasks'):
+            task_manager.refresh_tasks = {}
+        
+        # Only start auto-refresh if not already running for this task
+        if task_id not in task_manager.refresh_tasks or task_manager.refresh_tasks[task_id].done():
+            async def auto_refresh_wrapper():
+                try:
+                    # Wait a moment before starting refresh
+                    await asyncio.sleep(2)
+                    await auto_refresh_task_progress(
+                        query.bot,
+                        query.message.chat_id,
+                        query.message.message_id,
+                        task_id
+                    )
+                except asyncio.CancelledError:
+                    logger.info(f"Auto-refresh task for task {task_id} was cancelled")
+                except Exception as e:
+                    logger.error(f"Auto-refresh error for task {task_id}: {e}", exc_info=True)
+            
+            refresh_task = asyncio.create_task(auto_refresh_wrapper())
+            task_manager.refresh_tasks[task_id] = refresh_task
+            logger.info(f"Started auto-refresh for running task {task_id}")
     
     # Export button for completed tasks
     if task.status == TaskStatus.COMPLETED.value:
