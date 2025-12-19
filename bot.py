@@ -7813,10 +7813,10 @@ def main():
     logger.info("Registering task configuration conversation handler...")
     config_conv = ConversationHandler(
         entry_points=[
+            CallbackQueryHandler(request_thread_interval_config, pattern='^cfg_thread_interval_'),
             CallbackQueryHandler(request_thread_config, pattern='^cfg_thread_'),
             CallbackQueryHandler(request_interval_config, pattern='^cfg_interval_'),
             CallbackQueryHandler(request_bidirect_config, pattern='^cfg_bidirect_'),
-            CallbackQueryHandler(request_thread_interval_config, pattern='^cfg_thread_interval_'),
             CallbackQueryHandler(request_daily_limit_config, pattern='^cfg_daily_limit_'),
             CallbackQueryHandler(request_retry_config, pattern='^cfg_retry_'),
             CallbackQueryHandler(request_reply_mode_config, pattern='^cfg_reply_mode_')
