@@ -6375,7 +6375,35 @@ async def handle_daily_limit_config(update: Update, context: ContextTypes.DEFAUL
         return ConversationHandler.END
         
     except ValueError:
-        await update.message.reply_text("❌ 请输入有效的数字（1-200）：")
+        retry_count = context.user_data.get('retry_count', 0) + 1
+        context.user_data['retry_count'] = retry_count
+        
+        if retry_count >= 3:
+            msg = await update.message.reply_text(
+                "❌ <b>输入错误次数过多</b>\n\n"
+                "已自动取消配置，请重新开始",
+                parse_mode='HTML'
+            )
+            await asyncio.sleep(2)
+            try:
+                await msg.delete()
+                await update.message.delete()
+                if 'config_prompt_msg_id' in context.user_data:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=context.user_data['config_prompt_msg_id']
+                    )
+            except Exception:
+                pass
+            context.user_data.clear()
+            return ConversationHandler.END
+        
+        await update.message.reply_text(
+            f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+            f"请输入有效的数字（1-200）\n"
+            f"还剩 {3 - retry_count} 次尝试机会",
+            parse_mode='HTML'
+        )
         return CONFIG_DAILY_LIMIT_INPUT
 
 
@@ -6425,25 +6453,109 @@ async def handle_retry_config(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         parts = update.message.text.strip().split()
         if len(parts) != 2:
-            await update.message.reply_text("❌ 格式错误，请输入两个数字（重试次数 间隔时间）：")
+            retry_count = context.user_data.get('retry_count', 0) + 1
+            context.user_data['retry_count'] = retry_count
+            
+            if retry_count >= 3:
+                msg = await update.message.reply_text(
+                    "❌ <b>输入错误次数过多</b>\n\n"
+                    "已自动取消配置，请重新开始",
+                    parse_mode='HTML'
+                )
+                await asyncio.sleep(2)
+                try:
+                    await msg.delete()
+                    await update.message.delete()
+                    if 'config_prompt_msg_id' in context.user_data:
+                        await context.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=context.user_data['config_prompt_msg_id']
+                        )
+                except Exception:
+                    pass
+                context.user_data.clear()
+                return ConversationHandler.END
+            
+            await update.message.reply_text(
+                f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+                f"请输入两个数字（重试次数 间隔时间）\n"
+                f"还剩 {3 - retry_count} 次尝试机会",
+                parse_mode='HTML'
+            )
             return CONFIG_RETRY_INPUT
         
-        retry_count = int(parts[0])
+        retry_count_val = int(parts[0])
         retry_interval = int(parts[1])
         
-        if retry_count < 0 or retry_count > 10:
-            await update.message.reply_text("❌ 重试次数必须在 0-10 之间，请重新输入：")
+        if retry_count_val < 0 or retry_count_val > 10:
+            retry_count = context.user_data.get('retry_count', 0) + 1
+            context.user_data['retry_count'] = retry_count
+            
+            if retry_count >= 3:
+                msg = await update.message.reply_text(
+                    "❌ <b>输入错误次数过多</b>\n\n"
+                    "已自动取消配置，请重新开始",
+                    parse_mode='HTML'
+                )
+                await asyncio.sleep(2)
+                try:
+                    await msg.delete()
+                    await update.message.delete()
+                    if 'config_prompt_msg_id' in context.user_data:
+                        await context.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=context.user_data['config_prompt_msg_id']
+                        )
+                except Exception:
+                    pass
+                context.user_data.clear()
+                return ConversationHandler.END
+            
+            await update.message.reply_text(
+                f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+                f"重试次数必须在 0-10 之间\n"
+                f"还剩 {3 - retry_count} 次尝试机会",
+                parse_mode='HTML'
+            )
             return CONFIG_RETRY_INPUT
         
         if retry_interval < 10 or retry_interval > 300:
-            await update.message.reply_text("❌ 间隔时间必须在 10-300秒 之间，请重新输入：")
+            retry_count = context.user_data.get('retry_count', 0) + 1
+            context.user_data['retry_count'] = retry_count
+            
+            if retry_count >= 3:
+                msg = await update.message.reply_text(
+                    "❌ <b>输入错误次数过多</b>\n\n"
+                    "已自动取消配置，请重新开始",
+                    parse_mode='HTML'
+                )
+                await asyncio.sleep(2)
+                try:
+                    await msg.delete()
+                    await update.message.delete()
+                    if 'config_prompt_msg_id' in context.user_data:
+                        await context.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=context.user_data['config_prompt_msg_id']
+                        )
+                except Exception:
+                    pass
+                context.user_data.clear()
+                return ConversationHandler.END
+            
+            await update.message.reply_text(
+                f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+                f"间隔时间必须在 10-300秒 之间\n"
+                f"还剩 {3 - retry_count} 次尝试机会",
+                parse_mode='HTML'
+            )
             return CONFIG_RETRY_INPUT
         
         # Update database
         result = db[Task.COLLECTION_NAME].update_one(
             {'_id': ObjectId(task_id)},
             {'$set': {
-                'retry_count': retry_count,
+                'retry_count': retry_count_val,
                 'retry_interval': retry_interval,
                 'updated_at': datetime.utcnow()
             }}
@@ -6451,13 +6563,13 @@ async def handle_retry_config(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         # Verify update
         if result.modified_count > 0:
-            logger.info(f"Task {task_id}: Retry config updated to {retry_count} times, {retry_interval}s interval")
+            logger.info(f"Task {task_id}: Retry config updated to {retry_count_val} times, {retry_interval}s interval")
             msg = await update.message.reply_text(
-                f"✅ 重试策略已设置为：{retry_count}次，间隔{retry_interval}秒"
+                f"✅ 重试策略已设置为：{retry_count_val}次，间隔{retry_interval}秒"
             )
         else:
             msg = await update.message.reply_text(
-                f"✅ 重试策略已设置为：{retry_count}次，间隔{retry_interval}秒（值未变更）"
+                f"✅ 重试策略已设置为：{retry_count_val}次，间隔{retry_interval}秒（值未变更）"
             )
         
         # Auto-cleanup
@@ -6476,7 +6588,35 @@ async def handle_retry_config(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
         
     except ValueError:
-        await update.message.reply_text("❌ 请输入有效的数字：")
+        retry_count = context.user_data.get('retry_count', 0) + 1
+        context.user_data['retry_count'] = retry_count
+        
+        if retry_count >= 3:
+            msg = await update.message.reply_text(
+                "❌ <b>输入错误次数过多</b>\n\n"
+                "已自动取消配置，请重新开始",
+                parse_mode='HTML'
+            )
+            await asyncio.sleep(2)
+            try:
+                await msg.delete()
+                await update.message.delete()
+                if 'config_prompt_msg_id' in context.user_data:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=context.user_data['config_prompt_msg_id']
+                    )
+            except Exception:
+                pass
+            context.user_data.clear()
+            return ConversationHandler.END
+        
+        await update.message.reply_text(
+            f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+            f"请输入有效的数字\n"
+            f"还剩 {3 - retry_count} 次尝试机会",
+            parse_mode='HTML'
+        )
         return CONFIG_RETRY_INPUT
 
 
@@ -6516,7 +6656,35 @@ async def handle_thread_interval_config(update: Update, context: ContextTypes.DE
         interval = int(update.message.text.strip())
         
         if interval < 0 or interval > 60:
-            await update.message.reply_text("❌ 间隔时间必须在 0-60秒 之间，请重新输入：")
+            retry_count = context.user_data.get('retry_count', 0) + 1
+            context.user_data['retry_count'] = retry_count
+            
+            if retry_count >= 3:
+                msg = await update.message.reply_text(
+                    "❌ <b>输入错误次数过多</b>\n\n"
+                    "已自动取消配置，请重新开始",
+                    parse_mode='HTML'
+                )
+                await asyncio.sleep(2)
+                try:
+                    await msg.delete()
+                    await update.message.delete()
+                    if 'config_prompt_msg_id' in context.user_data:
+                        await context.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=context.user_data['config_prompt_msg_id']
+                        )
+                except Exception:
+                    pass
+                context.user_data.clear()
+                return ConversationHandler.END
+            
+            await update.message.reply_text(
+                f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+                f"间隔时间必须在 0-60秒 之间\n"
+                f"还剩 {3 - retry_count} 次尝试机会",
+                parse_mode='HTML'
+            )
             return CONFIG_THREAD_INTERVAL_INPUT
         
         # Update database
@@ -6548,7 +6716,35 @@ async def handle_thread_interval_config(update: Update, context: ContextTypes.DE
         return ConversationHandler.END
         
     except ValueError:
-        await update.message.reply_text("❌ 请输入有效的数字（0-60）：")
+        retry_count = context.user_data.get('retry_count', 0) + 1
+        context.user_data['retry_count'] = retry_count
+        
+        if retry_count >= 3:
+            msg = await update.message.reply_text(
+                "❌ <b>输入错误次数过多</b>\n\n"
+                "已自动取消配置，请重新开始",
+                parse_mode='HTML'
+            )
+            await asyncio.sleep(2)
+            try:
+                await msg.delete()
+                await update.message.delete()
+                if 'config_prompt_msg_id' in context.user_data:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=context.user_data['config_prompt_msg_id']
+                    )
+            except Exception:
+                pass
+            context.user_data.clear()
+            return ConversationHandler.END
+        
+        await update.message.reply_text(
+            f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+            f"请输入有效的数字（0-60）\n"
+            f"还剩 {3 - retry_count} 次尝试机会",
+            parse_mode='HTML'
+        )
         return CONFIG_THREAD_INTERVAL_INPUT
 
 
