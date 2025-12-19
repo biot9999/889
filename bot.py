@@ -5394,6 +5394,31 @@ async def show_task_detail(query, task_id):
             InlineKeyboardButton("🔄 刷新进度", callback_data=f'task_detail_{task_id}'),
             InlineKeyboardButton("⏸️ 停止任务", callback_data=f'task_stop_{task_id}')
         ])
+        
+        # Start auto-refresh for running tasks if not already running
+        if not hasattr(task_manager, 'refresh_tasks'):
+            task_manager.refresh_tasks = {}
+        
+        # Only start auto-refresh if not already running for this task
+        if task_id not in task_manager.refresh_tasks or task_manager.refresh_tasks[task_id].done():
+            async def auto_refresh_wrapper():
+                try:
+                    # Wait a moment before starting refresh
+                    await asyncio.sleep(2)
+                    await auto_refresh_task_progress(
+                        query.bot,
+                        query.message.chat_id,
+                        query.message.message_id,
+                        task_id
+                    )
+                except asyncio.CancelledError:
+                    logger.info(f"Auto-refresh task for task {task_id} was cancelled")
+                except Exception as e:
+                    logger.error(f"Auto-refresh error for task {task_id}: {e}", exc_info=True)
+            
+            refresh_task = asyncio.create_task(auto_refresh_wrapper())
+            task_manager.refresh_tasks[task_id] = refresh_task
+            logger.info(f"Started auto-refresh for running task {task_id}")
     
     # Export button for completed tasks
     if task.status == TaskStatus.COMPLETED.value:
