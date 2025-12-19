@@ -2017,14 +2017,15 @@ class TaskManager:
         return True
     
     async def _sleep_with_stop_check(self, seconds, stop_event, task_id=None):
-        """可中断的睡眠 - 每秒检查停止信号"""
+        """可中断的睡眠 - 每秒检查停止信号，每5秒检查数据库"""
+        check_db_every = 5  # Check database every 5 seconds to reduce load
         for i in range(int(seconds)):
             if stop_event.is_set():
                 logger.debug(f"Sleep interrupted by stop signal after {i}s")
                 return True  # Return True if interrupted
             
-            # Also check database status for double assurance
-            if task_id:
+            # Check database status less frequently for performance
+            if task_id and i % check_db_every == 0:
                 task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
                 if task_doc and task_doc.get('status') == TaskStatus.STOPPED.value:
                     logger.debug(f"Sleep interrupted by database STOPPED status after {i}s")
@@ -2284,9 +2285,9 @@ class TaskManager:
                             )
                             account.messages_sent_today = 0
                     
-                    # 发送消息
+                    # 发送消息 - Use stop-aware wrapper
                     logger.info(f"账号 {account.phone} -> 用户 {target.username or target.user_id} ({target_idx + 1}/{len(targets)})")
-                    success = await self._send_message_with_mode(task, target, account)
+                    success = await self._send_message_with_stop_check(task, target, account, stop_event)
                     
                     if success:
                         self.tasks_col.update_one(
@@ -2432,9 +2433,9 @@ class TaskManager:
                         )
                         account.messages_sent_today = 0
                 
-                # 发送消息
+                # 发送消息 - Use stop-aware wrapper
                 logger.info(f"[批次 {batch_idx}] 使用账户 {account.phone} 尝试发送")
-                success = await self._send_message_with_mode(task, target, account)
+                success = await self._send_message_with_stop_check(task, target, account, stop_event)
                 
                 if not success:
                     logger.warning(f"[批次 {batch_idx}] 账户 {account.phone} 发送失败，尝试下一个账户")
@@ -3425,7 +3426,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  ✅ 消息个性化\n"
         "  ✅ 智能防封策略\n"
         "  ✅ 实时进度监控\n"
-        "  ✅ 即时停止响应 (&lt;3秒)\n\n"
+        "  ✅ 即时停止响应 (3秒内)\n\n"
         "💡 选择功能开始使用："
     )
     
@@ -7445,7 +7446,7 @@ async def stop_task_handler(query, task_id, context):
     # Show confirmation dialog
     text = (
         "⚠️ <b>确认停止任务？</b>\n\n"
-        "⚡ 任务将立即停止（响应时间 &lt; 3秒）\n"
+        "⚡ 任务将立即停止（响应时间 3秒内）\n"
         "📝 已发送的消息无法撤回\n"
         "📊 将生成任务完成报告\n\n"
         "❓ 确定要停止吗？"
