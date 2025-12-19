@@ -7806,8 +7806,14 @@ def main():
             CallbackQueryHandler(request_tdata_upload, pattern='^upload_tdata_file$')
         ],
         states={
-            SESSION_UPLOAD: [MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_file_upload)],
-            TDATA_UPLOAD: [MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_file_upload)]
+            SESSION_UPLOAD: [
+                MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_file_upload),
+                CallbackQueryHandler(button_handler)
+            ],
+            TDATA_UPLOAD: [
+                MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_file_upload),
+                CallbackQueryHandler(button_handler)
+            ]
         },
         fallbacks=[CommandHandler("start", start)]
     )
@@ -7818,16 +7824,34 @@ def main():
     task_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_create_task, pattern='^tasks_create$')],
         states={
-            TASK_NAME_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_task_name)],
-            MESSAGE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_input)],
+            TASK_NAME_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_task_name),
+                CallbackQueryHandler(button_handler)
+            ],
+            MESSAGE_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_input),
+                CallbackQueryHandler(button_handler)
+            ],
             FORMAT_SELECT: [CallbackQueryHandler(button_handler)],
             SEND_METHOD_SELECT: [CallbackQueryHandler(button_handler)],
-            POSTBOT_CODE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_postbot_code_input)],
-            CHANNEL_LINK_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_link_input)],
+            POSTBOT_CODE_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_postbot_code_input),
+                CallbackQueryHandler(button_handler)
+            ],
+            CHANNEL_LINK_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_link_input),
+                CallbackQueryHandler(button_handler)
+            ],
             PREVIEW_CONFIG: [CallbackQueryHandler(button_handler)],
             MEDIA_SELECT: [CallbackQueryHandler(button_handler)],
-            MEDIA_UPLOAD: [MessageHandler((filters.Document.ALL | filters.PHOTO | filters.VIDEO) & ~filters.COMMAND, handle_media_upload)],
-            TARGET_INPUT: [MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, handle_target_input)]
+            MEDIA_UPLOAD: [
+                MessageHandler((filters.Document.ALL | filters.PHOTO | filters.VIDEO) & ~filters.COMMAND, handle_media_upload),
+                CallbackQueryHandler(button_handler)
+            ],
+            TARGET_INPUT: [
+                MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, handle_target_input),
+                CallbackQueryHandler(button_handler)  # Allow clicking config buttons to exit TARGET_INPUT
+            ]
         },
         fallbacks=[CommandHandler("start", start)]
     )
@@ -7902,11 +7926,20 @@ def main():
     collection_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(caiji.start_create_collection, pattern='^collection_create$')],
         states={
-            caiji.COLLECTION_NAME_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, caiji.handle_collection_name)],
+            caiji.COLLECTION_NAME_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, caiji.handle_collection_name),
+                CallbackQueryHandler(button_handler)
+            ],
             caiji.COLLECTION_TYPE_SELECT: [CallbackQueryHandler(caiji.handle_collection_type, pattern='^coll_type_')],
             caiji.COLLECTION_ACCOUNT_SELECT: [CallbackQueryHandler(caiji.handle_collection_account, pattern='^coll_account_')],
-            caiji.COLLECTION_TARGET_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, caiji.handle_collection_target)],
-            caiji.COLLECTION_KEYWORD_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, caiji.handle_collection_keyword)],
+            caiji.COLLECTION_TARGET_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, caiji.handle_collection_target),
+                CallbackQueryHandler(button_handler)
+            ],
+            caiji.COLLECTION_KEYWORD_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, caiji.handle_collection_keyword),
+                CallbackQueryHandler(button_handler)
+            ],
             caiji.COLLECTION_FILTER_CONFIG: [
                 CallbackQueryHandler(caiji.show_filter_config, pattern='^coll_configure_filters$'),
                 CallbackQueryHandler(caiji.toggle_filter, pattern='^coll_filter_toggle_'),
