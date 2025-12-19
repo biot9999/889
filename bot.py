@@ -1763,21 +1763,65 @@ class AccountManager:
         return client
     
     async def check_account_status(self, account_id):
-        """Check account status"""
+        """
+        Check account status by attempting to connect and get user info.
+        
+        Logic:
+        - If get_me() succeeds → Account is ACTIVE (working)
+        - If get_me() fails → Account is BANNED/INACTIVE (not working)
+        
+        Returns:
+            bool: True if account is active, False if banned/inactive
+        """
+        account_doc = self.accounts_col.find_one({'_id': ObjectId(account_id)})
+        if not account_doc:
+            logger.error(f"Account {account_id} not found in database")
+            return False
+            
+        account = Account.from_dict(account_doc)
+        logger.info(f"Checking status for account {account.phone} (current status: {account.status})")
+        
         try:
+            # Try to get client and user info
             client = await self.get_client(account_id)
-            await client.get_me()
-            self.accounts_col.update_one(
-                {'_id': ObjectId(account_id)},
-                {'$set': {'status': AccountStatus.ACTIVE.value, 'updated_at': datetime.utcnow()}}
-            )
-            return True
+            me = await client.get_me()
+            
+            if me and me.id:
+                # ✅ SUCCESS: Account can be accessed → Mark as ACTIVE
+                logger.info(f"✅ Account {account.phone} is WORKING - user_id: {me.id}, marking as ACTIVE")
+                self.accounts_col.update_one(
+                    {'_id': ObjectId(account_id)},
+                    {'$set': {'status': AccountStatus.ACTIVE.value, 'updated_at': datetime.utcnow()}}
+                )
+                
+                # Verify the update
+                updated_doc = self.accounts_col.find_one({'_id': ObjectId(account_id)})
+                logger.info(f"✅ Database updated: {account.phone} status = {updated_doc['status']}")
+                return True
+            else:
+                # ❌ FAILURE: get_me() returned None → Mark as BANNED
+                logger.warning(f"❌ Account {account.phone} get_me() returned None, marking as BANNED")
+                self.accounts_col.update_one(
+                    {'_id': ObjectId(account_id)},
+                    {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
+                )
+                
+                # Verify the update
+                updated_doc = self.accounts_col.find_one({'_id': ObjectId(account_id)})
+                logger.info(f"❌ Database updated: {account.phone} status = {updated_doc['status']}")
+                return False
+                
         except Exception as e:
-            logger.error(f"Error checking account: {e}")
+            # ❌ EXCEPTION: Cannot access account → Mark as BANNED
+            logger.error(f"❌ Account {account.phone} check failed with error: {e}, marking as BANNED")
             self.accounts_col.update_one(
                 {'_id': ObjectId(account_id)},
-                {'$set': {'status': AccountStatus.INACTIVE.value, 'updated_at': datetime.utcnow()}}
+                {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
             )
+            
+            # Verify the update
+            updated_doc = self.accounts_col.find_one({'_id': ObjectId(account_id)})
+            logger.info(f"❌ Database updated: {account.phone} status = {updated_doc['status']}")
             return False
     
     def get_active_accounts(self):
@@ -5045,6 +5089,8 @@ async def check_all_accounts_status(progress_callback=None):
                     # 使用增强的分类系统
                     category, new_status = classify_status(response)
                     
+                    logger.info(f"✅ Account {account.phone} classified as: {category} → status: {new_status}")
+                    
                     status_results[category].append(account)
                     
                     # 更新数据库
@@ -5052,23 +5098,33 @@ async def check_all_accounts_status(progress_callback=None):
                         {'_id': account._id},
                         {'$set': {'status': new_status, 'updated_at': datetime.utcnow()}}
                     )
+                    
+                    # 验证更新
+                    updated_doc = db[Account.COLLECTION_NAME].find_one({'_id': account._id})
+                    logger.info(f"✅ Database verified: {account.phone} status = {updated_doc['status']}")
                 else:
                     # 没有收到回复，可能是无法对话
-                    logger.warning(f"Account {account.phone}: No response from @spambot")
+                    logger.warning(f"❌ Account {account.phone}: No response from @spambot, marking as BANNED")
                     status_results['banned'].append(account)
                     db[Account.COLLECTION_NAME].update_one(
                         {'_id': account._id},
                         {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
                     )
+                    # 验证更新
+                    updated_doc = db[Account.COLLECTION_NAME].find_one({'_id': account._id})
+                    logger.info(f"❌ Database verified: {account.phone} status = {updated_doc['status']}")
                     
             except Exception as e:
                 # 无法连接或对话的账户认为是封禁/死亡账户
-                logger.error(f"Failed to check account {account.phone}: {e}")
+                logger.error(f"❌ Failed to check account {account.phone}: {e}, marking as BANNED")
                 status_results['banned'].append(account)
                 db[Account.COLLECTION_NAME].update_one(
                     {'_id': account._id},
                     {'$set': {'status': AccountStatus.BANNED.value, 'updated_at': datetime.utcnow()}}
                 )
+                # 验证更新
+                updated_doc = db[Account.COLLECTION_NAME].find_one({'_id': account._id})
+                logger.info(f"❌ Database verified: {account.phone} status = {updated_doc['status']}")
             finally:
                 processed_count += 1
                 # Report progress every 5 accounts
