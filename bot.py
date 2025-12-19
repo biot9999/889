@@ -4062,6 +4062,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_id = data.split('_')[2]
         await show_config_menu_handler(update, context, task_id)
     
+    elif data.startswith('cfg_cancel_'):
+        return await handle_config_cancel(update, context)
+    elif data.startswith('cfg_example_'):
+        await show_config_example(update, context)
+    elif data == 'close_example':
+        # Close example message
+        await query.message.delete()
+    
     elif data == 'noop':
         # No operation for info-only buttons
         await safe_answer_query(query)
@@ -4919,12 +4927,25 @@ async def request_thread_config(update: Update, context: ContextTypes.DEFAULT_TY
     await safe_answer_query(query)
     task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
+    context.user_data['retry_count'] = 0
+    context.user_data['current_config_type'] = 'thread'
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("💡 查看示例", callback_data='cfg_example_thread'),
+            InlineKeyboardButton("❌ 取消", callback_data=f'cfg_cancel_{task_id}')
+        ],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'task_config_{task_id}')]
+    ]
+    
     prompt_msg = await query.message.reply_text(
         "🧵 <b>配置线程数</b>\n\n"
         "请输入要使用的账号数量（线程数）：\n\n"
         "💡 建议：1-10\n"
-        "⚠️ 线程数越多，发送速度越快，但风险也越高",
-        parse_mode='HTML'
+        "⚠️ 线程数越多，发送速度越快，但风险也越高\n\n"
+        "💬 提示：可以随时点击下方按钮取消或查看示例",
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     # Store prompt message ID for later deletion
     context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
@@ -4937,13 +4958,26 @@ async def request_interval_config(update: Update, context: ContextTypes.DEFAULT_
     await safe_answer_query(query)
     task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
+    context.user_data['retry_count'] = 0
+    context.user_data['current_config_type'] = 'interval'
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("💡 查看示例", callback_data='cfg_example_interval'),
+            InlineKeyboardButton("❌ 取消", callback_data=f'cfg_cancel_{task_id}')
+        ],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'task_config_{task_id}')]
+    ]
+    
     prompt_msg = await query.message.reply_text(
         "⏱️ <b>配置发送间隔</b>\n\n"
         "请输入最小间隔和最大间隔（秒），用空格分隔：\n\n"
         "💡 格式：最小值 最大值\n"
         "💡 例如：30 120\n"
-        "⚠️ 间隔越短，风险越高",
-        parse_mode='HTML'
+        "⚠️ 间隔越短，风险越高\n\n"
+        "💬 提示：可以随时点击下方按钮取消或查看示例",
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     # Store prompt message ID for later deletion
     context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
@@ -4956,13 +4990,26 @@ async def request_bidirect_config(update: Update, context: ContextTypes.DEFAULT_
     await safe_answer_query(query)
     task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
+    context.user_data['retry_count'] = 0
+    context.user_data['current_config_type'] = 'bidirect'
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("💡 查看示例", callback_data='cfg_example_bidirect'),
+            InlineKeyboardButton("❌ 取消", callback_data=f'cfg_cancel_{task_id}')
+        ],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'task_config_{task_id}')]
+    ]
+    
     prompt_msg = await query.message.reply_text(
         "🔄 <b>配置无视双向次数</b>\n\n"
         "请输入无视双向联系人限制的次数：\n\n"
         "💡 0 = 不忽略限制\n"
         "💡 1-999 = 忽略次数\n"
-        "⚠️ 设置过高可能导致封号",
-        parse_mode='HTML'
+        "⚠️ 设置过高可能导致封号\n\n"
+        "💬 提示：可以随时点击下方按钮取消或查看示例",
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     # Store prompt message ID for later deletion
     context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
@@ -5322,13 +5369,46 @@ async def handle_target_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_thread_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle thread count configuration"""
+    task_id = context.user_data.get('config_task_id')
+    if not task_id:
+        await update.message.reply_text("❌ 配置会话已过期，请重新开始")
+        return ConversationHandler.END
+    
     try:
         thread_count = int(update.message.text.strip())
         if thread_count < 1 or thread_count > 50:
-            await update.message.reply_text("❌ 线程数必须在 1-50 之间，请重新输入：")
+            # Add retry count
+            retry_count = context.user_data.get('retry_count', 0) + 1
+            context.user_data['retry_count'] = retry_count
+            
+            if retry_count >= 3:
+                msg = await update.message.reply_text(
+                    "❌ <b>输入错误次数过多</b>\n\n"
+                    "已自动取消配置，请重新开始",
+                    parse_mode='HTML'
+                )
+                await asyncio.sleep(2)
+                try:
+                    await msg.delete()
+                    await update.message.delete()
+                    if 'config_prompt_msg_id' in context.user_data:
+                        await context.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=context.user_data['config_prompt_msg_id']
+                        )
+                except Exception:
+                    pass
+                context.user_data.clear()
+                return ConversationHandler.END
+            
+            await update.message.reply_text(
+                f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+                f"线程数必须在 1-50 之间\n"
+                f"还剩 {3 - retry_count} 次尝试机会",
+                parse_mode='HTML'
+            )
             return CONFIG_THREAD_INPUT
         
-        task_id = context.user_data.get('config_task_id')
         db[Task.COLLECTION_NAME].update_one(
             {'_id': ObjectId(task_id)},
             {'$set': {'thread_count': thread_count, 'updated_at': datetime.utcnow()}}
@@ -5356,26 +5436,115 @@ async def handle_thread_config(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
         
     except ValueError:
-        await update.message.reply_text("❌ 请输入有效的数字：")
+        # Add retry count
+        retry_count = context.user_data.get('retry_count', 0) + 1
+        context.user_data['retry_count'] = retry_count
+        
+        if retry_count >= 3:
+            msg = await update.message.reply_text(
+                "❌ <b>输入错误次数过多</b>\n\n"
+                "已自动取消配置，请重新开始",
+                parse_mode='HTML'
+            )
+            await asyncio.sleep(2)
+            try:
+                await msg.delete()
+                await update.message.delete()
+                if 'config_prompt_msg_id' in context.user_data:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=context.user_data['config_prompt_msg_id']
+                    )
+            except Exception:
+                pass
+            context.user_data.clear()
+            return ConversationHandler.END
+        
+        await update.message.reply_text(
+            f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+            f"请输入有效的数字\n"
+            f"还剩 {3 - retry_count} 次尝试机会",
+            parse_mode='HTML'
+        )
         return CONFIG_THREAD_INPUT
 
 
 async def handle_interval_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle interval configuration"""
+    task_id = context.user_data.get('config_task_id')
+    if not task_id:
+        await update.message.reply_text("❌ 配置会话已过期，请重新开始")
+        return ConversationHandler.END
+    
     try:
         parts = update.message.text.strip().split()
         if len(parts) != 2:
-            await update.message.reply_text("❌ 格式错误，请输入两个数字（用空格分隔）：")
+            retry_count = context.user_data.get('retry_count', 0) + 1
+            context.user_data['retry_count'] = retry_count
+            
+            if retry_count >= 3:
+                msg = await update.message.reply_text(
+                    "❌ <b>输入错误次数过多</b>\n\n"
+                    "已自动取消配置，请重新开始",
+                    parse_mode='HTML'
+                )
+                await asyncio.sleep(2)
+                try:
+                    await msg.delete()
+                    await update.message.delete()
+                    if 'config_prompt_msg_id' in context.user_data:
+                        await context.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=context.user_data['config_prompt_msg_id']
+                        )
+                except Exception:
+                    pass
+                context.user_data.clear()
+                return ConversationHandler.END
+            
+            await update.message.reply_text(
+                f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+                f"格式错误，请输入两个数字（用空格分隔）\n"
+                f"还剩 {3 - retry_count} 次尝试机会",
+                parse_mode='HTML'
+            )
             return CONFIG_INTERVAL_MIN_INPUT
         
         min_interval = int(parts[0])
         max_interval = int(parts[1])
         
         if min_interval < 1 or max_interval < min_interval or max_interval > 3600:
-            await update.message.reply_text("❌ 间隔设置不合理，请重新输入：\n最小值 ≥ 1，最大值 ≥ 最小值，最大值 ≤ 3600")
+            retry_count = context.user_data.get('retry_count', 0) + 1
+            context.user_data['retry_count'] = retry_count
+            
+            if retry_count >= 3:
+                msg = await update.message.reply_text(
+                    "❌ <b>输入错误次数过多</b>\n\n"
+                    "已自动取消配置，请重新开始",
+                    parse_mode='HTML'
+                )
+                await asyncio.sleep(2)
+                try:
+                    await msg.delete()
+                    await update.message.delete()
+                    if 'config_prompt_msg_id' in context.user_data:
+                        await context.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=context.user_data['config_prompt_msg_id']
+                        )
+                except Exception:
+                    pass
+                context.user_data.clear()
+                return ConversationHandler.END
+            
+            await update.message.reply_text(
+                f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+                f"间隔设置不合理：最小值 ≥ 1，最大值 ≥ 最小值，最大值 ≤ 3600\n"
+                f"还剩 {3 - retry_count} 次尝试机会",
+                parse_mode='HTML'
+            )
             return CONFIG_INTERVAL_MIN_INPUT
         
-        task_id = context.user_data.get('config_task_id')
         db[Task.COLLECTION_NAME].update_one(
             {'_id': ObjectId(task_id)},
             {'$set': {
@@ -5407,19 +5576,79 @@ async def handle_interval_config(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
         
     except ValueError:
-        await update.message.reply_text("❌ 请输入有效的数字：")
+        retry_count = context.user_data.get('retry_count', 0) + 1
+        context.user_data['retry_count'] = retry_count
+        
+        if retry_count >= 3:
+            msg = await update.message.reply_text(
+                "❌ <b>输入错误次数过多</b>\n\n"
+                "已自动取消配置，请重新开始",
+                parse_mode='HTML'
+            )
+            await asyncio.sleep(2)
+            try:
+                await msg.delete()
+                await update.message.delete()
+                if 'config_prompt_msg_id' in context.user_data:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=context.user_data['config_prompt_msg_id']
+                    )
+            except Exception:
+                pass
+            context.user_data.clear()
+            return ConversationHandler.END
+        
+        await update.message.reply_text(
+            f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+            f"请输入有效的数字\n"
+            f"还剩 {3 - retry_count} 次尝试机会",
+            parse_mode='HTML'
+        )
         return CONFIG_INTERVAL_MIN_INPUT
 
 
 async def handle_bidirect_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle bidirectional limit configuration"""
+    task_id = context.user_data.get('config_task_id')
+    if not task_id:
+        await update.message.reply_text("❌ 配置会话已过期，请重新开始")
+        return ConversationHandler.END
+    
     try:
         limit = int(update.message.text.strip())
         if limit < 0 or limit > 999:
-            await update.message.reply_text("❌ 次数必须在 0-999 之间，请重新输入：")
+            retry_count = context.user_data.get('retry_count', 0) + 1
+            context.user_data['retry_count'] = retry_count
+            
+            if retry_count >= 3:
+                msg = await update.message.reply_text(
+                    "❌ <b>输入错误次数过多</b>\n\n"
+                    "已自动取消配置，请重新开始",
+                    parse_mode='HTML'
+                )
+                await asyncio.sleep(2)
+                try:
+                    await msg.delete()
+                    await update.message.delete()
+                    if 'config_prompt_msg_id' in context.user_data:
+                        await context.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=context.user_data['config_prompt_msg_id']
+                        )
+                except Exception:
+                    pass
+                context.user_data.clear()
+                return ConversationHandler.END
+            
+            await update.message.reply_text(
+                f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+                f"次数必须在 0-999 之间\n"
+                f"还剩 {3 - retry_count} 次尝试机会",
+                parse_mode='HTML'
+            )
             return CONFIG_BIDIRECT_INPUT
         
-        task_id = context.user_data.get('config_task_id')
         db[Task.COLLECTION_NAME].update_one(
             {'_id': ObjectId(task_id)},
             {'$set': {'ignore_bidirectional_limit': limit, 'updated_at': datetime.utcnow()}}
@@ -5427,6 +5656,56 @@ async def handle_bidirect_config(update: Update, context: ContextTypes.DEFAULT_T
         
         msg = await update.message.reply_text(f"✅ 无视双向次数已设置为：{limit}")
         # Auto-delete after configured delay
+        await asyncio.sleep(Config.CONFIG_MESSAGE_DELETE_DELAY)
+        try:
+            # Delete confirmation message
+            await msg.delete()
+            # Delete user input message
+            await update.message.delete()
+            # Delete prompt message
+            prompt_msg_id = context.user_data.get('config_prompt_msg_id')
+            if prompt_msg_id:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=prompt_msg_id
+                )
+        except Exception as e:
+            logger.warning(f"Failed to delete config message: {e}")
+        
+        context.user_data.clear()
+        return ConversationHandler.END
+        
+    except ValueError:
+        retry_count = context.user_data.get('retry_count', 0) + 1
+        context.user_data['retry_count'] = retry_count
+        
+        if retry_count >= 3:
+            msg = await update.message.reply_text(
+                "❌ <b>输入错误次数过多</b>\n\n"
+                "已自动取消配置，请重新开始",
+                parse_mode='HTML'
+            )
+            await asyncio.sleep(2)
+            try:
+                await msg.delete()
+                await update.message.delete()
+                if 'config_prompt_msg_id' in context.user_data:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=context.user_data['config_prompt_msg_id']
+                    )
+            except Exception:
+                pass
+            context.user_data.clear()
+            return ConversationHandler.END
+        
+        await update.message.reply_text(
+            f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+            f"请输入有效的数字\n"
+            f"还剩 {3 - retry_count} 次尝试机会",
+            parse_mode='HTML'
+        )
+        return CONFIG_BIDIRECT_INPUT
         await asyncio.sleep(Config.CONFIG_MESSAGE_DELETE_DELAY)
         try:
             # Delete confirmation message
@@ -5521,6 +5800,8 @@ async def request_reply_mode_config(update: Update, context: ContextTypes.DEFAUL
     await safe_answer_query(query)
     task_id = query.data.split('_')[3]
     context.user_data['config_task_id'] = task_id
+    context.user_data['retry_count'] = 0
+    context.user_data['current_config_type'] = 'reply'
     
     task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
     task = Task.from_dict(task_doc)
@@ -5531,6 +5812,14 @@ async def request_reply_mode_config(update: Update, context: ContextTypes.DEFAUL
     
     # Format existing keywords for display
     keywords_display = "\n".join([f"  • {k} → {v}" for k, v in reply_keywords.items()]) if reply_keywords else "  （无）"
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("💡 查看示例", callback_data='cfg_example_reply'),
+            InlineKeyboardButton("❌ 取消", callback_data=f'cfg_cancel_{task_id}')
+        ],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'task_config_{task_id}')]
+    ]
     
     prompt_msg = await query.message.reply_text(
         f"💬 <b>回复模式配置</b>\n\n"
@@ -5546,8 +5835,9 @@ async def request_reply_mode_config(update: Update, context: ContextTypes.DEFAUL
         f"💡 <b>默认回复:</b> 如果用户回复不匹配任何关键词，发送默认回复\n"
         f"输入格式: default=默认回复内容\n\n"
         f"⚠️ 发送 'clear' 可清空所有配置\n"
-        f"⚠️ 直接发送 '返回' 取消配置",
-        parse_mode='HTML'
+        f"💬 提示：可以随时点击下方按钮取消或查看示例",
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
     return CONFIG_REPLY_MODE_INPUT
@@ -5959,13 +6249,25 @@ async def request_thread_interval_config(update: Update, context: ContextTypes.D
     await safe_answer_query(query)
     task_id = query.data.split('_')[3]
     context.user_data['config_task_id'] = task_id
+    context.user_data['retry_count'] = 0
+    context.user_data['current_config_type'] = 'threadinterval'
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("💡 查看示例", callback_data='cfg_example_threadinterval'),
+            InlineKeyboardButton("❌ 取消", callback_data=f'cfg_cancel_{task_id}')
+        ],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'task_config_{task_id}')]
+    ]
     
     prompt_msg = await query.message.reply_text(
         "⏲️ <b>配置线程启动间隔</b>\n\n"
         "请输入线程启动间隔（秒）：\n\n"
         "💡 建议：0-5秒\n"
-        "⚠️ 间隔可以避免瞬间并发过高",
-        parse_mode='HTML'
+        "⚠️ 间隔可以避免瞬间并发过高\n\n"
+        "💬 提示：可以随时点击下方按钮取消或查看示例",
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
     return CONFIG_THREAD_INTERVAL_INPUT
@@ -5977,14 +6279,26 @@ async def request_daily_limit_config(update: Update, context: ContextTypes.DEFAU
     await safe_answer_query(query)
     task_id = query.data.split('_')[3]
     context.user_data['config_task_id'] = task_id
+    context.user_data['retry_count'] = 0
+    context.user_data['current_config_type'] = 'daily'
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("💡 查看示例", callback_data='cfg_example_daily'),
+            InlineKeyboardButton("❌ 取消", callback_data=f'cfg_cancel_{task_id}')
+        ],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'task_config_{task_id}')]
+    ]
     
     prompt_msg = await query.message.reply_text(
         "📊 <b>配置单账号日限</b>\n\n"
         "请输入每个账号每天最多发送的消息数量：\n\n"
         "💡 建议范围：1-200条\n"
         "💡 默认值：50条\n"
-        "⚠️ 设置过高可能导致封号风险增加",
-        parse_mode='HTML'
+        "⚠️ 设置过高可能导致封号风险增加\n\n"
+        "💬 提示：可以随时点击下方按钮取消或查看示例",
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
     return CONFIG_DAILY_LIMIT_INPUT
@@ -6001,7 +6315,35 @@ async def handle_daily_limit_config(update: Update, context: ContextTypes.DEFAUL
         daily_limit = int(update.message.text.strip())
         
         if daily_limit < 1 or daily_limit > 200:
-            await update.message.reply_text("❌ 日限必须在 1-200 之间，请重新输入：")
+            retry_count = context.user_data.get('retry_count', 0) + 1
+            context.user_data['retry_count'] = retry_count
+            
+            if retry_count >= 3:
+                msg = await update.message.reply_text(
+                    "❌ <b>输入错误次数过多</b>\n\n"
+                    "已自动取消配置，请重新开始",
+                    parse_mode='HTML'
+                )
+                await asyncio.sleep(2)
+                try:
+                    await msg.delete()
+                    await update.message.delete()
+                    if 'config_prompt_msg_id' in context.user_data:
+                        await context.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=context.user_data['config_prompt_msg_id']
+                        )
+                except Exception:
+                    pass
+                context.user_data.clear()
+                return ConversationHandler.END
+            
+            await update.message.reply_text(
+                f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+                f"日限必须在 1-200 之间\n"
+                f"还剩 {3 - retry_count} 次尝试机会",
+                parse_mode='HTML'
+            )
             return CONFIG_DAILY_LIMIT_INPUT
         
         # Update database
@@ -6033,7 +6375,35 @@ async def handle_daily_limit_config(update: Update, context: ContextTypes.DEFAUL
         return ConversationHandler.END
         
     except ValueError:
-        await update.message.reply_text("❌ 请输入有效的数字（1-200）：")
+        retry_count = context.user_data.get('retry_count', 0) + 1
+        context.user_data['retry_count'] = retry_count
+        
+        if retry_count >= 3:
+            msg = await update.message.reply_text(
+                "❌ <b>输入错误次数过多</b>\n\n"
+                "已自动取消配置，请重新开始",
+                parse_mode='HTML'
+            )
+            await asyncio.sleep(2)
+            try:
+                await msg.delete()
+                await update.message.delete()
+                if 'config_prompt_msg_id' in context.user_data:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=context.user_data['config_prompt_msg_id']
+                    )
+            except Exception:
+                pass
+            context.user_data.clear()
+            return ConversationHandler.END
+        
+        await update.message.reply_text(
+            f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+            f"请输入有效的数字（1-200）\n"
+            f"还剩 {3 - retry_count} 次尝试机会",
+            parse_mode='HTML'
+        )
         return CONFIG_DAILY_LIMIT_INPUT
 
 
@@ -6043,9 +6413,19 @@ async def request_retry_config(update: Update, context: ContextTypes.DEFAULT_TYP
     await safe_answer_query(query)
     task_id = query.data.split('_')[2]
     context.user_data['config_task_id'] = task_id
+    context.user_data['retry_count'] = 0
+    context.user_data['current_config_type'] = 'retry'
     
     task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
     task = Task.from_dict(task_doc)
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("💡 查看示例", callback_data='cfg_example_retry'),
+            InlineKeyboardButton("❌ 取消", callback_data=f'cfg_cancel_{task_id}')
+        ],
+        [InlineKeyboardButton("🔙 返回", callback_data=f'task_config_{task_id}')]
+    ]
     
     prompt_msg = await query.message.reply_text(
         "🔄 <b>配置重试策略</b>\n\n"
@@ -6054,8 +6434,10 @@ async def request_retry_config(update: Update, context: ContextTypes.DEFAULT_TYP
         "💡 格式：重试次数 间隔时间\n"
         "💡 例如：3 60（重试3次，每次间隔60秒）\n"
         "💡 建议：1-10次，间隔30-300秒\n"
-        "⚠️ 重试过于频繁可能被检测为异常行为",
-        parse_mode='HTML'
+        "⚠️ 重试过于频繁可能被检测为异常行为\n\n"
+        "💬 提示：可以随时点击下方按钮取消或查看示例",
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     context.user_data['config_prompt_msg_id'] = prompt_msg.message_id
     return CONFIG_RETRY_INPUT
@@ -6071,25 +6453,109 @@ async def handle_retry_config(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         parts = update.message.text.strip().split()
         if len(parts) != 2:
-            await update.message.reply_text("❌ 格式错误，请输入两个数字（重试次数 间隔时间）：")
+            retry_count = context.user_data.get('retry_count', 0) + 1
+            context.user_data['retry_count'] = retry_count
+            
+            if retry_count >= 3:
+                msg = await update.message.reply_text(
+                    "❌ <b>输入错误次数过多</b>\n\n"
+                    "已自动取消配置，请重新开始",
+                    parse_mode='HTML'
+                )
+                await asyncio.sleep(2)
+                try:
+                    await msg.delete()
+                    await update.message.delete()
+                    if 'config_prompt_msg_id' in context.user_data:
+                        await context.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=context.user_data['config_prompt_msg_id']
+                        )
+                except Exception:
+                    pass
+                context.user_data.clear()
+                return ConversationHandler.END
+            
+            await update.message.reply_text(
+                f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+                f"请输入两个数字（重试次数 间隔时间）\n"
+                f"还剩 {3 - retry_count} 次尝试机会",
+                parse_mode='HTML'
+            )
             return CONFIG_RETRY_INPUT
         
-        retry_count = int(parts[0])
+        retry_count_val = int(parts[0])
         retry_interval = int(parts[1])
         
-        if retry_count < 0 or retry_count > 10:
-            await update.message.reply_text("❌ 重试次数必须在 0-10 之间，请重新输入：")
+        if retry_count_val < 0 or retry_count_val > 10:
+            retry_count = context.user_data.get('retry_count', 0) + 1
+            context.user_data['retry_count'] = retry_count
+            
+            if retry_count >= 3:
+                msg = await update.message.reply_text(
+                    "❌ <b>输入错误次数过多</b>\n\n"
+                    "已自动取消配置，请重新开始",
+                    parse_mode='HTML'
+                )
+                await asyncio.sleep(2)
+                try:
+                    await msg.delete()
+                    await update.message.delete()
+                    if 'config_prompt_msg_id' in context.user_data:
+                        await context.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=context.user_data['config_prompt_msg_id']
+                        )
+                except Exception:
+                    pass
+                context.user_data.clear()
+                return ConversationHandler.END
+            
+            await update.message.reply_text(
+                f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+                f"重试次数必须在 0-10 之间\n"
+                f"还剩 {3 - retry_count} 次尝试机会",
+                parse_mode='HTML'
+            )
             return CONFIG_RETRY_INPUT
         
         if retry_interval < 10 or retry_interval > 300:
-            await update.message.reply_text("❌ 间隔时间必须在 10-300秒 之间，请重新输入：")
+            retry_count = context.user_data.get('retry_count', 0) + 1
+            context.user_data['retry_count'] = retry_count
+            
+            if retry_count >= 3:
+                msg = await update.message.reply_text(
+                    "❌ <b>输入错误次数过多</b>\n\n"
+                    "已自动取消配置，请重新开始",
+                    parse_mode='HTML'
+                )
+                await asyncio.sleep(2)
+                try:
+                    await msg.delete()
+                    await update.message.delete()
+                    if 'config_prompt_msg_id' in context.user_data:
+                        await context.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=context.user_data['config_prompt_msg_id']
+                        )
+                except Exception:
+                    pass
+                context.user_data.clear()
+                return ConversationHandler.END
+            
+            await update.message.reply_text(
+                f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+                f"间隔时间必须在 10-300秒 之间\n"
+                f"还剩 {3 - retry_count} 次尝试机会",
+                parse_mode='HTML'
+            )
             return CONFIG_RETRY_INPUT
         
         # Update database
         result = db[Task.COLLECTION_NAME].update_one(
             {'_id': ObjectId(task_id)},
             {'$set': {
-                'retry_count': retry_count,
+                'retry_count': retry_count_val,
                 'retry_interval': retry_interval,
                 'updated_at': datetime.utcnow()
             }}
@@ -6097,13 +6563,13 @@ async def handle_retry_config(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         # Verify update
         if result.modified_count > 0:
-            logger.info(f"Task {task_id}: Retry config updated to {retry_count} times, {retry_interval}s interval")
+            logger.info(f"Task {task_id}: Retry config updated to {retry_count_val} times, {retry_interval}s interval")
             msg = await update.message.reply_text(
-                f"✅ 重试策略已设置为：{retry_count}次，间隔{retry_interval}秒"
+                f"✅ 重试策略已设置为：{retry_count_val}次，间隔{retry_interval}秒"
             )
         else:
             msg = await update.message.reply_text(
-                f"✅ 重试策略已设置为：{retry_count}次，间隔{retry_interval}秒（值未变更）"
+                f"✅ 重试策略已设置为：{retry_count_val}次，间隔{retry_interval}秒（值未变更）"
             )
         
         # Auto-cleanup
@@ -6122,7 +6588,35 @@ async def handle_retry_config(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
         
     except ValueError:
-        await update.message.reply_text("❌ 请输入有效的数字：")
+        retry_count = context.user_data.get('retry_count', 0) + 1
+        context.user_data['retry_count'] = retry_count
+        
+        if retry_count >= 3:
+            msg = await update.message.reply_text(
+                "❌ <b>输入错误次数过多</b>\n\n"
+                "已自动取消配置，请重新开始",
+                parse_mode='HTML'
+            )
+            await asyncio.sleep(2)
+            try:
+                await msg.delete()
+                await update.message.delete()
+                if 'config_prompt_msg_id' in context.user_data:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=context.user_data['config_prompt_msg_id']
+                    )
+            except Exception:
+                pass
+            context.user_data.clear()
+            return ConversationHandler.END
+        
+        await update.message.reply_text(
+            f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+            f"请输入有效的数字\n"
+            f"还剩 {3 - retry_count} 次尝试机会",
+            parse_mode='HTML'
+        )
         return CONFIG_RETRY_INPUT
 
 
@@ -6162,7 +6656,35 @@ async def handle_thread_interval_config(update: Update, context: ContextTypes.DE
         interval = int(update.message.text.strip())
         
         if interval < 0 or interval > 60:
-            await update.message.reply_text("❌ 间隔时间必须在 0-60秒 之间，请重新输入：")
+            retry_count = context.user_data.get('retry_count', 0) + 1
+            context.user_data['retry_count'] = retry_count
+            
+            if retry_count >= 3:
+                msg = await update.message.reply_text(
+                    "❌ <b>输入错误次数过多</b>\n\n"
+                    "已自动取消配置，请重新开始",
+                    parse_mode='HTML'
+                )
+                await asyncio.sleep(2)
+                try:
+                    await msg.delete()
+                    await update.message.delete()
+                    if 'config_prompt_msg_id' in context.user_data:
+                        await context.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=context.user_data['config_prompt_msg_id']
+                        )
+                except Exception:
+                    pass
+                context.user_data.clear()
+                return ConversationHandler.END
+            
+            await update.message.reply_text(
+                f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+                f"间隔时间必须在 0-60秒 之间\n"
+                f"还剩 {3 - retry_count} 次尝试机会",
+                parse_mode='HTML'
+            )
             return CONFIG_THREAD_INTERVAL_INPUT
         
         # Update database
@@ -6194,9 +6716,207 @@ async def handle_thread_interval_config(update: Update, context: ContextTypes.DE
         return ConversationHandler.END
         
     except ValueError:
-        await update.message.reply_text("❌ 请输入有效的数字（0-60）：")
+        retry_count = context.user_data.get('retry_count', 0) + 1
+        context.user_data['retry_count'] = retry_count
+        
+        if retry_count >= 3:
+            msg = await update.message.reply_text(
+                "❌ <b>输入错误次数过多</b>\n\n"
+                "已自动取消配置，请重新开始",
+                parse_mode='HTML'
+            )
+            await asyncio.sleep(2)
+            try:
+                await msg.delete()
+                await update.message.delete()
+                if 'config_prompt_msg_id' in context.user_data:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=context.user_data['config_prompt_msg_id']
+                    )
+            except Exception:
+                pass
+            context.user_data.clear()
+            return ConversationHandler.END
+        
+        await update.message.reply_text(
+            f"❌ <b>格式错误（第{retry_count}次）</b>\n\n"
+            f"请输入有效的数字（0-60）\n"
+            f"还剩 {3 - retry_count} 次尝试机会",
+            parse_mode='HTML'
+        )
         return CONFIG_THREAD_INTERVAL_INPUT
 
+
+
+async def handle_config_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理配置取消 - 统一处理器"""
+    query = update.callback_query
+    await safe_answer_query(query, "✅ 已取消配置")
+    
+    # 清理临时消息
+    try:
+        prompt_msg_id = context.user_data.get('config_prompt_msg_id')
+        if prompt_msg_id:
+            await context.bot.delete_message(update.effective_chat.id, prompt_msg_id)
+    except Exception as e:
+        logger.warning(f"Failed to delete prompt message: {e}")
+    
+    # 清理用户数据
+    task_id = context.user_data.get('config_task_id')
+    context.user_data.clear()
+    
+    # 返回任务配置界面
+    if task_id:
+        await show_task_config(query, task_id)
+    else:
+        await show_tasks_menu(query)
+    
+    return ConversationHandler.END
+
+
+async def show_config_example(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """显示配置示例"""
+    query = update.callback_query
+    config_type = query.data.split('_')[2]
+    
+    examples = {
+        'edit': (
+            "✏️ <b>编辑模式配置示例</b>\n\n"
+            "格式：延迟最小 延迟最大 | 编辑内容\n\n"
+            "<b>示例1：</b> 5 15 | 🎉 限时优惠！\n"
+            "→ 5-15秒后编辑为优惠信息\n\n"
+            "<b>示例2：</b> 3 10 | 点击链接：http://xxx.com\n"
+            "→ 3-10秒后编辑为链接\n\n"
+            "<b>示例3：</b> 10 20 | 联系客服获取更多信息\n"
+            "→ 10-20秒后编辑为联系方式"
+        ),
+        'reply': (
+            "💬 <b>回复模式配置示例</b>\n\n"
+            "格式：关键词1=回复1;关键词2=回复2\n\n"
+            "<b>示例1：</b>\n"
+            "价格=我们的价格是199元;联系=请加微信abc123\n\n"
+            "<b>示例2：</b>\n"
+            "多少钱=试听免费，正式课199元;怎么报名=请加QQ群123456\n\n"
+            "<b>示例3：</b>\n"
+            "在哪=我们在北京;电话=联系电话：13800138000;default=感谢回复！"
+        ),
+        'batch': (
+            "🔄 <b>分批停顿配置示例</b>\n\n"
+            "格式：条数 最小秒 最大秒\n\n"
+            "<b>示例1：</b> 3 5 10\n"
+            "→ 每发送3条消息，停顿5-10秒\n\n"
+            "<b>示例2：</b> 5 10 20\n"
+            "→ 每发送5条消息，停顿10-20秒\n\n"
+            "<b>示例3：</b> 10 30 60\n"
+            "→ 每发送10条消息，停顿30-60秒"
+        ),
+        'voice': (
+            "📞 <b>语音拨打配置示例</b>\n\n"
+            "格式：持续时间 等待时间 失败继续\n\n"
+            "<b>示例1：</b> 10 3 yes\n"
+            "→ 拨打10秒，等待3秒，失败继续发消息\n\n"
+            "<b>示例2：</b> 15 5 no\n"
+            "→ 拨打15秒，等待5秒，失败跳过\n\n"
+            "<b>示例3：</b> 5 2 yes\n"
+            "→ 拨打5秒，等待2秒，失败继续发消息"
+        ),
+        'bidirect': (
+            "🔄 <b>双向重试配置示例</b>\n\n"
+            "格式：重试次数 间隔秒数\n\n"
+            "<b>示例1：</b> 15 5\n"
+            "→ 尝试15次，每次间隔5秒\n\n"
+            "<b>示例2：</b> 10 3\n"
+            "→ 尝试10次，每次间隔3秒\n\n"
+            "<b>示例3：</b> 20 10\n"
+            "→ 尝试20次，每次间隔10秒"
+        ),
+        'thread': (
+            "🧵 <b>线程数配置示例</b>\n\n"
+            "格式：线程数（1-100）\n\n"
+            "<b>示例1：</b> 1\n"
+            "→ 使用1个账号发送（最安全）\n\n"
+            "<b>示例2：</b> 5\n"
+            "→ 使用5个账号并发发送\n\n"
+            "<b>示例3：</b> 10\n"
+            "→ 使用10个账号并发发送（高速）"
+        ),
+        'interval': (
+            "⏱️ <b>发送间隔配置示例</b>\n\n"
+            "格式：最小秒数 最大秒数\n\n"
+            "<b>示例1：</b> 30 120\n"
+            "→ 每次发送间隔30-120秒\n\n"
+            "<b>示例2：</b> 10 60\n"
+            "→ 每次发送间隔10-60秒\n\n"
+            "<b>示例3：</b> 60 300\n"
+            "→ 每次发送间隔1-5分钟（更安全）"
+        ),
+        'daily': (
+            "📊 <b>单账号日限配置示例</b>\n\n"
+            "格式：每日消息数量（1-200）\n\n"
+            "<b>示例1：</b> 50\n"
+            "→ 每个账号每天最多发50条\n\n"
+            "<b>示例2：</b> 100\n"
+            "→ 每个账号每天最多发100条\n\n"
+            "<b>示例3：</b> 20\n"
+            "→ 每个账号每天最多发20条（保守）"
+        ),
+        'retry': (
+            "🔄 <b>重试配置示例</b>\n\n"
+            "格式：重试次数（0-10）\n\n"
+            "<b>示例1：</b> 3\n"
+            "→ 失败后重试3次\n\n"
+            "<b>示例2：</b> 5\n"
+            "→ 失败后重试5次\n\n"
+            "<b>示例3：</b> 0\n"
+            "→ 不重试，失败即跳过"
+        ),
+        'threadinterval': (
+            "⏲️ <b>线程启动间隔示例</b>\n\n"
+            "格式：间隔秒数（0-300）\n\n"
+            "<b>示例1：</b> 10\n"
+            "→ 每个线程间隔10秒启动\n\n"
+            "<b>示例2：</b> 30\n"
+            "→ 每个线程间隔30秒启动\n\n"
+            "<b>示例3：</b> 0\n"
+            "→ 所有线程同时启动"
+        )
+    }
+    
+    text = examples.get(config_type, "❌ 示例不存在")
+    
+    keyboard = [[InlineKeyboardButton("✅ 知道了", callback_data='close_example')]]
+    
+    await query.edit_message_text(
+        text,
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def handle_config_return(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理配置返回按钮 - 返回到任务配置界面"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    
+    # 清理临时消息
+    try:
+        prompt_msg_id = context.user_data.get('config_prompt_msg_id')
+        if prompt_msg_id:
+            await context.bot.delete_message(update.effective_chat.id, prompt_msg_id)
+    except Exception as e:
+        logger.warning(f"Failed to delete prompt message: {e}")
+    
+    # 提取task_id
+    task_id = query.data.split('_')[2]
+    
+    # 清理用户数据
+    context.user_data.clear()
+    
+    # 显示任务配置界面
+    await show_task_config(query, task_id)
+    
+    return ConversationHandler.END
 
 
 async def show_config_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id=None):
@@ -7086,8 +7806,14 @@ def main():
             CallbackQueryHandler(request_tdata_upload, pattern='^upload_tdata_file$')
         ],
         states={
-            SESSION_UPLOAD: [MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_file_upload)],
-            TDATA_UPLOAD: [MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_file_upload)]
+            SESSION_UPLOAD: [
+                MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_file_upload),
+                CallbackQueryHandler(button_handler)
+            ],
+            TDATA_UPLOAD: [
+                MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_file_upload),
+                CallbackQueryHandler(button_handler)
+            ]
         },
         fallbacks=[CommandHandler("start", start)]
     )
@@ -7098,16 +7824,34 @@ def main():
     task_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_create_task, pattern='^tasks_create$')],
         states={
-            TASK_NAME_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_task_name)],
-            MESSAGE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_input)],
+            TASK_NAME_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_task_name),
+                CallbackQueryHandler(button_handler)
+            ],
+            MESSAGE_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_input),
+                CallbackQueryHandler(button_handler)
+            ],
             FORMAT_SELECT: [CallbackQueryHandler(button_handler)],
             SEND_METHOD_SELECT: [CallbackQueryHandler(button_handler)],
-            POSTBOT_CODE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_postbot_code_input)],
-            CHANNEL_LINK_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_link_input)],
+            POSTBOT_CODE_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_postbot_code_input),
+                CallbackQueryHandler(button_handler)
+            ],
+            CHANNEL_LINK_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_link_input),
+                CallbackQueryHandler(button_handler)
+            ],
             PREVIEW_CONFIG: [CallbackQueryHandler(button_handler)],
             MEDIA_SELECT: [CallbackQueryHandler(button_handler)],
-            MEDIA_UPLOAD: [MessageHandler((filters.Document.ALL | filters.PHOTO | filters.VIDEO) & ~filters.COMMAND, handle_media_upload)],
-            TARGET_INPUT: [MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, handle_target_input)]
+            MEDIA_UPLOAD: [
+                MessageHandler((filters.Document.ALL | filters.PHOTO | filters.VIDEO) & ~filters.COMMAND, handle_media_upload),
+                CallbackQueryHandler(button_handler)
+            ],
+            TARGET_INPUT: [
+                MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, handle_target_input),
+                CallbackQueryHandler(button_handler)  # Allow clicking config buttons to exit TARGET_INPUT
+            ]
         },
         fallbacks=[CommandHandler("start", start)]
     )
@@ -7118,24 +7862,62 @@ def main():
     logger.info("Registering task configuration conversation handler...")
     config_conv = ConversationHandler(
         entry_points=[
+            CallbackQueryHandler(request_thread_interval_config, pattern='^cfg_thread_interval_'),
             CallbackQueryHandler(request_thread_config, pattern='^cfg_thread_'),
             CallbackQueryHandler(request_interval_config, pattern='^cfg_interval_'),
             CallbackQueryHandler(request_bidirect_config, pattern='^cfg_bidirect_'),
-            CallbackQueryHandler(request_thread_interval_config, pattern='^cfg_thread_interval_'),
             CallbackQueryHandler(request_daily_limit_config, pattern='^cfg_daily_limit_'),
             CallbackQueryHandler(request_retry_config, pattern='^cfg_retry_'),
             CallbackQueryHandler(request_reply_mode_config, pattern='^cfg_reply_mode_')
         ],
         states={
-            CONFIG_THREAD_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_thread_config)],
-            CONFIG_INTERVAL_MIN_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_interval_config)],
-            CONFIG_BIDIRECT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bidirect_config)],
-            CONFIG_THREAD_INTERVAL_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_thread_interval_config)],
-            CONFIG_DAILY_LIMIT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_daily_limit_config)],
-            CONFIG_RETRY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_retry_config)],
-            CONFIG_REPLY_MODE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_mode_config)]
+            CONFIG_THREAD_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_thread_config),
+                CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
+                CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
+            ],
+            CONFIG_INTERVAL_MIN_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_interval_config),
+                CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
+                CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
+            ],
+            CONFIG_BIDIRECT_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bidirect_config),
+                CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
+                CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
+            ],
+            CONFIG_THREAD_INTERVAL_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_thread_interval_config),
+                CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
+                CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
+            ],
+            CONFIG_DAILY_LIMIT_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_daily_limit_config),
+                CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
+                CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
+            ],
+            CONFIG_RETRY_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_retry_config),
+                CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
+                CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
+            ],
+            CONFIG_REPLY_MODE_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_mode_config),
+                CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
+                CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
+            ]
         },
-        fallbacks=[CommandHandler("start", start)]
+        fallbacks=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_')
+        ]
     )
     application.add_handler(config_conv)
     
@@ -7144,11 +7926,20 @@ def main():
     collection_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(caiji.start_create_collection, pattern='^collection_create$')],
         states={
-            caiji.COLLECTION_NAME_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, caiji.handle_collection_name)],
+            caiji.COLLECTION_NAME_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, caiji.handle_collection_name),
+                CallbackQueryHandler(button_handler)
+            ],
             caiji.COLLECTION_TYPE_SELECT: [CallbackQueryHandler(caiji.handle_collection_type, pattern='^coll_type_')],
             caiji.COLLECTION_ACCOUNT_SELECT: [CallbackQueryHandler(caiji.handle_collection_account, pattern='^coll_account_')],
-            caiji.COLLECTION_TARGET_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, caiji.handle_collection_target)],
-            caiji.COLLECTION_KEYWORD_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, caiji.handle_collection_keyword)],
+            caiji.COLLECTION_TARGET_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, caiji.handle_collection_target),
+                CallbackQueryHandler(button_handler)
+            ],
+            caiji.COLLECTION_KEYWORD_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, caiji.handle_collection_keyword),
+                CallbackQueryHandler(button_handler)
+            ],
             caiji.COLLECTION_FILTER_CONFIG: [
                 CallbackQueryHandler(caiji.show_filter_config, pattern='^coll_configure_filters$'),
                 CallbackQueryHandler(caiji.toggle_filter, pattern='^coll_filter_toggle_'),
