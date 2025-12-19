@@ -6894,6 +6894,31 @@ async def show_config_example(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+async def handle_config_return(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理配置返回按钮 - 返回到任务配置界面"""
+    query = update.callback_query
+    await safe_answer_query(query)
+    
+    # 清理临时消息
+    try:
+        prompt_msg_id = context.user_data.get('config_prompt_msg_id')
+        if prompt_msg_id:
+            await context.bot.delete_message(update.effective_chat.id, prompt_msg_id)
+    except Exception as e:
+        logger.warning(f"Failed to delete prompt message: {e}")
+    
+    # 提取task_id
+    task_id = query.data.split('_')[2]
+    
+    # 清理用户数据
+    context.user_data.clear()
+    
+    # 显示任务配置界面
+    await show_task_config(query, task_id)
+    
+    return ConversationHandler.END
+
+
 async def show_config_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id=None):
     """Helper to show config menu"""
     if task_id is None:
@@ -7825,37 +7850,44 @@ def main():
             CONFIG_THREAD_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_thread_config),
                 CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
-                CallbackQueryHandler(show_config_example, pattern='^cfg_example_')
+                CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
             ],
             CONFIG_INTERVAL_MIN_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_interval_config),
                 CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
-                CallbackQueryHandler(show_config_example, pattern='^cfg_example_')
+                CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
             ],
             CONFIG_BIDIRECT_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bidirect_config),
                 CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
-                CallbackQueryHandler(show_config_example, pattern='^cfg_example_')
+                CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
             ],
             CONFIG_THREAD_INTERVAL_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_thread_interval_config),
                 CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
-                CallbackQueryHandler(show_config_example, pattern='^cfg_example_')
+                CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
             ],
             CONFIG_DAILY_LIMIT_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_daily_limit_config),
                 CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
-                CallbackQueryHandler(show_config_example, pattern='^cfg_example_')
+                CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
             ],
             CONFIG_RETRY_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_retry_config),
                 CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
-                CallbackQueryHandler(show_config_example, pattern='^cfg_example_')
+                CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
             ],
             CONFIG_REPLY_MODE_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_mode_config),
                 CallbackQueryHandler(handle_config_cancel, pattern='^cfg_cancel_'),
-                CallbackQueryHandler(show_config_example, pattern='^cfg_example_')
+                CallbackQueryHandler(show_config_example, pattern='^cfg_example_'),
+                CallbackQueryHandler(handle_config_return, pattern='^task_config_')
             ]
         },
         fallbacks=[
