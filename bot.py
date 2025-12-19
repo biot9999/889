@@ -3387,7 +3387,7 @@ db = None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command"""
+    """Start command with enhanced dashboard"""
     user_id = update.effective_user.id
     username = update.effective_user.username or "unknown"
     
@@ -3400,21 +3400,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.info(f"Authorized user {username} ({user_id}) accessing main menu")
     
+    # Get quick stats
+    total_accounts = db[Account.COLLECTION_NAME].count_documents({})
+    active_accounts = db[Account.COLLECTION_NAME].count_documents({'status': AccountStatus.ACTIVE.value})
+    total_tasks = db[Task.COLLECTION_NAME].count_documents({})
+    running_tasks = db[Task.COLLECTION_NAME].count_documents({'status': TaskStatus.RUNNING.value})
+    
     keyboard = [
         [InlineKeyboardButton("📢 广告私信", callback_data='menu_messaging'), InlineKeyboardButton("👥 采集用户", callback_data='menu_collection')],
         [InlineKeyboardButton("❓ 帮助", callback_data='menu_help')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
+    # Enhanced welcome message with stats
     text = (
-        "🤖 <b>Telegram 私信机器人</b>\n\n"
-        "欢迎使用 Telegram 批量私信管理系统！\n\n"
-        "✅ 多账户管理\n"
-        "✅ 富媒体消息\n"
-        "✅ 消息个性化\n"
-        "✅ 智能防封策略\n"
-        "✅ 实时进度监控\n\n"
-        "请选择一个选项："
+        "🤖 <b>Telegram 私信机器人</b>\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        "📊 <b>系统状态</b>\n"
+        f"  • 账户: {active_accounts}/{total_accounts} 可用\n"
+        f"  • 任务: {running_tasks}/{total_tasks} 运行中\n\n"
+        "✨ <b>核心功能</b>\n"
+        "  ✅ 多账户管理\n"
+        "  ✅ 富媒体消息\n"
+        "  ✅ 消息个性化\n"
+        "  ✅ 智能防封策略\n"
+        "  ✅ 实时进度监控\n"
+        "  ✅ 即时停止响应 (&lt;3秒)\n\n"
+        "💡 选择功能开始使用："
     )
     
     await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
@@ -4805,7 +4817,7 @@ async def show_tasks_menu(query):
 
 
 async def list_tasks(query):
-    """List tasks"""
+    """List tasks with enhanced status display"""
     task_docs = db[Task.COLLECTION_NAME].find()
     tasks = [Task.from_dict(doc) for doc in task_docs]
     
@@ -4816,14 +4828,45 @@ async def list_tasks(query):
             [InlineKeyboardButton("🔙 返回", callback_data='menu_tasks')]
         ]
     else:
-        text = f"📝 <b>任务列表</b>\n\n共 {len(tasks)} 个任务：\n\n"
+        # Enhanced status display with counts
+        status_counts = {}
+        for task in tasks:
+            status_counts[task.status] = status_counts.get(task.status, 0) + 1
+        
+        # Format status summary with emoji
+        status_emoji_map = {
+            'pending': '⏳', 
+            'running': '🚀', 
+            'paused': '⏸️', 
+            'stopped': '⏹️',
+            'completed': '✅', 
+            'failed': '❌'
+        }
+        
+        status_summary = " | ".join([
+            f"{status_emoji_map.get(status, '❓')}{count}"
+            for status, count in sorted(status_counts.items())
+        ])
+        
+        text = (
+            f"📝 <b>任务列表</b>\n\n"
+            f"📊 共 {len(tasks)} 个任务 | {status_summary}\n\n"
+            f"💡 点击任务查看详情\n"
+        )
         keyboard = []
         
-        # Show tasks in a 2-column grid
+        # Show tasks in a 2-column grid with enhanced display
         row = []
         for idx, task in enumerate(tasks):
-            status_emoji = {'pending': '⏳', 'running': '▶️', 'paused': '⏸️', 'completed': '✅', 'failed': '❌'}.get(task.status, '❓')
-            button_text = f"{status_emoji} {task.name}"
+            status_emoji = status_emoji_map.get(task.status, '❓')
+            
+            # Add progress indicator for running tasks
+            if task.status == 'running' and task.total_targets > 0:
+                progress_pct = int((task.sent_count or 0) / task.total_targets * 100)
+                button_text = f"{status_emoji} {task.name} ({progress_pct}%)"
+            else:
+                button_text = f"{status_emoji} {task.name}"
+            
             row.append(InlineKeyboardButton(button_text, callback_data=f'task_detail_{str(task._id)}'))
             
             # Create a new row after every 2 tasks
@@ -4843,14 +4886,24 @@ async def list_tasks(query):
 
 
 async def show_task_detail(query, task_id):
-    """Show task detail with configuration options and real-time progress"""
+    """Show task detail with enhanced display and configuration options"""
     task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
     if not task_doc:
         await safe_answer_query(query, "❌ 任务不存在", show_alert=True)
         return
     
     task = Task.from_dict(task_doc)
-    status_emoji = {'pending': '⏳', 'running': '▶️', 'paused': '⏸️', 'completed': '✅', 'failed': '❌'}.get(task.status, '❓')
+    
+    # Enhanced status emoji mapping
+    status_emoji_map = {
+        'pending': '⏳', 
+        'running': '🚀', 
+        'paused': '⏸️', 
+        'stopped': '⏹️',
+        'completed': '✅', 
+        'failed': '❌'
+    }
+    status_emoji = status_emoji_map.get(task.status, '❓')
     progress = (task.sent_count / task.total_targets * 100) if task.total_targets > 0 else 0
     
     # Build progress display for running tasks
@@ -4861,13 +4914,19 @@ async def show_task_detail(query, task_id):
             'sent_at': {'$ne': None}
         })
         
+        # Enhanced running task display
+        progress_bar_length = 20
+        filled = int(progress / 5)  # 5% per bar
+        progress_bar = '█' * filled + '░' * (progress_bar_length - filled)
+        
         text = (
-            f"⬇ <b>正在私信中</b> ⬇\n"
-            f"进度 {task.sent_count}/{task.total_targets}\n\n"
-            f"👥 总用户数    {task.total_targets}\n"
-            f"✅ 发送成功    {task.sent_count} 条消息\n"
-            f"📧 成功用户    {unique_users_sent} 人\n"
-            f"❌ 发送失败    {task.failed_count}\n\n"
+            f"🚀 <b>正在私信中</b>\n\n"
+            f"📊 进度: {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n"
+            f"{progress_bar}\n\n"
+            f"👥 总用户数: {task.total_targets}\n"
+            f"✅ 发送成功: {task.sent_count} 条消息\n"
+            f"📧 成功用户: {unique_users_sent} 人\n"
+            f"❌ 发送失败: {task.failed_count}\n\n"
         )
         
         # Calculate estimated time
@@ -4876,12 +4935,17 @@ async def show_task_detail(query, task_id):
             if remaining > 0 and task.min_interval and task.max_interval:
                 avg_interval = (task.min_interval + task.max_interval) / 2
                 estimated_seconds = remaining * avg_interval
-                estimated_time = timedelta(seconds=int(estimated_seconds))
-                text += f"⏱️ 预计剩余时间: {estimated_time}\n"
+                hours, remainder = divmod(int(estimated_seconds), 3600)
+                minutes, seconds = divmod(remainder, 60)
+                text += f"⏱️ 预计剩余: {hours}:{minutes:02d}:{seconds:02d}\n"
         
         if task.started_at:
             elapsed = datetime.utcnow() - task.started_at
-            text += f"⏰ 已运行时间: {elapsed}\n"
+            hours, remainder = divmod(int(elapsed.total_seconds()), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            text += f"⏰ 已运行: {hours}:{minutes:02d}:{seconds:02d}\n"
+        
+        text += f"\n💡 <i>任务可随时停止，不会丢失进度</i>"
     else:
         # Calculate unique users who received messages for completed/paused tasks
         unique_users_sent = db[Target.COLLECTION_NAME].count_documents({
@@ -4889,32 +4953,40 @@ async def show_task_detail(query, task_id):
             'sent_at': {'$ne': None}
         })
         
+        # Enhanced status display with badge
+        status_text_map = {
+            'pending': '待执行',
+            'running': '运行中',
+            'paused': '已暂停',
+            'stopped': '已停止',
+            'completed': '已完成',
+            'failed': '已失败'
+        }
+        status_text = status_text_map.get(task.status, '未知')
+        
         text = (
-            f"{status_emoji} <b>{task.name}</b>\n\n"
-            f"📊 进度: {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n"
-            f"✅ 成功: {task.sent_count} 条消息\n"
-            f"📧 用户: {unique_users_sent} 人\n"
-            f"❌ 失败: {task.failed_count}\n\n"
-            f"<b>⚙️ 当前配置:</b>\n"
-            f"🧵 多账号线程数: {task.thread_count}\n"
-            f"⏱️ 发送间隔: {task.min_interval}-{task.max_interval}秒\n"
-            f"🔄 无视双向次数: {task.ignore_bidirectional_limit}\n"
-            f"📊 单账号日限: {task.daily_limit}条\n"
-            f"🔄 重试次数: {task.retry_count}次 (间隔{task.retry_interval}秒)\n"
-            f"📌 置顶消息: {'✔️' if task.pin_message else '❌'}\n"
-            f"🗑️ 删除对话框: {'✔️' if task.delete_dialog else '❌'}\n"
-            f"🔁 重复发送: {'✔️' if task.repeat_send else '❌'}\n"
-            f"✏️ 消息模式: {task.message_mode}\n"
-            f"🌊 FloodWait策略: {task.flood_wait_strategy}\n"
-            f"📞 语音拨打: {'✔️' if task.voice_call_enabled else '❌'}\n"
-            f"⏲️ 线程启动间隔: {task.thread_start_interval}秒\n"
-            f"🔄 死号自动换号: {'✔️' if task.auto_switch_dead_account else '❌'}\n"
-            f"💬 强制私信模式: {'✔️' if task.force_private_mode else '❌'}\n"
+            f"{status_emoji} <b>{task.name}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"📌 状态: {status_text}\n\n"
+            f"📊 <b>任务统计</b>\n"
+            f"  • 进度: {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n"
+            f"  • 成功: {task.sent_count} 条消息\n"
+            f"  • 用户: {unique_users_sent} 人\n"
+            f"  • 失败: {task.failed_count}\n\n"
+            f"⚙️ <b>任务配置</b>\n"
+            f"  • 线程数: {task.thread_count}\n"
+            f"  • 间隔: {task.min_interval}-{task.max_interval}秒\n"
+            f"  • 日限: {task.daily_limit}条/账号\n"
+            f"  • 重复发送: {'✔️' if task.repeat_send else '❌'}\n"
+            f"  • 置顶消息: {'✔️' if task.pin_message else '❌'}\n"
+            f"  • 删除对话: {'✔️' if task.delete_dialog else '❌'}\n"
         )
         
         if task.started_at:
             elapsed = datetime.utcnow() - task.started_at
-            text += f"\n⏰ 已运行时间: {elapsed}\n"
+            hours, remainder = divmod(int(elapsed.total_seconds()), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            text += f"\n⏰ 运行时长: {hours}:{minutes:02d}:{seconds:02d}\n"
     
     keyboard = []
     
