@@ -1919,31 +1919,41 @@ class TaskManager:
         return asyncio_task
     
     async def stop_task(self, task_id):
-        """Stop task immediately with dual mechanism"""
+        """Stop task immediately with graceful + force cancellation (improved version)"""
         task_id_str = str(task_id)
-        if task_id_str not in self.running_tasks:
-            raise ValueError("Task not running")
         
-        # Get task info early to avoid undefined variable
+        if task_id_str not in self.running_tasks:
+            logger.warning(f"Task {task_id} not in running_tasks")
+            # Even if not in running list, update database status
+            self.tasks_col.update_one(
+                {'_id': ObjectId(task_id)},
+                {'$set': {
+                    'status': TaskStatus.STOPPED.value,
+                    'completed_at': datetime.utcnow(),
+                    'updated_at': datetime.utcnow()
+                }}
+            )
+            return
+        
         task_info = self.running_tasks[task_id_str]
         
-        # Validate task_info structure (should always be dict with new implementation)
-        # Old format (before this fix): asyncio.Task was stored directly
-        # New format: {'asyncio_task': asyncio.Task, 'stop_event': asyncio.Event, 'started_at': datetime}
+        logger.info(f"Task {task_id}: Initiating stop sequence...")
+        
+        # Validate task_info structure
         if not isinstance(task_info, dict):
             logger.error(f"Task {task_id}: Invalid task_info structure, expected dict (old format detected)")
-            # Fallback to handle old format for safety
             asyncio_task = task_info
         else:
             asyncio_task = task_info.get('asyncio_task')
         
-        # 1. Set memory stop flag (for backward compatibility)
-        self.stop_flags[task_id_str] = True
-        
-        # 2. Set asyncio.Event for immediate stop
+        # 1. Set stop event (highest priority)
         if isinstance(task_info, dict) and 'stop_event' in task_info:
             task_info['stop_event'].set()
-            logger.info(f"Task {task_id}: Stop event set")
+            logger.info(f"Task {task_id}: ✓ Stop event set")
+        
+        # 2. Set memory stop flag (backward compatibility)
+        self.stop_flags[task_id_str] = True
+        logger.info(f"Task {task_id}: ✓ Stop flag set")
         
         # 3. Update database status immediately
         self.tasks_col.update_one(
@@ -1954,35 +1964,34 @@ class TaskManager:
                 'updated_at': datetime.utcnow()
             }}
         )
-        logger.info(f"Task {task_id}: Database status updated to STOPPED")
+        logger.info(f"Task {task_id}: ✓ Database status updated to STOPPED")
         
-        # 4. Wait for task to acknowledge and stop (with timeout)
+        # 4. Wait for graceful stop (reduced timeout to 3 seconds)
         try:
-            await asyncio.wait_for(asyncio_task, timeout=10.0)
-            logger.info(f"Task {task_id}: Stopped gracefully")
+            await asyncio.wait_for(asyncio_task, timeout=3.0)
+            logger.info(f"Task {task_id}: ✓ Stopped gracefully within 3s")
         except asyncio.TimeoutError:
-            logger.warning(f"Task {task_id}: Timeout, cancelling forcefully")
+            logger.warning(f"Task {task_id}: Timeout after 3s, forcing cancellation...")
+            
+            # 5. Force cancel the task
             asyncio_task.cancel()
             try:
                 await asyncio_task
             except asyncio.CancelledError:
-                pass
+                logger.info(f"Task {task_id}: ✓ Cancelled successfully")
+            except Exception as e:
+                logger.error(f"Task {task_id}: Error during cancellation: {e}")
         
-        # 5. Wait for confirmation that task has cleaned up
-        for i in range(Config.STOP_CONFIRMATION_ITERATIONS):
-            if task_id_str not in self.running_tasks:
-                logger.info(f"Task {task_id}: Confirmed stopped (iteration {i})")
-                break
-            await asyncio.sleep(Config.STOP_CONFIRMATION_SLEEP)
-        else:
-            # Force cleanup after timeout (Config.STOP_CONFIRMATION_ITERATIONS * Config.STOP_CONFIRMATION_SLEEP seconds)
-            logger.warning(f"Task {task_id}: Force cleanup after timeout")
-            if task_id_str in self.running_tasks:
-                del self.running_tasks[task_id_str]
-            if task_id_str in self.stop_flags:
-                del self.stop_flags[task_id_str]
+        # 6. Clean up running tasks record
+        if task_id_str in self.running_tasks:
+            del self.running_tasks[task_id_str]
+            logger.info(f"Task {task_id}: ✓ Removed from running_tasks")
         
-        logger.info(f"Task {task_id}: Stop task completed")
+        if task_id_str in self.stop_flags:
+            del self.stop_flags[task_id_str]
+            logger.info(f"Task {task_id}: ✓ Removed stop_flag")
+        
+        logger.info(f"Task {task_id}: ✅ Stop sequence completed")
     
     def delete_task(self, task_id):
         """Delete task and all associated data"""
@@ -2007,6 +2016,48 @@ class TaskManager:
         logger.info(f"Task {task_id} and all associated data deleted successfully")
         return True
     
+    async def _sleep_with_stop_check(self, seconds, stop_event, task_id=None):
+        """可中断的睡眠 - 每秒检查停止信号，每5秒检查数据库"""
+        check_db_every = 5  # Check database every 5 seconds to reduce load
+        for i in range(int(seconds)):
+            if stop_event.is_set():
+                logger.debug(f"Sleep interrupted by stop signal after {i}s")
+                return True  # Return True if interrupted
+            
+            # Check database status less frequently for performance
+            if task_id and i % check_db_every == 0:
+                task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+                if task_doc and task_doc.get('status') == TaskStatus.STOPPED.value:
+                    logger.debug(f"Sleep interrupted by database STOPPED status after {i}s")
+                    return True
+            
+            await asyncio.sleep(1)
+        
+        # Handle remaining fractional seconds
+        remaining = seconds - int(seconds)
+        if remaining > 0 and not stop_event.is_set():
+            await asyncio.sleep(remaining)
+        
+        return stop_event.is_set()  # Return True if stopped during remaining time
+    
+    async def _send_message_with_stop_check(self, task, target, account, stop_event):
+        """发送消息（带停止检查）"""
+        # Check before sending
+        if stop_event.is_set():
+            logger.debug("Send cancelled: stop signal detected before send")
+            return False
+        
+        try:
+            # Execute actual send
+            success = await self._send_message_with_mode(task, target, account)
+            return success
+        except asyncio.CancelledError:
+            logger.warning("Send message cancelled by task cancellation")
+            raise
+        except Exception as e:
+            logger.error(f"Send message error: {e}")
+            return False
+
     async def _execute_task(self, task_id, stop_event):
         """执行任务 - 支持重复发送模式和正常模式，使用双重停止机制"""
         task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
@@ -2234,9 +2285,9 @@ class TaskManager:
                             )
                             account.messages_sent_today = 0
                     
-                    # 发送消息
+                    # 发送消息 - Use stop-aware wrapper
                     logger.info(f"账号 {account.phone} -> 用户 {target.username or target.user_id} ({target_idx + 1}/{len(targets)})")
-                    success = await self._send_message_with_mode(task, target, account)
+                    success = await self._send_message_with_stop_check(task, target, account, stop_event)
                     
                     if success:
                         self.tasks_col.update_one(
@@ -2267,7 +2318,12 @@ class TaskManager:
                     # 消息间隔
                     delay = random.randint(task.min_interval, task.max_interval)
                     logger.debug(f"等待 {delay} 秒...")
-                    await asyncio.sleep(delay)
+                    
+                    # ✅ Use interruptible sleep for message interval
+                    interrupted = await self._sleep_with_stop_check(delay, stop_event, task_id)
+                    if interrupted:
+                        logger.info(f"账号 {account.phone}: Stop signal during message interval")
+                        break
                 
                 logger.info(f"账号 {account.phone} 完成所有发送")
             
@@ -2377,9 +2433,9 @@ class TaskManager:
                         )
                         account.messages_sent_today = 0
                 
-                # 发送消息
+                # 发送消息 - Use stop-aware wrapper
                 logger.info(f"[批次 {batch_idx}] 使用账户 {account.phone} 尝试发送")
-                success = await self._send_message_with_mode(task, target, account)
+                success = await self._send_message_with_stop_check(task, target, account, stop_event)
                 
                 if not success:
                     logger.warning(f"[批次 {batch_idx}] 账户 {account.phone} 发送失败，尝试下一个账户")
@@ -2410,11 +2466,20 @@ class TaskManager:
                             if current_sent > 0 and current_sent % task.batch_pause_count == 0:
                                 pause_delay = random.randint(task.batch_pause_min, task.batch_pause_max)
                                 logger.info(f"[批次 {batch_idx}] 🛑 批次停顿: 已发送 {current_sent} 条，停顿 {pause_delay} 秒")
-                                await asyncio.sleep(pause_delay)
+                                
+                                # ✅ Use interruptible sleep during batch pause
+                                interrupted = await self._sleep_with_stop_check(pause_delay, stop_event, task_id)
+                                if interrupted:
+                                    logger.info(f"[批次 {batch_idx}] Stop signal during batch pause")
+                                    break
                     
-                    # 消息间隔
+                    # 消息间隔 - ✅ Use interruptible sleep
                     delay = random.randint(task.min_interval, task.max_interval)
-                    await asyncio.sleep(delay)
+                    interrupted = await self._sleep_with_stop_check(delay, stop_event, task_id)
+                    if interrupted:
+                        logger.info(f"[批次 {batch_idx}] Stop signal during message interval")
+                        break
+                    
                     break
             
             # 如果所有账号都尝试过仍然失败
@@ -2433,6 +2498,11 @@ class TaskManager:
                     if await self.check_and_stop_if_no_accounts(task_id):
                         logger.info(f"[批次 {batch_idx}] 所有账号不可用，任务已停止")
                         break
+            
+            # ✅ Check stop signal after each target processing
+            if stop_event.is_set():
+                logger.info(f"[批次 {batch_idx}] Stop signal detected after target {idx + 1}")
+                break
         
         logger.info(f"[批次 {batch_idx}] 批次处理完成")
     
@@ -3318,7 +3388,7 @@ db = None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command"""
+    """Start command with enhanced dashboard"""
     user_id = update.effective_user.id
     username = update.effective_user.username or "unknown"
     
@@ -3331,21 +3401,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.info(f"Authorized user {username} ({user_id}) accessing main menu")
     
+    # Get quick stats
+    total_accounts = db[Account.COLLECTION_NAME].count_documents({})
+    active_accounts = db[Account.COLLECTION_NAME].count_documents({'status': AccountStatus.ACTIVE.value})
+    total_tasks = db[Task.COLLECTION_NAME].count_documents({})
+    running_tasks = db[Task.COLLECTION_NAME].count_documents({'status': TaskStatus.RUNNING.value})
+    
     keyboard = [
         [InlineKeyboardButton("📢 广告私信", callback_data='menu_messaging'), InlineKeyboardButton("👥 采集用户", callback_data='menu_collection')],
         [InlineKeyboardButton("❓ 帮助", callback_data='menu_help')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
+    # Enhanced welcome message with stats
     text = (
-        "🤖 <b>Telegram 私信机器人</b>\n\n"
-        "欢迎使用 Telegram 批量私信管理系统！\n\n"
-        "✅ 多账户管理\n"
-        "✅ 富媒体消息\n"
-        "✅ 消息个性化\n"
-        "✅ 智能防封策略\n"
-        "✅ 实时进度监控\n\n"
-        "请选择一个选项："
+        "🤖 <b>Telegram 私信机器人</b>\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        "📊 <b>系统状态</b>\n"
+        f"  • 账户: {active_accounts}/{total_accounts} 可用\n"
+        f"  • 任务: {running_tasks}/{total_tasks} 运行中\n\n"
+        "✨ <b>核心功能</b>\n"
+        "  ✅ 多账户管理\n"
+        "  ✅ 富媒体消息\n"
+        "  ✅ 消息个性化\n"
+        "  ✅ 智能防封策略\n"
+        "  ✅ 实时进度监控\n"
+        "  ✅ 即时停止响应 (3秒内)\n\n"
+        "💡 选择功能开始使用："
     )
     
     await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
@@ -4078,9 +4160,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"User {user_id} starting task {task_id}")
         await start_task_handler(query, task_id, context)
     elif data.startswith('task_stop_'):
-        task_id = data.split('_')[2]
-        logger.info(f"User {user_id} stopping task {task_id}")
-        await stop_task_handler(query, task_id, context)
+        if data.startswith('task_stop_confirm_'):
+            # Confirmed stop action
+            task_id = data.split('_')[3]
+            logger.info(f"User {user_id} confirmed stopping task {task_id}")
+            await stop_task_confirmed(query, task_id, context)
+        else:
+            # Show confirmation dialog
+            task_id = data.split('_')[2]
+            logger.info(f"User {user_id} stopping task {task_id}")
+            await stop_task_handler(query, task_id, context)
     elif data.startswith('task_progress_'):
         # Handle both task_progress_refresh_ and task_progress_
         if 'refresh' in data:
@@ -4729,7 +4818,7 @@ async def show_tasks_menu(query):
 
 
 async def list_tasks(query):
-    """List tasks"""
+    """List tasks with enhanced status display"""
     task_docs = db[Task.COLLECTION_NAME].find()
     tasks = [Task.from_dict(doc) for doc in task_docs]
     
@@ -4740,14 +4829,45 @@ async def list_tasks(query):
             [InlineKeyboardButton("🔙 返回", callback_data='menu_tasks')]
         ]
     else:
-        text = f"📝 <b>任务列表</b>\n\n共 {len(tasks)} 个任务：\n\n"
+        # Enhanced status display with counts
+        status_counts = {}
+        for task in tasks:
+            status_counts[task.status] = status_counts.get(task.status, 0) + 1
+        
+        # Format status summary with emoji
+        status_emoji_map = {
+            'pending': '⏳', 
+            'running': '🚀', 
+            'paused': '⏸️', 
+            'stopped': '⏹️',
+            'completed': '✅', 
+            'failed': '❌'
+        }
+        
+        status_summary = " | ".join([
+            f"{status_emoji_map.get(status, '❓')}{count}"
+            for status, count in sorted(status_counts.items())
+        ])
+        
+        text = (
+            f"📝 <b>任务列表</b>\n\n"
+            f"📊 共 {len(tasks)} 个任务 | {status_summary}\n\n"
+            f"💡 点击任务查看详情\n"
+        )
         keyboard = []
         
-        # Show tasks in a 2-column grid
+        # Show tasks in a 2-column grid with enhanced display
         row = []
         for idx, task in enumerate(tasks):
-            status_emoji = {'pending': '⏳', 'running': '▶️', 'paused': '⏸️', 'completed': '✅', 'failed': '❌'}.get(task.status, '❓')
-            button_text = f"{status_emoji} {task.name}"
+            status_emoji = status_emoji_map.get(task.status, '❓')
+            
+            # Add progress indicator for running tasks
+            if task.status == 'running' and task.total_targets > 0:
+                progress_pct = int((task.sent_count or 0) / task.total_targets * 100)
+                button_text = f"{status_emoji} {task.name} ({progress_pct}%)"
+            else:
+                button_text = f"{status_emoji} {task.name}"
+            
             row.append(InlineKeyboardButton(button_text, callback_data=f'task_detail_{str(task._id)}'))
             
             # Create a new row after every 2 tasks
@@ -4767,14 +4887,24 @@ async def list_tasks(query):
 
 
 async def show_task_detail(query, task_id):
-    """Show task detail with configuration options and real-time progress"""
+    """Show task detail with enhanced display and configuration options"""
     task_doc = db[Task.COLLECTION_NAME].find_one({'_id': ObjectId(task_id)})
     if not task_doc:
         await safe_answer_query(query, "❌ 任务不存在", show_alert=True)
         return
     
     task = Task.from_dict(task_doc)
-    status_emoji = {'pending': '⏳', 'running': '▶️', 'paused': '⏸️', 'completed': '✅', 'failed': '❌'}.get(task.status, '❓')
+    
+    # Enhanced status emoji mapping
+    status_emoji_map = {
+        'pending': '⏳', 
+        'running': '🚀', 
+        'paused': '⏸️', 
+        'stopped': '⏹️',
+        'completed': '✅', 
+        'failed': '❌'
+    }
+    status_emoji = status_emoji_map.get(task.status, '❓')
     progress = (task.sent_count / task.total_targets * 100) if task.total_targets > 0 else 0
     
     # Build progress display for running tasks
@@ -4785,13 +4915,19 @@ async def show_task_detail(query, task_id):
             'sent_at': {'$ne': None}
         })
         
+        # Enhanced running task display
+        progress_bar_length = 20
+        filled = int(progress / 5)  # 5% per bar
+        progress_bar = '█' * filled + '░' * (progress_bar_length - filled)
+        
         text = (
-            f"⬇ <b>正在私信中</b> ⬇\n"
-            f"进度 {task.sent_count}/{task.total_targets}\n\n"
-            f"👥 总用户数    {task.total_targets}\n"
-            f"✅ 发送成功    {task.sent_count} 条消息\n"
-            f"📧 成功用户    {unique_users_sent} 人\n"
-            f"❌ 发送失败    {task.failed_count}\n\n"
+            f"🚀 <b>正在私信中</b>\n\n"
+            f"📊 进度: {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n"
+            f"{progress_bar}\n\n"
+            f"👥 总用户数: {task.total_targets}\n"
+            f"✅ 发送成功: {task.sent_count} 条消息\n"
+            f"📧 成功用户: {unique_users_sent} 人\n"
+            f"❌ 发送失败: {task.failed_count}\n\n"
         )
         
         # Calculate estimated time
@@ -4800,12 +4936,17 @@ async def show_task_detail(query, task_id):
             if remaining > 0 and task.min_interval and task.max_interval:
                 avg_interval = (task.min_interval + task.max_interval) / 2
                 estimated_seconds = remaining * avg_interval
-                estimated_time = timedelta(seconds=int(estimated_seconds))
-                text += f"⏱️ 预计剩余时间: {estimated_time}\n"
+                hours, remainder = divmod(int(estimated_seconds), 3600)
+                minutes, seconds = divmod(remainder, 60)
+                text += f"⏱️ 预计剩余: {hours}:{minutes:02d}:{seconds:02d}\n"
         
         if task.started_at:
             elapsed = datetime.utcnow() - task.started_at
-            text += f"⏰ 已运行时间: {elapsed}\n"
+            hours, remainder = divmod(int(elapsed.total_seconds()), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            text += f"⏰ 已运行: {hours}:{minutes:02d}:{seconds:02d}\n"
+        
+        text += f"\n💡 <i>任务可随时停止，不会丢失进度</i>"
     else:
         # Calculate unique users who received messages for completed/paused tasks
         unique_users_sent = db[Target.COLLECTION_NAME].count_documents({
@@ -4813,32 +4954,40 @@ async def show_task_detail(query, task_id):
             'sent_at': {'$ne': None}
         })
         
+        # Enhanced status display with badge
+        status_text_map = {
+            'pending': '待执行',
+            'running': '运行中',
+            'paused': '已暂停',
+            'stopped': '已停止',
+            'completed': '已完成',
+            'failed': '已失败'
+        }
+        status_text = status_text_map.get(task.status, '未知')
+        
         text = (
-            f"{status_emoji} <b>{task.name}</b>\n\n"
-            f"📊 进度: {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n"
-            f"✅ 成功: {task.sent_count} 条消息\n"
-            f"📧 用户: {unique_users_sent} 人\n"
-            f"❌ 失败: {task.failed_count}\n\n"
-            f"<b>⚙️ 当前配置:</b>\n"
-            f"🧵 多账号线程数: {task.thread_count}\n"
-            f"⏱️ 发送间隔: {task.min_interval}-{task.max_interval}秒\n"
-            f"🔄 无视双向次数: {task.ignore_bidirectional_limit}\n"
-            f"📊 单账号日限: {task.daily_limit}条\n"
-            f"🔄 重试次数: {task.retry_count}次 (间隔{task.retry_interval}秒)\n"
-            f"📌 置顶消息: {'✔️' if task.pin_message else '❌'}\n"
-            f"🗑️ 删除对话框: {'✔️' if task.delete_dialog else '❌'}\n"
-            f"🔁 重复发送: {'✔️' if task.repeat_send else '❌'}\n"
-            f"✏️ 消息模式: {task.message_mode}\n"
-            f"🌊 FloodWait策略: {task.flood_wait_strategy}\n"
-            f"📞 语音拨打: {'✔️' if task.voice_call_enabled else '❌'}\n"
-            f"⏲️ 线程启动间隔: {task.thread_start_interval}秒\n"
-            f"🔄 死号自动换号: {'✔️' if task.auto_switch_dead_account else '❌'}\n"
-            f"💬 强制私信模式: {'✔️' if task.force_private_mode else '❌'}\n"
+            f"{status_emoji} <b>{task.name}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"📌 状态: {status_text}\n\n"
+            f"📊 <b>任务统计</b>\n"
+            f"  • 进度: {task.sent_count}/{task.total_targets} ({progress:.1f}%)\n"
+            f"  • 成功: {task.sent_count} 条消息\n"
+            f"  • 用户: {unique_users_sent} 人\n"
+            f"  • 失败: {task.failed_count}\n\n"
+            f"⚙️ <b>任务配置</b>\n"
+            f"  • 线程数: {task.thread_count}\n"
+            f"  • 间隔: {task.min_interval}-{task.max_interval}秒\n"
+            f"  • 日限: {task.daily_limit}条/账号\n"
+            f"  • 重复发送: {'✔️' if task.repeat_send else '❌'}\n"
+            f"  • 置顶消息: {'✔️' if task.pin_message else '❌'}\n"
+            f"  • 删除对话: {'✔️' if task.delete_dialog else '❌'}\n"
         )
         
         if task.started_at:
             elapsed = datetime.utcnow() - task.started_at
-            text += f"\n⏰ 已运行时间: {elapsed}\n"
+            hours, remainder = divmod(int(elapsed.total_seconds()), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            text += f"\n⏰ 运行时长: {hours}:{minutes:02d}:{seconds:02d}\n"
     
     keyboard = []
     
@@ -7074,9 +7223,10 @@ async def start_task_handler(query, task_id, context):
 
 
 async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
-    """Auto refresh task progress with smart intervals (10s first minute, then 30-50s)"""
+    """Auto refresh task progress with smart intervals and improved stop detection"""
     error_count = 0
     start_time = datetime.now(timezone.utc)
+    last_data = None
     
     # Wait a bit for task to actually start
     await asyncio.sleep(2)
@@ -7091,9 +7241,17 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
             
             task = Task.from_dict(task_doc)
             
-            # 任务结束则退出循环
+            # ✅ Enhanced stop detection - check both DB status and running_tasks
             if task.status in [TaskStatus.COMPLETED.value, TaskStatus.STOPPED.value, TaskStatus.FAILED.value]:
                 logger.info(f"Auto-refresh stopped: Task {task_id} status is {task.status}")
+                
+                # Wait a moment for completion report to be sent
+                await asyncio.sleep(2)
+                break
+            
+            # ✅ Double-check if task is still in running_tasks (additional safety)
+            if str(task_id) not in task_manager.running_tasks:
+                logger.info(f"Auto-refresh stopped: Task {task_id} not in running_tasks")
                 break
             
             # 使用任务文档中的 total_targets（已在任务创建时设置）
@@ -7141,33 +7299,38 @@ async def auto_refresh_task_progress(bot, chat_id, message_id, task_id):
                 speed_str = "0.0 条/分钟"
                 remaining_str = "未知"
             
-            # 更新消息
+            # 更新消息 - Enhanced with better visual indicators
             text = (
-                f"📊 <b>正在私信中</b>\n\n"
-                f"进度: {sent_count + failed_count}/{total_targets} ({progress_percent:.1f}%)\n"
+                f"🚀 <b>正在私信中</b>\n\n"
+                f"📊 进度: {sent_count + failed_count}/{total_targets} ({progress_percent:.1f}%)\n"
                 f"{progress_bar}\n\n"
                 f"⚡ 速度: {speed_str}\n"
                 f"⏱️ 预计剩余: {remaining_str}\n"
                 f"⏰ 已运行: {runtime_str}\n\n"
                 f"👥 总用户数: {total_targets}\n"
                 f"✅ 发送成功: {sent_count}\n"
-                f"❌ 发送失败: {failed_count}"
+                f"❌ 发送失败: {failed_count}\n\n"
+                f"💡 提示: 任务可随时停止"
             )
             
             keyboard = [
                 [InlineKeyboardButton("🔄 刷新进度", callback_data=f'task_progress_refresh_{task_id}')],
-                [InlineKeyboardButton("⏸️ 停止任务", callback_data=f'task_stop_{task_id}')]
+                [InlineKeyboardButton("⏹️ 停止任务", callback_data=f'task_stop_{task_id}')]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             try:
-                await bot.edit_message_text(
-                    text=text,
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    reply_markup=reply_markup,
-                    parse_mode='HTML'
-                )
+                # Only update if data changed
+                current_data = (sent_count, failed_count, task.status)
+                if current_data != last_data:
+                    await bot.edit_message_text(
+                        text=text,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        reply_markup=reply_markup,
+                        parse_mode='HTML'
+                    )
+                    last_data = current_data
                 # Reset error count on successful update
                 error_count = 0
             except telegram_error.BadRequest as e:
@@ -7277,69 +7440,97 @@ async def send_task_completion_report(bot, chat_id, task_id):
 
 
 async def stop_task_handler(query, task_id, context):
-    """Stop task immediately and generate report"""
+    """Stop task with confirmation dialog (improved UX)"""
+    await safe_answer_query(query)
+    
+    # Show confirmation dialog
+    text = (
+        "⚠️ <b>确认停止任务？</b>\n\n"
+        "⚡ 任务将立即停止（响应时间 3秒内）\n"
+        "📝 已发送的消息无法撤回\n"
+        "📊 将生成任务完成报告\n\n"
+        "❓ 确定要停止吗？"
+    )
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ 确认停止", callback_data=f'task_stop_confirm_{task_id}'),
+            InlineKeyboardButton("❌ 取消", callback_data=f'task_progress_{task_id}')
+        ]
+    ]
+    
     try:
-        # Set stop flag immediately
-        task_manager.stop_flags[task_id] = True
-        
-        # Update task status to STOPPED (not PAUSED) with completion time
-        db[Task.COLLECTION_NAME].update_one(
-            {'_id': ObjectId(task_id)},
-            {'$set': {
-                'status': TaskStatus.STOPPED.value,
-                'completed_at': datetime.utcnow(),
-                'updated_at': datetime.utcnow()
-            }}
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        logger.error(f"Error showing stop confirmation: {e}")
+        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def stop_task_confirmed(query, task_id, context):
+    """Execute confirmed stop action (improved with better feedback)"""
+    await safe_answer_query(query, "⏹️ 正在停止任务...", show_alert=True)
+    
+    try:
+        # Show stopping progress message
+        stopping_text = (
+            "⏹️ <b>正在停止任务...</b>\n\n"
+            "⏳ 等待当前操作完成\n"
+            "📝  即将生成任务报告"
         )
         
-        await safe_answer_query(query, "⏸️ 任务停止中...")
-        
-        # Cancel the auto-refresh task if it exists
-        if hasattr(task_manager, 'refresh_tasks') and task_id in task_manager.refresh_tasks:
-            refresh_task = task_manager.refresh_tasks[task_id]
-            if not refresh_task.done():
-                refresh_task.cancel()
-                try:
-                    await asyncio.wait_for(refresh_task, timeout=1.0)
-                except (asyncio.CancelledError, asyncio.TimeoutError):
-                    pass  # Expected when cancelling
-                except Exception as e:
-                    logger.warning(f"Error cancelling refresh task: {e}")
-            del task_manager.refresh_tasks[task_id]
-        
-        # Try to stop the task gracefully
-        if task_id in task_manager.running_tasks:
-            asyncio_task = task_manager.running_tasks[task_id]
-            try:
-                await asyncio.wait_for(asyncio_task, timeout=TASK_STOP_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                # Cancel forcefully if it takes too long
-                asyncio_task.cancel()
-                try:
-                    await asyncio.wait_for(asyncio_task, timeout=1.0)
-                except (asyncio.CancelledError, asyncio.TimeoutError):
-                    pass  # Expected
-            except Exception as e:
-                logger.warning(f"Error stopping task: {e}")
-            
-            if task_id in task_manager.running_tasks:
-                del task_manager.running_tasks[task_id]
-        
-        # Send completion report directly (don't edit first, just send new message)
         try:
-            await send_task_completion_report(context.bot, query.message.chat_id, task_id)
-        except Exception as report_error:
-            logger.error(f"Error sending completion report: {report_error}", exc_info=True)
-            # Fallback to simple message
-            await query.message.reply_text(
-                "⏸️ <b>任务已手动停止</b>\n\n"
-                "报告生成失败，请查看日志。",
-                parse_mode='HTML'
-            )
+            await query.edit_message_text(stopping_text, parse_mode='HTML')
+        except Exception as e:
+            logger.debug(f"Could not edit message: {e}")
+        
+        # Execute stop using TaskManager
+        await task_manager.stop_task(task_id)
+        
+        # Wait a moment for cleanup
+        await asyncio.sleep(1)
+        
+        # Show success message
+        success_text = (
+            "✅ <b>任务已停止</b>\n\n"
+            "📊 正在生成任务报告...\n"
+            "⏰ 请稍候..."
+        )
+        
+        try:
+            await query.edit_message_text(success_text, parse_mode='HTML')
+        except Exception:
+            await query.message.reply_text(success_text, parse_mode='HTML')
+        
+        # Wait for completion report to be generated
+        await asyncio.sleep(2)
+        
+        # Show task detail with final status
+        await show_task_detail(query, task_id)
+        
+    except ValueError as e:
+        # Task not running
+        logger.warning(f"Stop task error: {e}")
+        await query.message.reply_text(
+            f"⚠️ <b>任务状态异常</b>\n\n"
+            f"任务可能已经停止或完成。\n"
+            f"详情: {str(e)}",
+            parse_mode='HTML'
+        )
+        # Still show task detail
+        await show_task_detail(query, task_id)
         
     except Exception as e:
         logger.error(f"Error stopping task {task_id}: {e}", exc_info=True)
-        await safe_answer_query(query, f"❌ 停止失败: {str(e)}", show_alert=True)
+        await query.message.reply_text(
+            f"❌ <b>停止任务失败</b>\n\n"
+            f"错误: {str(e)}\n\n"
+            f"请查看日志或联系管理员。",
+            parse_mode='HTML'
+        )
 
 
 async def show_task_progress(query, task_id):
