@@ -2905,6 +2905,84 @@ class TaskManager:
         
         return False
     
+    async def generate_failed_targets_report(self, task_id):
+        """生成失败用户报告（按失败原因分类）"""
+        
+        # 查询所有失败的目标（有重试但未成功）
+        failed_targets = list(self.targets_col.find({
+            'task_id': str(task_id),
+            'is_sent': False,
+            'retry_count': {'$gt': 0}  # 至少被尝试过一次
+        }))
+        
+        if not failed_targets:
+            return "✅ 没有失败的用户"
+        
+        # 按失败原因分类
+        failed_by_reason = {}
+        for target in failed_targets:
+            reason = target.get('last_error', '未知错误')
+            if reason not in failed_by_reason:
+                failed_by_reason[reason] = []
+            failed_by_reason[reason].append(target)
+        
+        # 生成报告
+        report_lines = [
+            f"❌ <b>失败用户报告</b>",
+            f"",
+            f"总计失败: {len(failed_targets)} 个用户",
+            f""
+        ]
+        
+        for reason, targets_list in failed_by_reason.items():
+            report_lines.append(f"<b>{reason}</b>: {len(targets_list)}个")
+            
+            # 列出用户名（最多显示5个）
+            usernames = [t.get('username', t.get('user_id', 'Unknown')) for t in targets_list[:5]]
+            report_lines.append(f"  用户: {', '.join(usernames)}")
+            
+            if len(targets_list) > 5:
+                report_lines.append(f"  ... 还有 {len(targets_list) - 5} 个")
+            
+            report_lines.append("")
+        
+        return "\n".join(report_lines)
+    
+    async def export_failed_targets_csv(self, task_id):
+        """导出失败用户列表为CSV"""
+        import io
+        
+        failed_targets = list(self.targets_col.find({
+            'task_id': str(task_id),
+            'is_sent': False,
+            'retry_count': {'$gt': 0}
+        }))
+        
+        if not failed_targets:
+            return None
+        
+        # 生成CSV内容
+        csv_content = "用户名,用户ID,失败原因,尝试次数,失败账号数\n"
+        
+        for target in failed_targets:
+            username = target.get('username', '')
+            user_id = target.get('user_id', '')
+            last_error = target.get('last_error', '未知')
+            retry_count = target.get('retry_count', 0)
+            failed_accounts_count = len(target.get('failed_accounts', []))
+            
+            # Escape commas in fields
+            username = username.replace(',', '，')
+            last_error = last_error.replace(',', '，')
+            
+            csv_content += f"{username},{user_id},{last_error},{retry_count},{failed_accounts_count}\n"
+        
+        # 创建文件对象
+        file = io.BytesIO(csv_content.encode('utf-8-sig'))
+        file.name = f"failed_targets_{task_id}.csv"
+        
+        return file
+    
     async def _send_completion_reports(self, task_id):
         """生成并自动发送完成报告 - 任务完成后自动执行，防止重复发送"""
         # Prevent duplicate reports
@@ -3167,6 +3245,36 @@ class TaskManager:
                             logger.warning(f"文件为空或不存在: {filename}")
                     except Exception as e:
                         logger.error(f"发送文件失败 {filename}: {e}")
+                
+                # 发送失败用户报告（如果启用了强制私信模式）
+                task_doc = self.tasks_col.find_one({'_id': ObjectId(task_id)})
+                if task_doc:
+                    task = Task.from_dict(task_doc)
+                    if task.force_private_mode:
+                        try:
+                            # 生成失败报告
+                            logger.info("生成强制私信模式失败报告...")
+                            failed_report = await self.generate_failed_targets_report(task_id)
+                            await self.bot_application.bot.send_message(
+                                chat_id=Config.ADMIN_USER_ID,
+                                text=failed_report,
+                                parse_mode='HTML'
+                            )
+                            logger.info("失败报告已发送")
+                            
+                            # 导出失败用户CSV
+                            logger.info("导出失败用户CSV...")
+                            csv_file = await self.export_failed_targets_csv(task_id)
+                            if csv_file:
+                                await self.bot_application.bot.send_document(
+                                    chat_id=Config.ADMIN_USER_ID,
+                                    document=csv_file,
+                                    caption=f"📄 失败用户列表详情",
+                                    filename=csv_file.name
+                                )
+                                logger.info("失败用户CSV已发送")
+                        except Exception as e:
+                            logger.error(f"发送失败报告出错: {e}")
                 
                 logger.info("========================================")
                 logger.info("所有报告文件已发送完成")
