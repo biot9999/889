@@ -3271,16 +3271,6 @@ class TaskManager:
                     task = Task.from_dict(task_doc)
                     if task.force_private_mode:
                         try:
-                            # 生成失败报告
-                            logger.info("生成强制私信模式失败报告...")
-                            failed_report = await self.generate_failed_targets_report(task_id)
-                            await self.bot_application.bot.send_message(
-                                chat_id=Config.ADMIN_USER_ID,
-                                text=failed_report,
-                                parse_mode='HTML'
-                            )
-                            logger.info("失败报告已发送")
-                            
                             # 导出失败用户CSV
                             logger.info("导出失败用户CSV...")
                             csv_file = await self.export_failed_targets_csv(task_id)
