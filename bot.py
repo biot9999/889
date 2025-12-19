@@ -5364,7 +5364,9 @@ async def show_task_detail(query, task_id):
             f"  • 线程数: {task.thread_count}\n"
             f"  • 间隔: {task.min_interval}-{task.max_interval}秒\n"
             f"  • 日限: {task.daily_limit}条/账号\n"
+            f"  • 无视双向: {task.ignore_bidirectional_limit}次\n"
             f"  • 重复发送: {'✔️' if task.repeat_send else '❌'}\n"
+            f"  • 强制私信模式: {'✔️' if task.force_private_mode else '❌'}\n"
             f"  • 置顶消息: {'✔️' if task.pin_message else '❌'}\n"
             f"  • 删除对话: {'✔️' if task.delete_dialog else '❌'}\n"
         )
